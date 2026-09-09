@@ -72,19 +72,48 @@ const pendingStates = new Set<string>()
 function getConfig() {
   const clientId = process.env.QUICKBOOKS_CLIENT_ID
   const clientSecret = process.env.QUICKBOOKS_CLIENT_SECRET
-  const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3001}`
-  const redirectUri = process.env.QUICKBOOKS_REDIRECT_URI || `${backendUrl.replace(/\/$/, '')}/api/quickbooks/callback`
+  const redirectUri = process.env.QUICKBOOKS_REDIRECT_URI
   const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox'
 
-  if (!clientId || !clientSecret || !redirectUri) {
-    throw new Error('QuickBooks environment variables are not configured.')
+  const missing = getMissingConfigurationNames()
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variable: ${missing.join(', ')}`)
   }
 
   if (environment !== 'sandbox') {
     throw new Error('Only the QuickBooks sandbox environment is enabled.')
   }
 
-  return { clientId, clientSecret, redirectUri }
+  return { clientId: clientId!, clientSecret: clientSecret!, redirectUri: redirectUri! }
+}
+
+function isConfigured(value: string | undefined) {
+  return Boolean(value && value.trim() && value.trim().toLowerCase() !== 'undefined' && value.trim().toLowerCase() !== 'null')
+}
+
+export function getMissingConfigurationNames() {
+  const required: [string, string | undefined][] = [
+    ['QUICKBOOKS_CLIENT_ID', process.env.QUICKBOOKS_CLIENT_ID],
+    ['QUICKBOOKS_CLIENT_SECRET', process.env.QUICKBOOKS_CLIENT_SECRET],
+    ['QUICKBOOKS_REDIRECT_URI', process.env.QUICKBOOKS_REDIRECT_URI],
+    ['QUICKBOOKS_ENVIRONMENT', process.env.QUICKBOOKS_ENVIRONMENT],
+  ]
+  return required.filter(([, value]) => !isConfigured(value)).map(([name]) => name)
+}
+
+export function getConfigurationDiagnostics() {
+  return {
+    clientIdExists: isConfigured(process.env.QUICKBOOKS_CLIENT_ID),
+    redirectUriExists: isConfigured(process.env.QUICKBOOKS_REDIRECT_URI),
+    environment: process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox',
+  }
+}
+
+export function validateConfigurationAtStartup() {
+  getMissingConfigurationNames().forEach((name) => console.warn(`Missing required environment variable: ${name}`))
+  if (process.env.QUICKBOOKS_ENVIRONMENT && process.env.QUICKBOOKS_ENVIRONMENT !== 'sandbox') {
+    console.warn('QuickBooks production access is disabled; QUICKBOOKS_ENVIRONMENT must be sandbox.')
+  }
 }
 
 export function createAuthorizationUrl() {
@@ -98,7 +127,37 @@ export function createAuthorizationUrl() {
   url.searchParams.set('scope', scope)
   url.searchParams.set('redirect_uri', config.redirectUri)
   url.searchParams.set('state', state)
-  return url.toString()
+  const generatedUrl = url.toString()
+  validateAuthorizationUrl(generatedUrl)
+  return generatedUrl
+}
+
+function validateAuthorizationUrl(value: string) {
+  const url = new URL(value)
+  const required = {
+    client_id: url.searchParams.get('client_id'),
+    redirect_uri: url.searchParams.get('redirect_uri'),
+    response_type: url.searchParams.get('response_type'),
+    scope: url.searchParams.get('scope'),
+    state: url.searchParams.get('state'),
+  }
+  if (url.origin !== 'https://appcenter.intuit.com' || url.pathname !== '/connect/oauth2') throw new Error('QuickBooks authorization URL has an unexpected host or path.')
+  if (!isConfigured(required.client_id || undefined) || !isConfigured(required.redirect_uri || undefined) || required.response_type !== 'code' || required.scope !== scope || !isConfigured(required.state || undefined)) {
+    throw new Error('QuickBooks authorization URL is missing or has an invalid required parameter.')
+  }
+}
+
+export function getAuthorizationUrlDiagnostics(value: string) {
+  const url = new URL(value)
+  return {
+    authorizationHost: url.host,
+    authorizationPathname: url.pathname,
+    clientIdPresent: isConfigured(url.searchParams.get('client_id') || undefined),
+    redirectUri: url.searchParams.get('redirect_uri'),
+    responseType: url.searchParams.get('response_type'),
+    scope: url.searchParams.get('scope'),
+    statePresent: isConfigured(url.searchParams.get('state') || undefined),
+  }
 }
 
 export async function exchangeCode(code: string, state: string, realmId: string) {

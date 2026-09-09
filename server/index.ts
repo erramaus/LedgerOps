@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
-import { createAuthorizationUrl, exchangeCode, getAccounts, getBills, getCompanyInfo, getConnectionStatus, getCustomers, getFinancialReport, getInvoices, getTransactions, getVendors, updateTransactionAccount } from './quickbooks.js'
+import { createAuthorizationUrl, exchangeCode, getAccounts, getBills, getCompanyInfo, getConnectionStatus, getCustomers, getFinancialReport, getInvoices, getTransactions, getVendors, getAuthorizationUrlDiagnostics, getConfigurationDiagnostics, updateTransactionAccount, validateConfigurationAtStartup } from './quickbooks.js'
 
 const app = express()
 const port = Number(process.env.PORT || 3001)
@@ -9,6 +9,7 @@ const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
 const allowedOrigins = new Set(['http://localhost:5173', 'https://Erramaus.github.io', frontendUrl, (() => { try { return new URL(frontendUrl).origin } catch { return frontendUrl } })()])
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
 app.use(express.json())
+validateConfigurationAtStartup()
 
 app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok', service: 'LedgerOps API' })
@@ -16,9 +17,12 @@ app.get('/api/health', (_request, response) => {
 
 app.get('/api/quickbooks/connect', (_request, response) => {
   try {
-    response.redirect(createAuthorizationUrl())
+    const authorizationUrl = createAuthorizationUrl()
+    console.info('[QuickBooks OAuth URL diagnostics]', { ...getAuthorizationUrlDiagnostics(authorizationUrl), ...getConfigurationDiagnostics() })
+    response.redirect(authorizationUrl)
   } catch (error) {
-    response.status(500).json({ error: error instanceof Error ? error.message : 'Unable to start QuickBooks connection.' })
+    console.error('[QuickBooks OAuth URL diagnostics]', getConfigurationDiagnostics())
+    response.status(500).json({ error: error instanceof Error ? error.message : 'Unable to start QuickBooks connection.', diagnostics: getConfigurationDiagnostics() })
   }
 })
 
