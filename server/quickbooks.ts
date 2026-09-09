@@ -72,7 +72,8 @@ const pendingStates = new Set<string>()
 function getConfig() {
   const clientId = process.env.QUICKBOOKS_CLIENT_ID
   const clientSecret = process.env.QUICKBOOKS_CLIENT_SECRET
-  const redirectUri = process.env.QUICKBOOKS_REDIRECT_URI
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3001}`
+  const redirectUri = process.env.QUICKBOOKS_REDIRECT_URI || `${backendUrl.replace(/\/$/, '')}/api/quickbooks/callback`
   const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox'
 
   if (!clientId || !clientSecret || !redirectUri) {

@@ -6,7 +6,9 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "noEmit": true,
+    "rootDir": ".",
+    "outDir": "./dist-server",
+    "sourceMap": true,
     "types": ["node"]
   },
   "include": ["server/**/*.ts"]

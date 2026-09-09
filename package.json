@@ -7,8 +7,10 @@
     "dev": "vite",
     "server:dev": "tsx server/index.ts",
     "dev:all": "concurrently \"npm run server:dev\" \"npm run dev\"",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "build": "tsc -b && npm run build:server && vite build",
+    "build:server": "tsc --project tsconfig.server.json",
+    "preview": "vite preview",
+    "start": "node dist-server/server/index.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
@@ -16,11 +18,13 @@
     "typescript": "latest",
     "react": "latest",
     "react-dom": "latest"
+    ,"cors": "latest"
     ,"dotenv": "latest"
     ,"express": "latest"
   },
   "devDependencies": {
     "@types/express": "latest",
+    "@types/cors": "latest",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",

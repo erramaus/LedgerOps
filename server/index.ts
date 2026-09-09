@@ -1,10 +1,18 @@
 import 'dotenv/config'
+import cors from 'cors'
 import express from 'express'
 import { createAuthorizationUrl, exchangeCode, getAccounts, getBills, getCompanyInfo, getConnectionStatus, getCustomers, getFinancialReport, getInvoices, getTransactions, getVendors, updateTransactionAccount } from './quickbooks.js'
 
 const app = express()
 const port = Number(process.env.PORT || 3001)
+const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
+const allowedOrigins = new Set(['http://localhost:5173', 'https://Erramaus.github.io', frontendUrl, (() => { try { return new URL(frontendUrl).origin } catch { return frontendUrl } })()])
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
 app.use(express.json())
+
+app.get('/api/health', (_request, response) => {
+  response.json({ status: 'ok', service: 'LedgerOps API' })
+})
 
 app.get('/api/quickbooks/connect', (_request, response) => {
   try {
@@ -21,7 +29,7 @@ app.get('/api/quickbooks/callback', async (request, response) => {
 
   try {
     await exchangeCode(code, state, realmId)
-    response.redirect('/?quickbooks=connected')
+    response.redirect(`${frontendUrl.replace(/\/$/, '')}/?quickbooks=connected`)
   } catch (callbackError) {
     response.status(500).send(callbackError instanceof Error ? callbackError.message : 'Unable to finish QuickBooks connection.')
   }
@@ -90,5 +98,5 @@ app.get('/api/quickbooks/reports/:report', async (request, response) => {
 })
 
 app.listen(port, () => {
-  console.log(`LedgerOps backend listening at http://localhost:${port}`)
+  console.log(`LedgerOps backend listening on port ${port}`)
 })
