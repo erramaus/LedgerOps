@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "server:dev": "tsx server/index.ts",
+    "dev:all": "concurrently \"npm run server:dev\" \"npm run dev\"",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -14,9 +16,15 @@
     "typescript": "latest",
     "react": "latest",
     "react-dom": "latest"
+    ,"dotenv": "latest"
+    ,"express": "latest"
   },
   "devDependencies": {
+    "@types/express": "latest",
+    "@types/node": "latest",
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "tsx": "latest"
   }
 }

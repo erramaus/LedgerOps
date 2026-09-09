@@ -57,14 +57,14 @@ export type ReconciliationAccount = {
   possibleProblems?: string[]
 }
 
-export type MonthEndStatus = 'Complete' | 'Needs Attention' | 'Not Started'
+export type MonthEndStatus = 'Complete' | 'Needs Attention' | 'Not Started' | 'Not Available'
 
 export type MonthEndItem = {
   id: string
   label: string
   status: MonthEndStatus
   explanation?: string
-  relatedView?: 'Transactions' | 'Reconcile'
+  relatedView?: 'Transactions' | 'Reconcile' | 'Receivables' | 'Payables' | 'Reports' | 'Client Requests'
   relatedLabel?: string
 }
 
@@ -82,7 +82,7 @@ export type InboxItem = {
   requestId?: string
 }
 
-export type ClientRequestStatus = 'Waiting for Client' | 'Answered' | 'Resolved'
+export type ClientRequestStatus = 'Draft' | 'Waiting for Client' | 'Answered' | 'Client Responded' | 'Resolved'
 
 export type ClientRequest = {
   id: string
@@ -93,6 +93,13 @@ export type ClientRequest = {
   question: string
   status: ClientRequestStatus
   answer?: string
+  quickBooksId?: string
+  transactionType?: string
+  payee?: string
+  transactionDate?: string
+  amount?: string
+  currentCategory?: string
+  responseCategory?: string
 }
 
 export type InvoiceStatus = 'Open' | 'Overdue' | 'Partially Paid' | 'Paid'
@@ -325,6 +332,7 @@ export const navigationItems = [
   { label: 'Dashboard', icon: '⌂' },
   { label: 'Clients', icon: '●' },
   { label: 'Inbox', icon: '✉' },
+  { label: 'Bookkeeping Review', icon: '!' },
   { label: 'Transactions', icon: '↔' },
   { label: 'Reconcile', icon: '✓' },
   { label: 'Receivables', icon: '$' },
