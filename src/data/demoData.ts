@@ -24,6 +24,15 @@ export type WorkItem = {
 
 export type TransactionStatus = 'Needs Review' | 'Categorized' | 'Matched' | 'Needs Receipt'
 
+/** One expense line of a transaction. Split transactions have several, each with its own category. */
+export type TransactionLine = {
+  id: string
+  description: string
+  amount: number
+  category: string
+  categoryId?: string
+}
+
 export type Transaction = {
   id: string
   date: string
@@ -34,6 +43,11 @@ export type Transaction = {
   status: TransactionStatus
   suggestedCategory?: string
   confidence?: number
+  /** The bank or card the money moved through, not the category. */
+  account?: string
+  /** When absent the transaction is treated as a single line using `category`. */
+  lines?: TransactionLine[]
+  clientId?: string
 }
 
 export type ReconciliationTransaction = {
@@ -214,7 +228,7 @@ export const clients: Client[] = [
   },
 ]
 
-export const demoTransactions: Transaction[] = [
+const baseTransactions: Transaction[] = [
   { id: 'txn-001', date: 'Aug 29, 2026', payee: 'Amazon', description: 'Office supplies and shipping materials', amount: '$47.82', category: 'Uncategorized', status: 'Needs Review', suggestedCategory: 'Office Supplies', confidence: 94 },
   { id: 'txn-002', date: 'Aug 28, 2026', payee: 'Home Depot', description: 'PVC pipe and plumbing fittings', amount: '$341.22', category: 'Uncategorized', status: 'Needs Review', suggestedCategory: 'Materials', confidence: 97 },
   { id: 'txn-003', date: 'Aug 27, 2026', payee: 'Shell', description: 'Truck fuel', amount: '$82.41', category: 'Fuel', status: 'Categorized' },
@@ -230,51 +244,23 @@ export const demoTransactions: Transaction[] = [
   { id: 'txn-013', date: 'Aug 13, 2026', payee: 'UPS', description: 'Parts delivery to jobsite', amount: '$38.72', category: 'Shipping', status: 'Needs Receipt' },
   { id: 'txn-014', date: 'Aug 10, 2026', payee: 'Office Depot', description: 'Printer paper and ink cartridges', amount: '$73.45', category: 'Office Supplies', status: 'Categorized' },
   { id: 'txn-015', date: 'Aug 05, 2026', payee: 'BuildPro Training', description: 'Backflow certification course', amount: '$225.00', category: 'Training', status: 'Matched' },
+  { id: 'txn-016', date: 'Aug 21, 2026', payee: 'Costco Wholesale', description: 'Shop supplies and breakroom restock', amount: '$286.40', category: 'Split', status: 'Needs Review', account: 'Chase Business Credit Card', lines: [
+    { id: 'txn-016-1', description: 'Printer paper and toner', amount: 120.4, category: 'Office Supplies' },
+    { id: 'txn-016-2', description: 'Coffee and snacks', amount: 64, category: 'Uncategorized' },
+    { id: 'txn-016-3', description: 'Cleaning supplies', amount: 102, category: 'Uncategorized' },
+  ] },
+  { id: 'txn-017', date: 'Aug 12, 2026', payee: 'Home Depot', description: 'Job materials and a new ladder rack', amount: '$763.84', category: 'Split', status: 'Needs Review', account: 'Chase Business Checking', lines: [
+    { id: 'txn-017-1', description: 'PVC pipe and fittings', amount: 341.22, category: 'Materials' },
+    { id: 'txn-017-2', description: 'Truck ladder rack', amount: 422.62, category: 'Uncategorized' },
+  ] },
+  { id: 'txn-018', date: 'Jul 30, 2026', payee: 'Home Depot', description: 'Copper fittings and flux', amount: '$198.40', category: 'Materials', status: 'Matched' },
+  { id: 'txn-019', date: 'Jul 18, 2026', payee: 'Home Depot', description: 'Pipe wrap and hangers', amount: '$74.10', category: 'Materials', status: 'Matched' },
 ]
 
-export const reconciliationAccounts: ReconciliationAccount[] = [
-  {
-    id: 'chase-checking',
-    name: 'Chase Business Checking',
-    lastReconciled: 'July 31, 2026',
-    statementEnding: 'August 31, 2026',
-    quickBooksBalance: 48421.72,
-    statementBalance: 48421.72,
-    status: 'Ready to complete',
-    transactions: [
-      { id: 'rec-checking-1', date: 'Aug 02, 2026', payee: 'ABC Plumbing Customer', amount: 5000, type: 'Deposit', cleared: true },
-      { id: 'rec-checking-2', date: 'Aug 04, 2026', payee: 'Home Depot', amount: 341.22, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-3', date: 'Aug 05, 2026', payee: 'Shell', amount: 82.41, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-4', date: 'Aug 07, 2026', payee: 'Verizon', amount: 126.44, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-5', date: 'Aug 09, 2026', payee: 'Grainger', amount: 218.65, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-6', date: 'Aug 11, 2026', payee: 'City Water Department', amount: 174.2, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-7', date: 'Aug 13, 2026', payee: 'Ace Hardware', amount: 96.37, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-8', date: 'Aug 15, 2026', payee: 'Quick Lane', amount: 89.5, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-9', date: 'Aug 17, 2026', payee: 'Lowe\'s', amount: 412.06, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-10', date: 'Aug 20, 2026', payee: 'State Farm', amount: 286, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-11', date: 'Aug 22, 2026', payee: 'UPS', amount: 38.72, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-12', date: 'Aug 25, 2026', payee: 'Office Depot', amount: 73.45, type: 'Withdrawal', cleared: true },
-      { id: 'rec-checking-13', date: 'Aug 29, 2026', payee: 'Payroll', amount: 1639.26, type: 'Withdrawal', cleared: true },
-    ],
-  },
-  {
-    id: 'chase-card',
-    name: 'Chase Business Credit Card',
-    lastReconciled: 'July 31, 2026',
-    statementEnding: 'August 31, 2026',
-    quickBooksBalance: 6010.3,
-    statementBalance: 6234.5,
-    status: 'Difference to resolve',
-    possibleProblems: ['Home Depot charge may be missing from the books', 'A duplicate materials charge may be recorded', 'The statement amount may be different'],
-    transactions: [
-      { id: 'rec-card-1', date: 'Aug 03, 2026', payee: 'Amazon Business', amount: 112.45, type: 'Withdrawal', cleared: true },
-      { id: 'rec-card-2', date: 'Aug 08, 2026', payee: 'Home Depot', amount: 224.2, type: 'Withdrawal', cleared: true },
-      { id: 'rec-card-3', date: 'Aug 12, 2026', payee: 'Adobe', amount: 59.99, type: 'Withdrawal', cleared: true },
-      { id: 'rec-card-4', date: 'Aug 18, 2026', payee: 'BuildPro Training', amount: 225, type: 'Withdrawal', cleared: true },
-      { id: 'rec-card-5', date: 'Aug 24, 2026', payee: 'Fuel Rewards', amount: 88.66, type: 'Withdrawal', cleared: true },
-    ],
-  },
-]
+export const demoTransactions: Transaction[] = baseTransactions.map((transaction) => ({ account: 'Chase Business Checking', clientId: 'abc-plumbing', ...transaction }))
+
+// Derived from the raw statement and register inputs in demoReconciliation.ts, never typed in.
+export { reconciliationAccounts } from './demoReconciliation'
 
 export const monthEndItems: MonthEndItem[] = [
   { id: 'month-bank', label: 'Bank reconciliations', status: 'Complete' },

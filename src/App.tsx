@@ -1,11 +1,10 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { demoDataService } from "./services/demoDataService";
 import type {
   Bill,
   Client,
   ClientRequest,
   DemoReportData,
-  InboxItem,
   Invoice,
   LedgerAccount,
   LedgerBill,
@@ -22,6 +21,45 @@ import {
   type QuickBooksCompany,
   type QuickBooksStatus,
 } from "./services/quickBooksService";
+import type { AuthUser } from "./services/authService";
+import {
+  QUICKBOOKS_CLIENT_ID,
+  buildReviewTasks,
+  buildWorkTasks,
+  countByClient,
+  filterTasks,
+  isReviewTask,
+  monthEndPercent,
+  scopeRequests,
+  summarizeTasks,
+  taskPriorities,
+  taskStatuses,
+  taskTypes,
+  type ClientRecords,
+  type TaskPriority,
+  type TaskStatus,
+  type TaskType,
+  type WorkTask,
+} from "./services/workQueue";
+import {
+  DEMO_CATEGORIES,
+  adjacentInQueue,
+  applyLineChanges,
+  categoriesIn,
+  categoryLabel,
+  filterTransactions,
+  getLines,
+  isExpenseCategoryAccount,
+  isUncategorized,
+  matchesReviewFilter,
+  reviewFilters,
+  validateLineChanges,
+  type LineChange,
+  type ReviewFilter,
+} from "./services/transactionReview";
+import { suggestCategories } from "./services/categorySuggestions";
+import { ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
+import { demoReconSources } from "./data/demoReconciliation";
 
 const {
   bills: demoBills,
@@ -30,12 +68,10 @@ const {
   demoClient,
   invoices: demoInvoices,
   transactions: demoTransactions,
-  inboxItems,
   monthEndItems,
   navigationItems,
   reconciliationAccounts,
   reports: demoReports,
-  todaysWork,
 } = demoDataService;
 
 type View =
@@ -54,19 +90,18 @@ type View =
 type TransactionSource = "demo" | "quickbooks";
 type AccountSource = "demo" | "quickbooks";
 type ReviewSource = "demo" | "quickbooks";
-type ReviewCategory = "Transactions" | "Receivables" | "Payables" | "Reconciliation";
+type QuickBooksReviewData = { transactions: LedgerTransaction[]; accounts: LedgerAccount[]; invoices: LedgerInvoice[]; bills: LedgerBill[] };
 
-type ReviewItem = {
-  id: string;
-  category: ReviewCategory;
-  issueType: string;
-  client: string;
-  description: string;
-  amount?: number;
-  priority: "High" | "Medium" | "Low";
-  action: string;
-  destination: "Transactions" | "Receivables" | "Payables" | "Reconcile";
-};
+// Only one demo client has individual records; these pages cannot show anything for the others.
+const detailViews: View[] = ["Transactions", "Reconcile", "Receivables", "Payables", "Reports", "Month End", "Client Requests"];
+const scopeViews: View[] = ["Dashboard", "Clients", "Inbox", "Bookkeeping Review"];
+const NOT_AVAILABLE = "Not available";
+
+const ClientNameContext = createContext("");
+function ClientName({ upper }: { upper?: boolean }) {
+  const name = useContext(ClientNameContext);
+  return <>{upper ? name.toUpperCase() : name}</>;
+}
 
 type AuditLogEntry = {
   timestamp: string;
@@ -85,20 +120,18 @@ type MonthEndCompletion = {
   completedBy: string;
 };
 
-function App() {
+function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [currentDate, setCurrentDate] = useState(() => new Date());
   const [view, setView] = useState<View>("Dashboard");
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
+  const [companyOpen, setCompanyOpen] = useState(false);
   const [transactions, setTransactions] =
     useState<Transaction[]>(demoTransactions);
   const [selectedTransaction, setSelectedTransaction] =
     useState<Transaction | null>(null);
-  const [selectedReconciliation, setSelectedReconciliation] =
-    useState<ReconciliationAccount | null>(null);
   const [monthEndChecklist, setMonthEndChecklist] =
     useState<MonthEndItem[]>(monthEndItems);
   const [monthEndCompleted, setMonthEndCompleted] = useState(false);
-  const [inbox, setInbox] = useState<InboxItem[]>(inboxItems);
   const [requests, setRequests] = useState<ClientRequest[]>(clientRequests);
   const [selectedRequest, setSelectedRequest] = useState<ClientRequest | null>(
     null,
@@ -165,8 +198,27 @@ function App() {
     quickBooksService.getStatus().then(setQuickBooksStatus).catch(() => undefined);
   }, []);
 
-  const openClient = (client: Client) => {
+  const sandboxName = quickBooksCompany?.CompanyName || "QuickBooks Sandbox company";
+  const todayLabel = () => new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+
+  // Anything opened for one client must not stay open for another.
+  const selectClient = (client: Client | null) => {
     setSelectedClient(client);
+    setCompanyOpen(false);
+    setSelectedTransaction(null);
+    setSelectedInvoice(null);
+    setSelectedBill(null);
+    setSelectedRequest(null);
+  };
+
+  const openClient = (client: Client) => {
+    selectClient(client);
+    setView("Dashboard");
+  };
+
+  const openCompany = () => {
+    selectClient(null);
+    setCompanyOpen(true);
     setView("Dashboard");
   };
 
@@ -176,7 +228,6 @@ function App() {
   };
 
   const openReconcile = () => {
-    setSelectedReconciliation(null);
     setView("Reconcile");
   };
 
@@ -201,6 +252,7 @@ function App() {
   const openSettings = () => setView("Settings");
 
   const changeAppDataSource = async (source: AccountSource) => {
+    selectClient(null);
     setAppDataSource(source);
     await Promise.all([
       changeTransactionSource(source),
@@ -211,19 +263,58 @@ function App() {
     ]);
   };
 
-  const updateQuickBooksTransaction = async (transaction: LedgerTransaction, newCategory: string) => {
-    const entryBase = { timestamp: new Date().toISOString(), quickBooksId: transaction.quickBooksId || transaction.id, transactionType: transaction.transactionType || "Unknown", oldCategory: transaction.category, newCategory };
+  const replaceQuickBooksTransaction = (updated: LedgerTransaction) => {
+    const swap = (list: LedgerTransaction[]) => list.map((item) => (item.id === updated.id ? updated : item));
+    setQuickBooksTransactions(swap);
+    setReviewData((current) => (current ? { ...current, transactions: swap(current.transactions) } : current));
+    setSelectedTransaction((current) => (current?.id === updated.id ? updated : current));
+  };
+
+  const reloadQuickBooksTransactions = async (transaction?: Transaction) => {
+    const refreshed = await quickBooksService.getTransactions();
+    setQuickBooksTransactions(refreshed);
+    setReviewData((current) => (current ? { ...current, transactions: refreshed } : current));
+    if (transaction) setSelectedTransaction(refreshed.find((item) => item.id === transaction.id) ?? null);
+  };
+
+  // Demo changes only touch local state; QuickBooks changes go through the server's line-level update.
+  const applyTransactionChanges = async (transaction: Transaction, changes: LineChange[]): Promise<Transaction> => {
+    if (appDataSource === "demo") {
+      const updated = applyLineChanges(transaction, changes);
+      updateTransaction(updated);
+      return updated;
+    }
+    const quickBooksTransaction = transaction as LedgerTransaction;
+    const lines = getLines(transaction);
+    const timestamp = new Date().toISOString();
+    const entries = changes.map((change) => ({
+      timestamp,
+      quickBooksId: `${quickBooksTransaction.quickBooksId ?? transaction.id} · line ${change.lineId}`,
+      transactionType: quickBooksTransaction.transactionType || "Unknown",
+      oldCategory: lines.find((line) => line.id === change.lineId)?.category ?? "Unknown",
+      newCategory: change.category,
+    }));
     try {
-      await quickBooksService.updateTransactionAccount(transaction.transactionType || "", transaction.quickBooksId || "", newCategory);
-      setAuditLog((entries) => [{ ...entryBase, result: "Success" }, ...entries]);
-      const refreshed = await quickBooksService.getTransactions();
-      setQuickBooksTransactions(refreshed);
-      return refreshed.find((item) => item.quickBooksId === transaction.quickBooksId) || transaction;
+      const check = validateLineChanges(transaction, changes);
+      if (!check.ok) throw new Error(check.error);
+      if (changes.some((change) => !change.categoryId)) throw new Error("Choose a category from your QuickBooks accounts.");
+      const updated = await quickBooksService.updateTransactionLines(
+        quickBooksTransaction,
+        changes.map((change) => ({ lineId: change.lineId, accountId: change.categoryId! })),
+      );
+      replaceQuickBooksTransaction(updated);
+      setAuditLog((current) => [...entries.map((entry) => ({ ...entry, result: "Success" as const })), ...current]);
+      return updated;
     } catch (error) {
-      setAuditLog((entries) => [{ ...entryBase, result: "Failed" }, ...entries]);
+      setAuditLog((current) => [...entries.map((entry) => ({ ...entry, result: "Failed" as const })), ...current]);
       throw error;
     }
   };
+
+  const quickBooksCategoryOptions: CategoryOption[] = (quickBooksAccounts.length > 0 ? quickBooksAccounts : reviewData?.accounts ?? [])
+    .filter((account) => isExpenseCategoryAccount(account) && !isUncategorized(account.name))
+    .map((account) => ({ id: account.quickBooksId, name: account.name }));
+  const demoCategoryOptions: CategoryOption[] = [...new Set([...DEMO_CATEGORIES, ...categoriesIn(transactions).filter((name) => !isUncategorized(name) && name !== "Split")])].map((name) => ({ name }));
 
   const updateMonthEndItem = (updatedItem: MonthEndItem) => {
     setMonthEndChecklist((currentItems) =>
@@ -247,8 +338,8 @@ function App() {
   const createRequest = (transaction: Transaction) => {
     const request: ClientRequest = {
       id: `request-${transaction.id}`,
-      client: "ABC Plumbing",
-      dateCreated: "September 7, 2026",
+      client: demoClient.name,
+      dateCreated: todayLabel(),
       relatedTransaction: transaction.payee,
       relatedAmount: transaction.amount,
       question: "What was this purchase for?",
@@ -259,32 +350,14 @@ function App() {
         ? currentRequests
         : [...currentRequests, request],
     );
-    setInbox((currentInbox) =>
-      currentInbox.some((item) => item.requestId === request.id)
-        ? currentInbox
-        : [
-            ...currentInbox,
-            {
-              id: `inbox-${request.id}`,
-              client: request.client,
-              type: "Client Question",
-              description: `${request.relatedTransaction} purchase needs an answer`,
-              priority: "High",
-              date: "Today",
-              status: "Open",
-              destination: "Client Requests",
-              requestId: request.id,
-            },
-          ],
-    );
     updateTransaction({ ...transaction, status: "Needs Receipt" });
   };
 
   const createQuickBooksRequest = (transaction: LedgerTransaction, question: string) => {
     const request: ClientRequest = {
       id: `request-${transaction.quickBooksId || transaction.id}`,
-      client: "ABC Plumbing",
-      dateCreated: new Date().toLocaleDateString(),
+      client: sandboxName,
+      dateCreated: todayLabel(),
       relatedTransaction: transaction.payee,
       relatedAmount: transaction.amount,
       question,
@@ -297,24 +370,12 @@ function App() {
       currentCategory: transaction.category,
     };
     setRequests((currentRequests) => currentRequests.some((item) => item.id === request.id) ? currentRequests : [...currentRequests, request]);
-    setInbox((currentInbox) => currentInbox.some((item) => item.requestId === request.id) ? currentInbox : [...currentInbox, { id: `inbox-${request.id}`, client: request.client, type: "Client Question", description: `${request.payee} purchase needs an answer`, priority: "High", date: "Today", status: "Open", destination: "Client Requests", requestId: request.id }]);
   };
 
   const updateRequest = (updatedRequest: ClientRequest) => {
     setRequests((currentRequests) =>
       currentRequests.map((request) =>
         request.id === updatedRequest.id ? updatedRequest : request,
-      ),
-    );
-    setInbox((currentInbox) =>
-      currentInbox.map((item) =>
-        item.requestId === updatedRequest.id
-          ? {
-              ...item,
-              status:
-                updatedRequest.status === "Resolved" ? "Resolved" : updatedRequest.status === "Client Responded" ? "Answered" : "Open",
-            }
-          : item,
       ),
     );
     setSelectedRequest(updatedRequest);
@@ -324,10 +385,15 @@ function App() {
     if (!request.quickBooksId || !request.transactionType || !request.responseCategory) throw new Error("This request is not linked to a writable QuickBooks transaction.");
     const transaction = quickBooksTransactions.find((item) => item.quickBooksId === request.quickBooksId);
     if (!transaction) throw new Error("The linked QuickBooks transaction could not be refreshed.");
-    await updateQuickBooksTransaction(transaction, request.responseCategory);
+    if (transaction.readOnlyReason) throw new Error(transaction.readOnlyReason);
+    const lines = getLines(transaction);
+    if (lines.length !== 1) throw new Error("This transaction has several lines. Open it in Transactions and categorize each line individually.");
+    const wanted = request.responseCategory.trim().toLowerCase();
+    const option = quickBooksCategoryOptions.find((item) => item.name.toLowerCase() === wanted);
+    if (!option?.id) throw new Error(`QuickBooks account "${request.responseCategory}" was not found.`);
+    await applyTransactionChanges(transaction, [{ lineId: lines[0].id, category: option.name, categoryId: option.id }]);
     const resolved = { ...request, status: "Resolved" as const };
     setRequests((currentRequests) => currentRequests.map((item) => item.id === request.id ? resolved : item));
-    setInbox((currentInbox) => currentInbox.filter((item) => item.requestId !== request.id));
     setSelectedRequest(resolved);
   };
 
@@ -338,28 +404,14 @@ function App() {
   ) => {
     const request: ClientRequest = {
       id: `request-${Date.now()}`,
-      client: "ABC Plumbing",
-      dateCreated: "September 7, 2026",
+      client: demoClient.name,
+      dateCreated: todayLabel(),
       relatedTransaction,
       relatedAmount,
       question,
       status: "Waiting for Client",
     };
     setRequests((currentRequests) => [...currentRequests, request]);
-    setInbox((currentInbox) => [
-      ...currentInbox,
-      {
-        id: `inbox-${request.id}`,
-        client: request.client,
-        type: "Client Question",
-        description: `${relatedTransaction} needs an answer`,
-        priority: "High",
-        date: "Today",
-        status: "Open",
-        destination: "Client Requests",
-        requestId: request.id,
-      },
-    ]);
   };
 
   const updateInvoice = (invoice: Invoice) => {
@@ -396,7 +448,6 @@ function App() {
 
   const changeAccountSource = async (source: AccountSource) => {
     setAccountSource(source);
-    setSelectedReconciliation(null);
     if (source !== "quickbooks" || quickBooksAccounts.length > 0) return;
     setQuickBooksAccountsLoading(true);
     setQuickBooksAccountsError(null);
@@ -471,14 +522,40 @@ function App() {
     }
   };
 
-  const openReviewDestination = (destination: ReviewItem["destination"]) => {
-    if (destination === "Transactions") openTransactions();
-    else if (destination === "Receivables") openReceivables();
-    else if (destination === "Payables") openPayables();
-    else openReconcile();
+  const source = appDataSource;
+  const scopedRequests = scopeRequests(requests, source);
+  const quickBooksChecklist = reviewData ? buildQuickBooksMonthEndChecklist(reviewData, scopedRequests) : [];
+  // Demo records exist for one client only; QuickBooks is one connected company and is never a demo client.
+  const queueAvailable = source === "demo" || reviewData !== null;
+  const records: ClientRecords =
+    source === "demo"
+      ? { client: { id: demoClient.id, name: demoClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts, requests: scopedRequests, monthEnd: monthEndChecklist }
+      : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: quickBooksChecklist };
+  const allTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== demoClient.id) : []) : [];
+  const activeClient = source === "demo" ? selectedClient : null;
+  const visibleTasks = filterTasks(allTasks, { clientId: activeClient?.id });
+  const hasDetail = !activeClient || activeClient.id === demoClient.id;
+  const showNoDetail = Boolean(activeClient) && !hasDetail && detailViews.includes(view);
+  const scopeName = source === "demo" ? demoClient.name : sandboxName;
+  const clientMonthEnd = (client: Client) => (client.id === demoClient.id ? monthEndPercent(monthEndChecklist) : client.monthEnd);
+  const openedMonthEnd = source === "demo" ? (selectedClient ? clientMonthEnd(selectedClient) : null) : monthEndPercent(quickBooksChecklist);
+
+  const openTask = (task: WorkTask) => {
+    if (source === "demo") {
+      const owner = clients.find((client) => client.id === task.clientId);
+      if (owner && owner.id !== selectedClient?.id) selectClient(owner);
+    }
+    if (task.requestId) {
+      setSelectedRequest(requests.find((item) => item.id === task.requestId) ?? null);
+      setView("Client Requests");
+      return;
+    }
+    const open = { Transactions: openTransactions, Receivables: openReceivables, Payables: openPayables, Reconcile: openReconcile, "Month End": openMonthEnd, "Client Requests": openRequests }[task.destination];
+    open();
   };
 
   return (
+    <ClientNameContext.Provider value={scopeName}>
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand-mark">
@@ -540,10 +617,10 @@ function App() {
           })}
         </nav>
         <div className="sidebar-footer">
-          <div className="avatar">JR</div>
+          <div className="avatar">{(user.name || user.email).trim().slice(0, 2).toUpperCase()}</div>
           <div>
-            <strong>Jordan Reed</strong>
-            <span>Bookkeeper</span>
+            <strong>{user.name || user.email}</strong>
+            <button className="sign-out-button" onClick={onSignOut}>Sign out</button>
           </div>
         </div>
       </aside>
@@ -561,14 +638,18 @@ function App() {
             </p>
             <h1>
               {view === "Dashboard"
-                ? selectedClient
-                  ? selectedClient.name
-                  : "Let's get to work!"
+                ? activeClient
+                  ? activeClient.name
+                  : companyOpen && source === "quickbooks"
+                    ? sandboxName
+                    : "Let's get to work!"
                 : view}
             </h1>
           </div>
           <div className="global-source-area">
+            <ClientSwitcher source={source} clients={clients} selected={activeClient} sandboxName={sandboxName} onSelect={selectClient} />
             <AccountSourceSwitch source={appDataSource} onChange={changeAppDataSource} />
+            <span className={`source-badge ${source}`}>{source === "demo" ? "Demo data" : "QuickBooks Sandbox"}</span>
             {appDataSource === "quickbooks" && <div className="global-source-meta"><strong>{quickBooksCompany?.CompanyName || "QuickBooks Sandbox"}</strong><span>Sandbox · Write Enabled · Test Data Only</span></div>}
             {appDataSource === "quickbooks" && !quickBooksStatus.connected && <button className="text-button" onClick={openSettings}>Connect in Settings →</button>}
           </div>
@@ -577,86 +658,87 @@ function App() {
           </button>
         </header>
 
-        {view === "Dashboard" ? (
+        {scopeViews.includes(view) && <ScopeNotice source={source} client={activeClient} />}
+
+        {showNoDetail && activeClient ? (
+          <NoDetailNotice
+            client={activeClient}
+            monthEnd={clientMonthEnd(activeClient)}
+            onOpenDetailed={() => selectClient(demoClient)}
+            onBack={() => setView("Dashboard")}
+          />
+        ) : view === "Dashboard" ? (
           <Dashboard
-            client={selectedClient}
-            accountSource={appDataSource}
+            client={activeClient}
+            companyOpen={source === "quickbooks" && companyOpen}
+            companyName={sandboxName}
+            source={source}
+            available={queueAvailable}
+            tasks={visibleTasks}
+            clientTaskCounts={countByClient(allTasks)}
+            clients={clients}
+            monthEndProgress={openedMonthEnd}
             quickBooksAccounts={quickBooksAccounts}
-            onBack={() => setSelectedClient(null)}
+            accountLoading={quickBooksAccountsLoading}
+            accountError={quickBooksAccountsError}
+            loading={reviewLoading}
+            error={reviewError}
+            onSourceChange={changeAppDataSource}
+            onBack={() => selectClient(null)}
             onOpen={openClient}
+            onOpenCompany={openCompany}
             onViewClients={() => setView("Clients")}
+            onOpenInbox={openInbox}
+            onOpenTask={openTask}
             onTransactions={openTransactions}
             onReconcile={openReconcile}
             onMonthEnd={openMonthEnd}
             onReceivables={openReceivables}
             onPayables={openPayables}
             onReports={openReports}
-            onAccountSourceChange={changeAccountSource}
-            accountLoading={quickBooksAccountsLoading}
-            accountError={quickBooksAccountsError}
-            reviewSource={appDataSource}
-            reviewData={reviewData}
-            reviewLoading={reviewLoading}
-            reviewError={reviewError}
-            reviewRequests={requests}
-            reviewReconciliationAccounts={reconciliationAccounts}
-            onReviewSourceChange={changeAppDataSource}
-            onOpenReview={() => setView("Bookkeeping Review")}
-            onReviewNavigate={openReviewDestination}
           />
         ) : view === "Clients" ? (
-          <Clients onOpen={openClient} />
-        ) : view === "Bookkeeping Review" ? (
-          <BookkeepingReview source={appDataSource} data={reviewData} clientRequests={requests} reconciliationAccounts={reconciliationAccounts} loading={reviewLoading} error={reviewError} onSourceChange={changeAppDataSource} onNavigate={openReviewDestination} />
-        ) : view === "Inbox" ? (
-          <Inbox
-            items={inbox}
-            onOpenRequest={(requestId) => {
-              const request = requests.find((item) => item.id === requestId);
-              if (request) {
-                setSelectedRequest(request);
-                openRequests();
-              }
-            }}
-            onNavigate={(destination) =>
-              destination === "Transactions"
-                ? openTransactions()
-                : destination === "Reconcile"
-                  ? openReconcile()
-                  : destination === "Receivables"
-                    ? openReceivables()
-                    : destination === "Payables"
-                      ? openPayables()
-                      : destination === "Month End"
-                        ? openMonthEnd()
-                        : openRequests()
-            }
+          <Clients
+            source={source}
+            clients={clients}
+            tasks={allTasks}
+            available={queueAvailable}
+            companyName={sandboxName}
+            connected={quickBooksStatus.connected}
+            monthEndFor={clientMonthEnd}
+            onOpen={openClient}
+            onOpenCompany={openCompany}
           />
+        ) : view === "Bookkeeping Review" ? (
+          <BookkeepingReview source={source} tasks={visibleTasks.filter(isReviewTask)} available={queueAvailable} loading={reviewLoading} error={reviewError} onSourceChange={changeAppDataSource} onOpenTask={openTask} />
+        ) : view === "Inbox" ? (
+          <Inbox tasks={visibleTasks} source={source} available={queueAvailable} loading={reviewLoading} error={reviewError} scopeLabel={activeClient?.name ?? (source === "demo" ? "All clients" : sandboxName)} onOpenTask={openTask} />
         ) : view === "Transactions" ? (
           <Transactions
             transactions={transactions}
             quickBooksTransactions={quickBooksTransactions}
             source={appDataSource}
+            clientId={activeClient?.id ?? null}
+            categoryOptions={appDataSource === "demo" ? demoCategoryOptions : quickBooksCategoryOptions}
             isLoading={quickBooksTransactionsLoading}
             error={quickBooksTransactionsError}
             onSourceChange={changeAppDataSource}
             selectedTransaction={selectedTransaction}
             onSelect={setSelectedTransaction}
             onBack={() => setSelectedTransaction(null)}
-            onUpdate={updateTransaction}
+            onApplyChanges={applyTransactionChanges}
+            onReload={reloadQuickBooksTransactions}
             onRequestInformation={createRequest}
-            onQuickBooksUpdate={updateQuickBooksTransaction}
             onCreateQuickBooksRequest={createQuickBooksRequest}
           />
         ) : view === "Reconcile" ? (
           <Reconcile
             source={appDataSource}
+            clientRef={records.client}
             accounts={quickBooksAccounts}
             isLoading={quickBooksAccountsLoading}
             error={quickBooksAccountsError}
-            selectedAccount={selectedReconciliation}
-            onSelect={setSelectedReconciliation}
-            onBack={() => setSelectedReconciliation(null)}
+            today={currentDate.toISOString().slice(0, 10)}
             onSourceChange={changeAppDataSource}
           />
         ) : view === "Receivables" ? (
@@ -697,12 +779,11 @@ function App() {
             quickBooksAccounts={quickBooksAccounts}
             quickBooksInvoices={quickBooksInvoices}
             quickBooksBills={quickBooksBills}
-            reviewRequests={requests}
-            reviewReconciliationAccounts={reconciliationAccounts}
+            reviewRequests={scopedRequests}
             completed={monthEndCompleted}
             onUpdate={updateMonthEndItem}
             history={monthEndHistory}
-            onComplete={(status) => { setMonthEndCompleted(true); setMonthEndHistory((entries) => [{ client: "ABC Plumbing", month: "August 2026", dateCompleted: new Date().toLocaleDateString(), checklistStatus: status, completedBy: "LedgerOps User" }, ...entries]); }}
+            onComplete={(status) => { setMonthEndCompleted(true); setMonthEndHistory((entries) => [{ client: scopeName, month: "August 2026", dateCompleted: new Date().toLocaleDateString(), checklistStatus: status, completedBy: "LedgerOps User" }, ...entries]); }}
             onNavigate={(destination) =>
               destination === "Transactions"
                 ? openTransactions()
@@ -711,7 +792,7 @@ function App() {
           />
         ) : view === "Client Requests" ? (
           <ClientRequests
-            requests={requests}
+            requests={scopedRequests}
             selectedRequest={selectedRequest}
             onSelect={setSelectedRequest}
             onBack={() => setSelectedRequest(null)}
@@ -729,70 +810,156 @@ function App() {
         )}
       </main>
     </div>
+    </ClientNameContext.Provider>
+  );
+}
+
+function formatDueDate(iso: string) {
+  const [year, month, day] = iso.split("-").map(Number);
+  return new Date(year, month - 1, day).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+const taskSlug = (value: string) => value.toLowerCase().replaceAll(" ", "-");
+
+function TaskCardList({ tasks, showClient, onOpenTask }: { tasks: WorkTask[]; showClient: boolean; onOpenTask: (task: WorkTask) => void }) {
+  return (
+    <div className="review-card-list">
+      {tasks.map((task) => (
+        <button className="review-card" key={task.id} onClick={() => onOpenTask(task)}>
+          <div className="review-card-top">
+            <span className="review-type">{showClient ? `${task.client} · ` : ""}{task.issue}</span>
+            <span className={`priority-badge ${task.priority.toLowerCase()}`}>{task.priority}</span>
+          </div>
+          <p>{task.description}</p>
+          {task.amount !== undefined && <span className="review-amount">{formatMoney(task.amount)}</span>}
+          <div className="review-card-footer">
+            <span>{task.suspected ? "Possible issue · " : ""}{task.dueDate ? `Due ${formatDueDate(task.dueDate)} · ` : ""}Next: {task.action}</span>
+            <span className="row-arrow">→</span>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ClientSwitcher({ source, clients, selected, sandboxName, onSelect }: { source: AccountSource; clients: Client[]; selected: Client | null; sandboxName: string; onSelect: (client: Client | null) => void }) {
+  if (source === "quickbooks")
+    return (
+      <label className="client-switcher" title="QuickBooks Sandbox connects one company. Switching clients is not available yet.">
+        <span>Client</span>
+        <select disabled value="company"><option value="company">{sandboxName}</option></select>
+      </label>
+    );
+  return (
+    <label className="client-switcher">
+      <span>Client</span>
+      <select value={selected?.id ?? ""} onChange={(event) => onSelect(clients.find((client) => client.id === event.target.value) ?? null)}>
+        <option value="">All clients</option>
+        {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function ScopeNotice({ source, client }: { source: AccountSource; client: Client | null }) {
+  if (source === "quickbooks")
+    return <div className="scope-notice">QuickBooks Sandbox shows one connected company. It is not linked to any demo client, and connecting several companies is not supported yet.</div>;
+  if (client && client.id !== demoClient.id)
+    return <div className="scope-notice">Only {demoClient.name} has detailed demo records. {client.name} shows summary figures only and is not connected to QuickBooks.</div>;
+  return null;
+}
+
+function NoDetailNotice({ client, monthEnd, onOpenDetailed, onBack }: { client: Client; monthEnd: number | null; onOpenDetailed: () => void; onBack: () => void }) {
+  return (
+    <div className="page-content">
+      <div className="empty-state">
+        <h2>No detailed records for {client.name}</h2>
+        <p className="muted">Demo data only includes individual transactions, invoices, bills and requests for {demoClient.name}. {client.name} has summary figures only and is not connected to QuickBooks.</p>
+        <div className="detail-list">
+          <span><small>Items flagged</small><strong>{client.attention}</strong></span>
+          <span><small>Reconciliation</small><strong>{client.reconciliation}</strong></span>
+          <span><small>Month end</small><strong>{monthEnd === null ? NOT_AVAILABLE : `${monthEnd}%`}</strong></span>
+        </div>
+        <button className="primary-button" onClick={onOpenDetailed}>Open {demoClient.name}'s records <span>→</span></button>
+        <button className="text-button" onClick={onBack}>Back to dashboard</button>
+      </div>
+    </div>
   );
 }
 
 function Dashboard({
   client,
-  accountSource,
+  companyOpen,
+  companyName,
+  source,
+  available,
+  tasks,
+  clientTaskCounts,
+  clients,
+  monthEndProgress,
   quickBooksAccounts,
   accountLoading,
   accountError,
-  onAccountSourceChange,
+  loading,
+  error,
+  onSourceChange,
   onBack,
   onOpen,
+  onOpenCompany,
   onViewClients,
+  onOpenInbox,
+  onOpenTask,
   onTransactions,
   onReconcile,
   onMonthEnd,
   onReceivables,
   onPayables,
   onReports,
-  reviewSource,
-  reviewData,
-  reviewLoading,
-  reviewError,
-  reviewRequests,
-  reviewReconciliationAccounts,
-  onReviewSourceChange,
-  onOpenReview,
-  onReviewNavigate,
 }: {
   client: Client | null;
-  accountSource: AccountSource;
+  companyOpen: boolean;
+  companyName: string;
+  source: AccountSource;
+  available: boolean;
+  tasks: WorkTask[];
+  clientTaskCounts: Record<string, number>;
+  clients: Client[];
+  monthEndProgress: number | null;
   quickBooksAccounts: LedgerAccount[];
   accountLoading: boolean;
   accountError: string | null;
-  onAccountSourceChange: (source: AccountSource) => void;
+  loading: boolean;
+  error: string | null;
+  onSourceChange: (source: AccountSource) => void;
   onBack: () => void;
   onOpen: (client: Client) => void;
+  onOpenCompany: () => void;
   onViewClients: () => void;
+  onOpenInbox: () => void;
+  onOpenTask: (task: WorkTask) => void;
   onTransactions: () => void;
   onReconcile: () => void;
   onMonthEnd: () => void;
   onReceivables: () => void;
   onPayables: () => void;
   onReports: () => void;
-  reviewSource: ReviewSource;
-  reviewData: { transactions: LedgerTransaction[]; accounts: LedgerAccount[]; invoices: LedgerInvoice[]; bills: LedgerBill[] } | null;
-  reviewLoading: boolean;
-  reviewError: string | null;
-  reviewRequests: ClientRequest[];
-  reviewReconciliationAccounts: ReconciliationAccount[];
-  onReviewSourceChange: (source: ReviewSource) => void;
-  onOpenReview: () => void;
-  onReviewNavigate: (destination: ReviewItem["destination"]) => void;
 }) {
-  if (client)
+  if (client || companyOpen)
     return (
       <ClientDashboard
         client={client}
-        accountSource={accountSource}
+        companyName={companyName}
+        source={source}
+        available={available}
+        tasks={tasks}
+        monthEndProgress={monthEndProgress}
         quickBooksAccounts={quickBooksAccounts}
         accountLoading={accountLoading}
         accountError={accountError}
-        onAccountSourceChange={onAccountSourceChange}
+        onSourceChange={onSourceChange}
         onBack={onBack}
+        onOpenInbox={onOpenInbox}
+        onOpenTask={onOpenTask}
         onTransactions={onTransactions}
         onReconcile={onReconcile}
         onMonthEnd={onMonthEnd}
@@ -802,9 +969,10 @@ function Dashboard({
       />
     );
 
-  const reviewItems = buildReviewItems(reviewSource, reviewData, reviewRequests, reviewReconciliationAccounts);
-  const reviewCount = (predicate: (item: ReviewItem) => boolean) => reviewItems.filter(predicate).length;
-  const todaysReviewItems = [...reviewItems].sort((left, right) => ({ High: 0, Medium: 1, Low: 2 }[left.priority] - { High: 0, Medium: 1, Low: 2 }[right.priority])).slice(0, 8);
+  const summary = summarizeTasks(tasks);
+  const value = (count: number) => (available ? `${count}` : NOT_AVAILABLE);
+  const clientTotal = source === "demo" ? clients.length : 1;
+  const nextUp = tasks.slice(0, 8);
 
   return (
     <div className="page-content">
@@ -815,50 +983,24 @@ function Dashboard({
             Work through these items to keep your clients on track.
           </p>
         </div>
-        <button className="primary-button" onClick={onOpenReview}>
-          Open Bookkeeping Review <span>→</span>
+        <button className="primary-button" onClick={onOpenInbox}>
+          Open Inbox <span>→</span>
         </button>
       </section>
-      <AccountSourceSwitch source={reviewSource} onChange={onReviewSourceChange} />
-      {reviewLoading && <div className="data-state-message">Loading QuickBooks Sandbox review data...</div>}
-      {reviewError && <div className="data-state-message error">{reviewError}</div>}
+      <AccountSourceSwitch source={source} onChange={onSourceChange} />
+      {loading && <div className="data-state-message">Loading QuickBooks Sandbox data...</div>}
+      {error && <div className="data-state-message error">{error}</div>}
+      {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded. Connect in Settings to see real figures.</div>}
       <section className="metrics-grid" aria-label="Bookkeeping overview">
-        <MetricCard label="Clients" value="5" note="All clients" tone="green" />
-        <MetricCard
-          label="Items needing attention"
-          value={`${reviewItems.length}`}
-          note="From review rules"
-          tone="red"
-        />
-        <MetricCard
-          label="Transactions to review"
-          value={`${reviewCount((item) => item.category === "Transactions")}`}
-          note="Review queue"
-          tone="amber"
-        />
-        <MetricCard
-          label="Reconciliations"
-          value={`${reviewCount((item) => item.category === "Reconciliation")}`}
-          note="Review queue"
-          tone="blue"
-        />
-        <MetricCard
-          label="Client questions"
-          value={`${reviewRequests.filter((request) => request.status !== "Resolved").length}`}
-          note="Open client requests"
-          tone="purple"
-        />
-        <MetricCard
-          label="Month end"
-          value="90%"
-          note="ABC Plumbing"
-          tone="green"
-        />
-        <MetricCard label="High Priority" value={`${reviewCount((item) => item.priority === "High")}`} note="Review queue" tone="red" />
-        <MetricCard label="Medium Priority" value={`${reviewCount((item) => item.priority === "Medium")}`} note="Review queue" tone="amber" />
-        <MetricCard label="Low Priority" value={`${reviewCount((item) => item.priority === "Low")}`} note="Review queue" tone="green" />
-        <MetricCard label="Overdue invoices" value={`${reviewCount((item) => item.issueType === "Overdue invoice")}`} note="Receivables" tone="red" />
-        <MetricCard label="Overdue bills" value={`${reviewCount((item) => item.issueType === "Overdue bill")}`} note="Payables" tone="red" />
+        <MetricCard label="Clients" value={`${clientTotal}`} note={source === "demo" ? "Demo clients" : "Connected company"} tone="green" />
+        <MetricCard label="Clients needing attention" value={value(summary.clientsNeedingAttention)} note={available ? `of ${clientTotal}` : "Data not loaded"} tone="red" />
+        <MetricCard label="Transactions to review" value={value(summary.transactions)} note="Needs a look" tone="amber" />
+        <MetricCard label="Reconciliation issues" value={value(summary.reconciliation)} note="Accounts to check" tone="blue" />
+        <MetricCard label="Overdue invoices" value={value(summary.overdueInvoices)} note="Receivables" tone="red" />
+        <MetricCard label="Overdue bills" value={value(summary.overdueBills)} note="Payables" tone="red" />
+        <MetricCard label="Client questions" value={value(summary.clientQuestions)} note="Open requests" tone="purple" />
+        <MetricCard label="Month ends open" value={value(summary.clientsWithMonthEndOpen)} note="Clients not finished" tone="green" />
+        <MetricCard label="High priority" value={value(summary.high)} note="Do these first" tone="red" />
       </section>
       <section className="content-grid">
         <div className="panel work-panel">
@@ -867,34 +1009,48 @@ function Dashboard({
               <h2>Today's work</h2>
               <p className="muted">Start with the most important items.</p>
             </div>
-            <span className="count-pill">{todaysReviewItems.length} items</span>
+            <span className="count-pill">{available ? `${tasks.length} tasks` : NOT_AVAILABLE}</span>
           </div>
-          <div className="review-card-list">
-            {todaysReviewItems.map((item) => (
-              <button className="review-card" key={item.id} onClick={() => onReviewNavigate(item.destination)}>
-                <div className="review-card-top"><span className="review-type">{item.client} · {item.issueType}</span><span className={`priority-badge ${item.priority.toLowerCase()}`}>{item.priority}</span></div>
-                <p>{item.description}</p>
-                <div className="review-card-footer"><span>Next: {item.action}</span><span className="row-arrow">→</span></div>
-              </button>
-            ))}
-          </div>
+          {available && nextUp.length === 0 && <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">Nothing needs attention right now.</p></div>}
+          <TaskCardList tasks={nextUp} showClient={source === "demo"} onOpenTask={onOpenTask} />
+          {tasks.length > nextUp.length && (
+            <button className="text-button" onClick={onOpenInbox}>
+              See all {tasks.length} tasks in the Inbox <span>→</span>
+            </button>
+          )}
         </div>
         <div className="panel client-summary">
           <div className="panel-heading">
             <div>
               <h2>Your clients</h2>
-              <p className="muted">A quick look at their books.</p>
+              <p className="muted">{source === "demo" ? "Pick a client to focus on." : "The connected QuickBooks company."}</p>
             </div>
           </div>
-          <button className="client-card" onClick={() => onOpen(demoClient)}>
-            <div className="company-avatar">{demoClient.initials}</div>
-            <div className="client-info">
-              <strong>{demoClient.name}</strong>
-              <span>{demoClient.month}</span>
-            </div>
-            <span className="status-dot amber-dot" />{" "}
-            <span className="arrow">→</span>
-          </button>
+          {source === "demo" ? (
+            clients.map((item) => {
+              const open = clientTaskCounts[item.id] ?? 0;
+              return (
+                <button className="client-card" key={item.id} onClick={() => onOpen(item)}>
+                  <div className="company-avatar">{item.initials}</div>
+                  <div className="client-info">
+                    <strong>{item.name}</strong>
+                    <span>{open === 0 ? "Nothing open" : `${open} open`}</span>
+                  </div>
+                  <span className={`status-dot ${open === 0 ? "green-dot" : "amber-dot"}`} />{" "}
+                  <span className="arrow">→</span>
+                </button>
+              );
+            })
+          ) : (
+            <button className="client-card" onClick={onOpenCompany}>
+              <div className="company-avatar">QB</div>
+              <div className="client-info">
+                <strong>{companyName}</strong>
+                <span>{available ? `${tasks.length} open` : NOT_AVAILABLE}</span>
+              </div>
+              <span className="arrow">→</span>
+            </button>
+          )}
           <button className="text-button" onClick={onViewClients}>
             View all clients <span>→</span>
           </button>
@@ -904,7 +1060,30 @@ function Dashboard({
   );
 }
 
-function Clients({ onOpen }: { onOpen: (client: Client) => void }) {
+
+function Clients({
+  source,
+  clients,
+  tasks,
+  available,
+  companyName,
+  connected,
+  monthEndFor,
+  onOpen,
+  onOpenCompany,
+}: {
+  source: AccountSource;
+  clients: Client[];
+  tasks: WorkTask[];
+  available: boolean;
+  companyName: string;
+  connected: boolean;
+  monthEndFor: (client: Client) => number | null;
+  onOpen: (client: Client) => void;
+  onOpenCompany: () => void;
+}) {
+  const counts = countByClient(tasks);
+  const companyTaskCount = tasks.reduce((total, task) => total + task.count, 0);
   return (
     <div className="page-content">
       <section className="welcome-row">
@@ -917,125 +1096,174 @@ function Clients({ onOpen }: { onOpen: (client: Client) => void }) {
         </button>
       </section>
       <div className="client-card-grid">
-        {clients.map((client) => (
-          <button
-            className="full-client-card"
-            key={client.id}
-            onClick={() => onOpen(client)}
-          >
+        {source === "quickbooks" ? (
+          <button className="full-client-card" onClick={onOpenCompany}>
             <div className="full-client-header">
-              <span className="company-avatar">{client.initials}</span>
+              <span className="company-avatar">QB</span>
               <span className="client-card-title">
-                <strong>{client.name}</strong>
-                <span>{client.month}</span>
+                <strong>{companyName}</strong>
+                <span>QuickBooks Sandbox</span>
               </span>
-              <span
-                className={`status-badge ${client.status === "On track" ? "success" : "warning"}`}
-              >
-                {client.status}
+              <span className={`status-badge ${connected ? "success" : "warning"}`}>
+                {connected ? "Connected" : "Not connected"}
               </span>
             </div>
             <div className="client-card-details">
               <span>
                 <small>Items needing attention</small>
-                <strong
-                  className={
-                    client.attention ? "attention-number" : "success-text"
-                  }
-                >
-                  {client.attention}
+                <strong className={companyTaskCount ? "attention-number" : "success-text"}>
+                  {available ? companyTaskCount : NOT_AVAILABLE}
                 </strong>
               </span>
               <span>
                 <small>Reconciliation</small>
-                <strong>{client.reconciliation}</strong>
+                <strong>{NOT_AVAILABLE}</strong>
               </span>
             </div>
             <div className="client-card-progress">
               <span>
-                <small>Month-end progress</small>
-                <strong>{client.monthEnd}%</strong>
-              </span>
-              <span className="progress-bar">
-                <span style={{ width: `${client.monthEnd}%` }} />
+                <small>Sandbox supports one company at a time</small>
               </span>
               <span className="row-arrow">→</span>
             </div>
           </button>
-        ))}
+        ) : (
+          clients.map((client) => {
+            const open = counts[client.id] ?? 0;
+            const monthEnd = monthEndFor(client);
+            return (
+              <button
+                className="full-client-card"
+                key={client.id}
+                onClick={() => onOpen(client)}
+              >
+                <div className="full-client-header">
+                  <span className="company-avatar">{client.initials}</span>
+                  <span className="client-card-title">
+                    <strong>{client.name}</strong>
+                    <span>{client.month}</span>
+                  </span>
+                  <span className={`status-badge ${open === 0 ? "success" : "warning"}`}>
+                    {open === 0 ? "On track" : "Needs attention"}
+                  </span>
+                </div>
+                <div className="client-card-details">
+                  <span>
+                    <small>Items needing attention</small>
+                    <strong className={open ? "attention-number" : "success-text"}>{open}</strong>
+                  </span>
+                  <span>
+                    <small>Reconciliation</small>
+                    <strong>{client.reconciliation}</strong>
+                  </span>
+                  <span>
+                    <small>QuickBooks</small>
+                    <strong>Not connected (demo client)</strong>
+                  </span>
+                </div>
+                <div className="client-card-progress">
+                  <span>
+                    <small>Month-end progress</small>
+                    <strong>{monthEnd === null ? NOT_AVAILABLE : `${monthEnd}%`}</strong>
+                  </span>
+                  <span className="progress-bar">
+                    <span style={{ width: `${monthEnd ?? 0}%` }} />
+                  </span>
+                  <span className="row-arrow">→</span>
+                </div>
+              </button>
+            );
+          })
+        )}
       </div>
     </div>
   );
 }
 
-function buildReviewItems(source: ReviewSource, data: { transactions: LedgerTransaction[]; accounts: LedgerAccount[]; invoices: LedgerInvoice[]; bills: LedgerBill[] } | null, requests: ClientRequest[], reconciliationData: ReconciliationAccount[]): ReviewItem[] {
-  const transactionsToReview = source === "quickbooks" ? data?.transactions || [] : demoTransactions.map((transaction) => ({ ...transaction, source: "demo" as const }));
-  const invoicesToReview = source === "quickbooks" ? data?.invoices || [] : demoInvoices.map((invoice) => ({ ...invoice, source: "demo" as const }));
-  const billsToReview = source === "quickbooks" ? data?.bills || [] : demoBills.map((bill) => ({ ...bill, source: "demo" as const }));
-  const accountsToReview = source === "quickbooks" ? data?.accounts || [] : [];
-  const items: ReviewItem[] = [];
-  transactionsToReview.forEach((transaction, index) => {
-    const amount = Number(transaction.amount.replace(/[$,]/g, ""));
-    if (!transaction.category || transaction.category === "Uncategorized") items.push({ id: `${transaction.id}-category`, category: "Transactions", issueType: "Missing category", client: "ABC Plumbing", description: `${transaction.payee || "Unknown payee"} has no category or account.`, amount, priority: "High", action: "Categorize transaction", destination: "Transactions" });
-    if (!transaction.payee || transaction.payee === "Unknown") items.push({ id: `${transaction.id}-payee`, category: "Transactions", issueType: "Unknown payee", client: "ABC Plumbing", description: "This transaction needs a payee before it can be reviewed.", amount, priority: "High", action: "Review transaction", destination: "Transactions" });
-    if (amount >= 1000) items.push({ id: `${transaction.id}-large`, category: "Transactions", issueType: "Large transaction", client: "ABC Plumbing", description: `${transaction.payee} is a large transaction worth a second look.`, amount, priority: "Medium", action: "Review transaction", destination: "Transactions" });
-    if (transaction.status === "Needs Receipt") items.push({ id: `${transaction.id}-receipt`, category: "Transactions", issueType: "May need receipt", client: "ABC Plumbing", description: `${transaction.payee} may need supporting documentation.`, amount, priority: "Medium", action: "Request receipt", destination: "Transactions" });
-    if (transactionsToReview.some((other, otherIndex) => otherIndex < index && other.payee === transaction.payee && other.amount === transaction.amount)) items.push({ id: `${transaction.id}-duplicate`, category: "Transactions", issueType: "Duplicate-looking transaction", client: "ABC Plumbing", description: `${transaction.payee} has another transaction with the same amount.`, amount, priority: "Low", action: "Compare transactions", destination: "Transactions" });
-  });
-  invoicesToReview.forEach((invoice) => { const amount = invoice.amount - invoice.amountPaid; if (invoice.status === "Overdue") items.push({ id: `${invoice.id}-overdue`, category: "Receivables", issueType: "Overdue invoice", client: "ABC Plumbing", description: `${invoice.customer} invoice ${invoice.number} is overdue.`, amount, priority: amount >= 1000 ? "High" : "Medium", action: "Review invoice", destination: "Receivables" }); else if (amount >= 1000 && invoice.status !== "Paid") items.push({ id: `${invoice.id}-large`, category: "Receivables", issueType: "Large unpaid invoice", client: "ABC Plumbing", description: `${invoice.customer} still owes a large balance on ${invoice.number}.`, amount, priority: "Medium", action: "Review invoice", destination: "Receivables" }); });
-  billsToReview.forEach((bill) => { const amount = bill.amount - bill.amountPaid; if (bill.status === "Overdue") items.push({ id: `${bill.id}-overdue`, category: "Payables", issueType: "Overdue bill", client: "ABC Plumbing", description: `${bill.vendor} bill ${bill.number} is overdue.`, amount, priority: "High", action: "Review bill", destination: "Payables" }); else if (bill.status === "Due Soon") items.push({ id: `${bill.id}-soon`, category: "Payables", issueType: "Bill due soon", client: "ABC Plumbing", description: `${bill.vendor} bill ${bill.number} is due soon.`, amount, priority: "Medium", action: "Review bill", destination: "Payables" }); else if (bill.status === "Needs Review") items.push({ id: `${bill.id}-review`, category: "Payables", issueType: "Bill needs review", client: "ABC Plumbing", description: `${bill.vendor} bill ${bill.number} needs review.`, amount, priority: "High", action: "Review bill", destination: "Payables" }); });
-  accountsToReview.filter((account) => account.accountType === "Bank" || account.accountType === "Credit Card").forEach((account) => { if (account.currentBalance < 0) items.push({ id: `${account.quickBooksId || account.name}-balance`, category: "Reconciliation", issueType: "Account balance needs review", client: "ABC Plumbing", description: `${account.name} has a negative QuickBooks balance.`, amount: Math.abs(account.currentBalance), priority: "Medium", action: "Review account", destination: "Reconcile" }); });
-  reconciliationData.filter((account) => account.statementBalance !== account.quickBooksBalance).forEach((account) => items.push({ id: `${account.id}-difference`, category: "Reconciliation", issueType: "Reconciliation difference", client: "ABC Plumbing", description: `${account.name} does not match its statement.`, amount: Math.abs(account.statementBalance - account.quickBooksBalance), priority: "High", action: "Find the problem", destination: "Reconcile" }));
-  requests.filter((request) => request.status !== "Resolved").forEach((request) => items.push({ id: `${request.id}-question`, category: "Transactions", issueType: "Client question", client: request.client, description: request.question, priority: "Medium", action: "Open client request", destination: "Transactions" }));
-  return items;
+function BookkeepingReview({
+  source,
+  tasks,
+  available,
+  loading,
+  error,
+  onSourceChange,
+  onOpenTask,
+}: {
+  source: ReviewSource;
+  tasks: WorkTask[];
+  available: boolean;
+  loading: boolean;
+  error: string | null;
+  onSourceChange: (source: ReviewSource) => void;
+  onOpenTask: (task: WorkTask) => void;
+}) {
+  const [filter, setFilter] = useState<"All" | TaskType>("All");
+  const visibleTasks = filterTasks(tasks, { type: filter });
+  const total = (list: WorkTask[]) => list.reduce((sum, task) => sum + task.count, 0);
+  const count = (priority: TaskPriority) => total(tasks.filter((task) => task.priority === priority));
+  const figure = (value: number) => (available ? `${value}` : NOT_AVAILABLE);
+  return (
+    <div className="page-content">
+      <section className="welcome-row">
+        <div>
+          <h2>Bookkeeping Review</h2>
+          <p className="muted">Checks that suggest items may need attention. Items marked "Possible issue" are suggestions, not confirmed errors.</p>
+        </div>
+        <span className="attention-summary"><strong>{figure(total(tasks))}</strong> items found</span>
+      </section>
+      <AccountSourceSwitch source={source} onChange={onSourceChange} />
+      {loading && <div className="data-state-message">Loading QuickBooks Sandbox review data...</div>}
+      {error && <div className="data-state-message error">{error}</div>}
+      {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded.</div>}
+      <div className="review-summary-grid">
+        <SummaryCard value={figure(total(tasks))} label="Needs Attention" tone="red" />
+        <SummaryCard value={figure(count("High"))} label="High Priority" tone="red" />
+        <SummaryCard value={figure(count("Medium"))} label="Medium Priority" tone="amber" />
+        <SummaryCard value={figure(count("Low"))} label="Low Priority" tone="green" />
+      </div>
+      <div className="filter-row">
+        {(["All", "Transactions", "Receivables", "Payables", "Reconciliation"] as const).map((option) => (
+          <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} onClick={() => setFilter(option)}>
+            {option}
+            <span>{total(filterTasks(tasks, { type: option }))}</span>
+          </button>
+        ))}
+      </div>
+      {available && visibleTasks.length === 0 ? (
+        <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">No review items were found.</p></div>
+      ) : (
+        <TaskCardList tasks={visibleTasks} showClient={source === "demo"} onOpenTask={onOpenTask} />
+      )}
+    </div>
+  );
 }
 
-function BookkeepingReview({ source, data, clientRequests, reconciliationAccounts, loading, error, onSourceChange, onNavigate }: { source: ReviewSource; data: { transactions: LedgerTransaction[]; accounts: LedgerAccount[]; invoices: LedgerInvoice[]; bills: LedgerBill[] } | null; clientRequests: ClientRequest[]; reconciliationAccounts: ReconciliationAccount[]; loading: boolean; error: string | null; onSourceChange: (source: ReviewSource) => void; onNavigate: (destination: ReviewItem["destination"]) => void }) {
-  const [filter, setFilter] = useState<"All" | ReviewCategory>("All");
-  const items = buildReviewItems(source, data, clientRequests, reconciliationAccounts);
-  const visibleItems = filter === "All" ? items : items.filter((item) => item.category === filter);
-  const count = (priority: ReviewItem["priority"]) => items.filter((item) => item.priority === priority).length;
-  return <div className="page-content"><section className="welcome-row"><div><h2>Bookkeeping Review</h2><p className="muted">Rule-based checks for items that may need attention.</p></div><span className="attention-summary"><strong>{items.length}</strong> items found</span></section><AccountSourceSwitch source={source} onChange={onSourceChange} />{loading && <div className="data-state-message">Loading QuickBooks Sandbox review data...</div>}{error && <div className="data-state-message error">{error}</div>}<div className="review-summary-grid"><SummaryCard value={`${items.length}`} label="Needs Attention" tone="red" /><SummaryCard value={`${count("High")}`} label="High Priority" tone="red" /><SummaryCard value={`${count("Medium")}`} label="Medium Priority" tone="amber" /><SummaryCard value={`${count("Low")}`} label="Low Priority" tone="green" /></div><div className="filter-row">{(["All", "Transactions", "Receivables", "Payables", "Reconciliation"] as const).map((option) => <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} onClick={() => setFilter(option)}>{option}<span>{option === "All" ? items.length : items.filter((item) => item.category === option).length}</span></button>)}</div>{visibleItems.length === 0 ? <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">No rule-based review items were found.</p></div> : <div className="review-card-list">{visibleItems.map((item) => <button className="review-card" key={item.id} onClick={() => onNavigate(item.destination)}><div className="review-card-top"><span className="review-type">{item.issueType}</span><span className={`priority-badge ${item.priority.toLowerCase()}`}>{item.priority}</span></div><strong>{item.client}</strong><p>{item.description}</p>{item.amount !== undefined && <span className="review-amount">{formatMoney(item.amount)}</span>}<div className="review-card-footer"><span>Suggested next action: {item.action}</span><span className="row-arrow">→</span></div></button>)}</div>}</div>
-}
-
-const inboxFilters = [
-  "All",
-  "Transactions",
-  "Receipts",
-  "Client Questions",
-  "Reconciliation",
-  "Bills",
-  "Month End",
-] as const;
+const inboxTypeFilters = ["All", ...taskTypes] as const;
 
 function Inbox({
-  items,
-  onOpenRequest,
-  onNavigate,
+  tasks,
+  source,
+  available,
+  loading,
+  error,
+  scopeLabel,
+  onOpenTask,
 }: {
-  items: InboxItem[];
-  onOpenRequest: (requestId: string) => void;
-  onNavigate: (destination: InboxItem["destination"]) => void;
+  tasks: WorkTask[];
+  source: AccountSource;
+  available: boolean;
+  loading: boolean;
+  error: string | null;
+  scopeLabel: string;
+  onOpenTask: (task: WorkTask) => void;
 }) {
-  const [filter, setFilter] = useState<(typeof inboxFilters)[number]>("All");
-  const activeItems = items.filter((item) => item.status !== "Resolved");
-  const filteredItems =
-    filter === "All"
-      ? activeItems
-      : activeItems.filter((item) => matchesInboxFilter(item, filter));
-  const openItem = (item: InboxItem) =>
-    item.requestId
-      ? onOpenRequest(item.requestId)
-      : onNavigate(item.destination);
-  const clientQuestionCount = activeItems.filter(
-    (item) => item.type === "Client Question",
-  ).length;
-  const receiptCount = activeItems.some(
-    (item) => item.type === "Missing Receipt",
-  )
-    ? 2
-    : 0;
-  const billCount = activeItems.some((item) => item.type === "Bill") ? 2 : 0;
+  const [type, setType] = useState<TaskType | "All">("All");
+  const [priority, setPriority] = useState<TaskPriority | "All">("All");
+  const [status, setStatus] = useState<TaskStatus | "All">("All");
+  const visibleTasks = filterTasks(tasks, { type, priority, status });
+  const total = (list: WorkTask[]) => list.reduce((sum, task) => sum + task.count, 0);
+  const typeCount = (option: TaskType) => total(filterTasks(tasks, { type: option, priority, status }));
+  const figure = (value: number) => (available ? `${value}` : NOT_AVAILABLE);
 
   return (
     <div className="page-content">
@@ -1043,105 +1271,95 @@ function Inbox({
         <div>
           <h2>Bookkeeping Inbox</h2>
           <p className="muted">
-            Everything that needs your attention, in one place.
+            Everything that needs your attention, in one place. Showing: {scopeLabel}.
           </p>
         </div>
         <span className="attention-summary">
-          <strong>{activeItems.length}</strong> items need attention
+          <strong>{figure(total(tasks))}</strong> items need attention
         </span>
       </section>
+      {loading && <div className="data-state-message">Loading QuickBooks Sandbox data...</div>}
+      {error && <div className="data-state-message error">{error}</div>}
+      {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded. Connect in Settings to see real tasks.</div>}
       <div className="inbox-summary-grid">
-        <SummaryCard value="14" label="Transactions need review" tone="red" />
-        <SummaryCard
-          value={`${receiptCount}`}
-          label="Missing receipts"
-          tone="amber"
-        />
-        <SummaryCard
-          value={`${clientQuestionCount}`}
-          label="Client question"
-          tone="purple"
-        />
-        <SummaryCard value="1" label="Reconciliation issue" tone="blue" />
-        <SummaryCard
-          value={`${billCount}`}
-          label="Bills need review"
-          tone="red"
-        />
+        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Transactions" })))} label="Transactions to review" tone="red" />
+        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Receivables" })))} label="Receivables to check" tone="amber" />
+        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Payables" })))} label="Payables to check" tone="purple" />
+        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Reconciliation" })))} label="Reconciliation issues" tone="blue" />
+        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Client Requests" })))} label="Client questions" tone="red" />
       </div>
       <div className="filter-row" aria-label="Inbox filters">
-        {inboxFilters.map((filterOption) => (
+        {inboxTypeFilters.map((option) => (
           <button
-            className={`filter-button ${filter === filterOption ? "active" : ""}`}
-            key={filterOption}
-            onClick={() => setFilter(filterOption)}
+            className={`filter-button ${type === option ? "active" : ""}`}
+            key={option}
+            onClick={() => setType(option)}
           >
-            {filterOption}
-            <span>
-              {filterOption === "All"
-                ? activeItems.length
-                : activeItems.filter((item) =>
-                    matchesInboxFilter(item, filterOption),
-                  ).length}
-            </span>
+            {option}
+            <span>{option === "All" ? total(filterTasks(tasks, { priority, status })) : typeCount(option)}</span>
           </button>
         ))}
       </div>
-      {filteredItems.length === 0 ? (
-        <div className="empty-state">
-          <span>✓</span>
-          <h2>You're all caught up.</h2>
-          <p className="muted">There is nothing waiting for your attention.</p>
-        </div>
+      <div className="queue-filters">
+        <label>
+          Priority
+          <select value={priority} onChange={(event) => setPriority(event.target.value as TaskPriority | "All")}>
+            <option value="All">All priorities</option>
+            {taskPriorities.map((option) => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+        <label>
+          Status
+          <select value={status} onChange={(event) => setStatus(event.target.value as TaskStatus | "All")}>
+            <option value="All">All statuses</option>
+            {taskStatuses.map((option) => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+      </div>
+      {visibleTasks.length === 0 ? (
+        available ? (
+          <div className="empty-state">
+            <span>✓</span>
+            <h2>You're all caught up.</h2>
+            <p className="muted">{tasks.length === 0 ? "There is nothing waiting for your attention." : "No tasks match these filters."}</p>
+          </div>
+        ) : null
       ) : (
         <div className="panel inbox-panel">
           <div className="inbox-heading">
             <span>Client</span>
             <span>Type</span>
-            <span>Description</span>
+            <span>Task</span>
             <span>Priority</span>
-            <span>Date</span>
+            <span>Due</span>
             <span>Status</span>
             <span />
           </div>
-          {filteredItems.map((item) => (
+          {visibleTasks.map((task) => (
             <button
               className="inbox-row"
-              key={item.id}
-              onClick={() => openItem(item)}
+              key={task.id}
+              onClick={() => onOpenTask(task)}
+              title={`Next: ${task.action}`}
             >
-              <strong>{item.client}</strong>
-              <span className="inbox-type">{item.type}</span>
-              <span>{item.description}</span>
-              <span className={`priority-badge ${item.priority.toLowerCase()}`}>
-                {item.priority}
+              <strong>{task.client}</strong>
+              <span className="inbox-type">{task.type}</span>
+              <span>{task.suspected ? "Possible issue: " : ""}{task.description}</span>
+              <span className={`priority-badge ${task.priority.toLowerCase()}`}>
+                {task.priority}
               </span>
-              <span>{item.date}</span>
-              <span className={`inbox-status ${item.status.toLowerCase()}`}>
-                {item.status}
+              <span>{task.dueDate ? formatDueDate(task.dueDate) : "—"}</span>
+              <span className={`inbox-status ${taskSlug(task.status)}`}>
+                {task.status}
               </span>
               <span className="row-arrow">→</span>
             </button>
           ))}
         </div>
       )}
+      {source === "demo" && available && <p className="muted">Items from demo clients without detailed records are summary counts only.</p>}
     </div>
   );
-}
-
-function matchesInboxFilter(
-  item: InboxItem,
-  filter: (typeof inboxFilters)[number],
-) {
-  const types: Record<string, InboxItem["type"]> = {
-    Transactions: "Transaction",
-    Receipts: "Missing Receipt",
-    "Client Questions": "Client Question",
-    Reconciliation: "Reconciliation",
-    Bills: "Bill",
-    "Month End": "Month End",
-  };
-  return item.type === types[filter];
 }
 
 function SummaryCard({
@@ -1192,7 +1410,7 @@ function ClientRequests({
       <section className="welcome-row">
         <div>
           <h2>Client Requests</h2>
-          <p className="muted">Questions waiting for ABC Plumbing's answers.</p>
+          <p className="muted">Questions waiting for <ClientName />'s answers.</p>
         </div>
         <span className="attention-summary">
           <strong>{requests.filter((request) => request.status !== "Resolved").length}</strong> active requests
@@ -1263,7 +1481,7 @@ function ClientRequestDetail({
       </button>
       <section className="review-header">
         <div>
-          <p className="eyebrow">CLIENT REQUEST · ABC PLUMBING</p>
+          <p className="eyebrow">CLIENT REQUEST · <ClientName upper /></p>
           <h2>{request.relatedTransaction}</h2>
           <p className="muted">
             Created {request.dateCreated} · {request.relatedAmount}
@@ -1402,7 +1620,7 @@ function Receivables({
       <section className="welcome-row">
         <div>
           <h2>Accounts Receivable</h2>
-          <p className="muted">ABC Plumbing · Money customers owe you.</p>
+          <p className="muted"><ClientName /> · Money customers owe you.</p>
         </div>
         <span className="count-pill">{displayedInvoices.length} invoices</span>
       </section>
@@ -1513,7 +1731,7 @@ function InvoiceDetail({
       </button>
       <section className="review-header">
         <div>
-          <p className="eyebrow">ACCOUNTS RECEIVABLE · ABC PLUMBING</p>
+          <p className="eyebrow">ACCOUNTS RECEIVABLE · <ClientName upper /></p>
           <h2>{invoice.customer}</h2>
           <p className="muted">
             {invoice.number} · Due {invoice.dueDate}
@@ -1655,7 +1873,7 @@ function Payables({
         <div>
           <h2>Accounts Payable</h2>
           <p className="muted">
-            ABC Plumbing · Bills your company needs to pay.
+            <ClientName /> · Bills your company needs to pay.
           </p>
         </div>
         <span className="count-pill">{displayedBills.length} bills</span>
@@ -1759,7 +1977,7 @@ function BillDetail({
       </button>
       <section className="review-header">
         <div>
-          <p className="eyebrow">ACCOUNTS PAYABLE · ABC PLUMBING</p>
+          <p className="eyebrow">ACCOUNTS PAYABLE · <ClientName upper /></p>
           <h2>{bill.vendor}</h2>
           <p className="muted">
             {bill.number} · Due {bill.dueDate}
@@ -1859,79 +2077,75 @@ const transactionFilters = [
   "Matched",
   "Needs Receipt",
 ] as const;
-const reviewQueueFilters = ["Needs Review", "Missing Category", "Missing Payee", "Needs Receipt", "Large Transaction"] as const;
-
-function reviewFilterMatch(transaction: Transaction, filter: (typeof reviewQueueFilters)[number]) {
-  const amount = Number(transaction.amount.replace(/[$,]/g, ""));
-  if (filter === "Needs Review") return transaction.status === "Needs Review" || transaction.status === "Needs Receipt";
-  if (filter === "Missing Category") return !transaction.category || transaction.category === "Uncategorized";
-  if (filter === "Missing Payee") return !transaction.payee || transaction.payee === "Unknown";
-  if (filter === "Needs Receipt") return transaction.status === "Needs Receipt";
-  return amount >= 1000;
-}
+type CategoryOption = { id?: string; name: string };
 
 function Transactions({
   transactions,
   quickBooksTransactions,
   source,
+  clientId,
+  categoryOptions,
   isLoading,
   error,
   onSourceChange,
   selectedTransaction,
   onSelect,
   onBack,
-  onUpdate,
+  onApplyChanges,
+  onReload,
   onRequestInformation,
-  onQuickBooksUpdate,
   onCreateQuickBooksRequest,
 }: {
   transactions: Transaction[];
   quickBooksTransactions: LedgerTransaction[];
   source: TransactionSource;
+  clientId: string | null;
+  categoryOptions: CategoryOption[];
   isLoading: boolean;
   error: string | null;
   onSourceChange: (source: TransactionSource) => void;
   selectedTransaction: Transaction | null;
   onSelect: (transaction: Transaction) => void;
   onBack: () => void;
-  onUpdate: (transaction: Transaction) => void;
+  onApplyChanges: (transaction: Transaction, changes: LineChange[]) => Promise<Transaction>;
+  onReload: (transaction: Transaction) => Promise<void>;
   onRequestInformation: (transaction: Transaction) => void;
-  onQuickBooksUpdate: (transaction: LedgerTransaction, category: string) => Promise<LedgerTransaction>;
   onCreateQuickBooksRequest: (transaction: LedgerTransaction, question: string) => void;
 }) {
   const [filter, setFilter] =
     useState<(typeof transactionFilters)[number]>("All");
-  const [reviewFilter, setReviewFilter] = useState<(typeof reviewQueueFilters)[number]>("Needs Review");
+  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("Needs Review");
+  const [search, setSearch] = useState("");
+  const [category, setCategory] = useState("All");
 
-  const displayedTransactions = source === "demo" ? transactions : quickBooksTransactions;
-  const reviewQueue = displayedTransactions.filter((transaction) => reviewFilterMatch(transaction, reviewFilter));
-  const selectedIndex = selectedTransaction ? reviewQueue.findIndex((item) => item.id === selectedTransaction.id) : -1;
-  const moveToReview = (index: number) => { if (reviewQueue[index]) onSelect(reviewQueue[index]); };
+  const everything = source === "demo" ? transactions : quickBooksTransactions;
+  // Search, category and client narrow both the list and the review queue; status only narrows the list.
+  const scoped = filterTransactions(everything, { clientId, category, search });
+  const reviewQueue = scoped.filter((transaction) => matchesReviewFilter(transaction, reviewFilter));
 
-  if (selectedTransaction)
+  if (selectedTransaction) {
+    const current = everything.find((item) => item.id === selectedTransaction.id) ?? selectedTransaction;
     return (
       <TransactionReview
-        transaction={selectedTransaction}
-        readOnly={source === "quickbooks"}
+        key={current.id}
+        transaction={current}
+        source={source}
+        categoryOptions={categoryOptions}
+        history={everything}
+        ordered={scoped}
+        queue={reviewQueue}
         onBack={onBack}
-        onUpdate={onUpdate}
+        onSelect={onSelect}
+        onApplyChanges={onApplyChanges}
+        onReload={onReload}
         onRequestInformation={onRequestInformation}
-        onQuickBooksUpdate={onQuickBooksUpdate}
         onCreateQuickBooksRequest={onCreateQuickBooksRequest}
-        allTransactions={displayedTransactions}
-        reviewQueue={reviewQueue}
-        reviewIndex={selectedIndex}
-        onMoveToReview={moveToReview}
       />
     );
+  }
 
-  const filteredTransactions =
-    filter === "All"
-      ? displayedTransactions
-      : displayedTransactions.filter(
-          (transaction) => transaction.status === filter,
-        );
-  const attentionCount = displayedTransactions.filter(
+  const filteredTransactions = filterTransactions(scoped, { status: filter });
+  const attentionCount = scoped.filter(
     (transaction) =>
       transaction.status === "Needs Review" ||
       transaction.status === "Needs Receipt",
@@ -1943,7 +2157,7 @@ function Transactions({
         <div>
           <h2>Transactions</h2>
           <p className="muted">
-            Review ABC Plumbing's recent activity one item at a time.
+            Review <ClientName />'s recent activity one item at a time.
           </p>
         </div>
         <span className="attention-summary">
@@ -1971,6 +2185,22 @@ function Transactions({
         </div>
       )}
       {error && <div className="data-state-message error">{error}</div>}
+      <div className="queue-filters">
+        <label>
+          Search
+          <input type="search" value={search} placeholder="Vendor or description" aria-label="Search transactions" onChange={(event) => setSearch(event.target.value)} />
+        </label>
+        <label>
+          Category
+          <select value={category} aria-label="Filter by category" onChange={(event) => setCategory(event.target.value)}>
+            <option value="All">All categories</option>
+            {categoriesIn(everything).map((option) => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+        <button className="primary-button" disabled={reviewQueue.length === 0} onClick={() => onSelect(reviewQueue[0])}>
+          Review next ({reviewQueue.length}) <span>→</span>
+        </button>
+      </div>
       <div className="filter-row" aria-label="Transaction filters">
         {transactionFilters.map((filterOption) => (
           <button
@@ -1979,17 +2209,18 @@ function Transactions({
             onClick={() => setFilter(filterOption)}
           >
             {filterOption}
-            <span>
-              {filterOption === "All"
-                ? displayedTransactions.length
-                : displayedTransactions.filter(
-                    (transaction) => transaction.status === filterOption,
-                  ).length}
-            </span>
+            <span>{filterTransactions(scoped, { status: filterOption }).length}</span>
           </button>
         ))}
       </div>
-      <div className="filter-row" aria-label="Review queue filters">{reviewQueueFilters.map((option) => <button className={`filter-button ${reviewFilter === option ? "active" : ""}`} key={option} onClick={() => setReviewFilter(option)}>{option}<span>{displayedTransactions.filter((transaction) => reviewFilterMatch(transaction, option)).length}</span></button>)}</div>
+      <div className="filter-row" aria-label="Review queue filters">
+        {reviewFilters.map((option) => (
+          <button className={`filter-button ${reviewFilter === option ? "active" : ""}`} key={option} onClick={() => setReviewFilter(option)}>
+            {option}
+            <span>{scoped.filter((transaction) => matchesReviewFilter(transaction, option)).length}</span>
+          </button>
+        ))}
+      </div>
       <div className="panel transaction-panel">
         <div className="transaction-heading">
           <span>Date</span>
@@ -2000,6 +2231,7 @@ function Transactions({
           <span>Status</span>
           <span />
         </div>
+        {filteredTransactions.length === 0 && <p className="muted">No transactions match these filters.</p>}
         {filteredTransactions.map((transaction) => (
           <button
             className="transaction-row"
@@ -2010,7 +2242,7 @@ function Transactions({
             <strong>{transaction.payee}</strong>
             <span>{transaction.description}</span>
             <strong>{transaction.amount}</strong>
-            <span>{transaction.category}</span>
+            <span>{categoryLabel(transaction)}</span>
             <span
               className={`transaction-status ${statusClass(transaction.status)}`}
             >
@@ -2026,71 +2258,80 @@ function Transactions({
 
 function TransactionReview({
   transaction,
-  readOnly,
+  source,
+  categoryOptions,
+  history,
+  ordered,
+  queue,
   onBack,
-  onUpdate,
+  onSelect,
+  onApplyChanges,
+  onReload,
   onRequestInformation,
-  onQuickBooksUpdate,
   onCreateQuickBooksRequest,
-  allTransactions,
-  reviewQueue,
-  reviewIndex,
-  onMoveToReview,
 }: {
   transaction: LedgerTransaction;
-  readOnly: boolean;
+  source: TransactionSource;
+  categoryOptions: CategoryOption[];
+  history: Transaction[];
+  ordered: Transaction[];
+  queue: Transaction[];
   onBack: () => void;
-  onUpdate: (transaction: Transaction) => void;
+  onSelect: (transaction: Transaction) => void;
+  onApplyChanges: (transaction: Transaction, changes: LineChange[]) => Promise<Transaction>;
+  onReload: (transaction: Transaction) => Promise<void>;
   onRequestInformation: (transaction: Transaction) => void;
-  onQuickBooksUpdate: (transaction: LedgerTransaction, category: string) => Promise<LedgerTransaction>;
   onCreateQuickBooksRequest: (transaction: LedgerTransaction, question: string) => void;
-  allTransactions: Transaction[];
-  reviewQueue: Transaction[];
-  reviewIndex: number;
-  onMoveToReview: (index: number) => void;
 }) {
-  const categories = [
-    "Office Supplies",
-    "Materials",
-    "Equipment",
-    "Utilities",
-    "Meals",
-    "Travel",
-    "Personal / Ask Client",
-    "Other",
-  ];
-  const chooseCategory = (category: string) => {
-    onUpdate({ ...transaction, category, status: "Categorized" });
-    if (!readOnly && reviewIndex >= 0) onMoveToReview(reviewIndex);
-  };
+  const isQuickBooks = source === "quickbooks";
+  const lines = getLines(transaction);
+  const readOnlyReason = isQuickBooks ? transaction.readOnlyReason : undefined;
+  const suggestions = suggestCategories(transaction, history);
+  const [staged, setStaged] = useState<Record<string, string>>({});
   const [question, setQuestion] = useState("What was this purchase for?");
   const [showRequestComposer, setShowRequestComposer] = useState(false);
-  const requestInformation = () => readOnly ? setShowRequestComposer(true) : onRequestInformation(transaction);
-  const [selectedCategory, setSelectedCategory] = useState(transaction.category);
   const [showConfirmation, setShowConfirmation] = useState(false);
   const [updating, setUpdating] = useState(false);
-  const [updateError, setUpdateError] = useState<string | null>(null);
-  const [updated, setUpdated] = useState(false);
-  const supportedWrite = transaction.source === "quickbooks" && (transaction.transactionType === "Purchase" || transaction.transactionType === "Check");
-  const history = allTransactions.filter((item) => item.payee === transaction.payee && item.category && item.category !== "Uncategorized").reduce<Record<string, number>>((counts, item) => { counts[item.category] = (counts[item.category] || 0) + 1; return counts; }, {});
-  const historyItems = Object.entries(history).sort((left, right) => right[1] - left[1]);
-  const suggestedCategory = historyItems[0]?.[0];
-  const suggestionConfidence = (historyItems[0]?.[1] || 0) >= 5 ? "High" : (historyItems[0]?.[1] || 0) >= 2 ? "Medium" : "Low";
-  const completedCount = Math.max(0, allTransactions.length - reviewQueue.length);
+  const [updateError, setUpdateError] = useState<{ message: string; code?: string } | null>(null);
+  const [savedCount, setSavedCount] = useState(0);
+
+  const optionFor = (name: string) => categoryOptions.find((option) => option.name === name);
+  const changes: LineChange[] = lines.flatMap((line) => {
+    const name = staged[line.id];
+    return name && name !== line.category ? [{ lineId: line.id, category: name, categoryId: optionFor(name)?.id }] : [];
+  });
+  const validation = changes.length > 0 ? validateLineChanges(transaction, changes) : null;
+  const next = adjacentInQueue(ordered, queue, transaction.id, "next");
+  const previous = adjacentInQueue(ordered, queue, transaction.id, "previous");
+  const completedCount = Math.max(0, ordered.length - queue.length);
+  const usable = lines.filter((line) => suggestions[line.id] && !staged[line.id] && optionFor(suggestions[line.id].category));
+  const stage = (lineId: string, name: string) => {
+    setStaged((current) => {
+      const rest = { ...current };
+      if (name) rest[lineId] = name;
+      else delete rest[lineId];
+      return rest;
+    });
+    setUpdateError(null);
+    setSavedCount(0);
+    setShowConfirmation(false);
+  };
+  const requestInformation = () => (isQuickBooks ? setShowRequestComposer(true) : onRequestInformation(transaction));
   const confirmUpdate = async () => {
     setUpdating(true);
     setUpdateError(null);
     try {
-      await onQuickBooksUpdate(transaction, selectedCategory);
-      setUpdated(true);
+      await onApplyChanges(transaction, changes);
+      setStaged({});
       setShowConfirmation(false);
-      onMoveToReview(reviewIndex);
+      setSavedCount(changes.length);
     } catch (error) {
-      setUpdateError(error instanceof Error ? error.message : "QuickBooks rejected the update.");
+      setUpdateError({ message: error instanceof Error ? error.message : "The update could not be completed.", code: (error as { code?: string }).code });
     } finally {
       setUpdating(false);
     }
   };
+  const needsReload = isQuickBooks && updateError && ["STALE", "VERIFY_FAILED", "UNAVAILABLE"].includes(updateError.code ?? "");
 
   return (
     <div className="page-content">
@@ -2111,89 +2352,144 @@ function TransactionReview({
           {transaction.status}
         </span>
       </section>
-      <div className="review-progress-bar"><strong>{reviewQueue.length} transactions need review</strong><span>Progress: {completedCount} of {allTransactions.length} completed</span><div><span style={{ width: `${allTransactions.length ? (completedCount / allTransactions.length) * 100 : 0}%` }} /></div></div>
-      <div className="review-navigation"><button className="secondary-button" disabled={reviewIndex <= 0} onClick={() => onMoveToReview(reviewIndex - 1)}>Previous</button><button className="secondary-button" disabled={reviewIndex < 0 || reviewIndex >= reviewQueue.length - 1} onClick={() => onMoveToReview(reviewIndex + 1)}>Next</button><button className="secondary-button" disabled={reviewIndex < 0 || reviewIndex >= reviewQueue.length - 1} onClick={() => onMoveToReview(reviewIndex + 1)}>Skip</button></div>
+      <div className="review-progress-bar"><strong>{queue.length} transactions need review</strong><span>Progress: {completedCount} of {ordered.length} completed</span><div><span style={{ width: `${ordered.length ? (completedCount / ordered.length) * 100 : 0}%` }} /></div></div>
+      <div className="review-navigation">
+        <button className="secondary-button" disabled={!previous} onClick={() => previous && onSelect(previous)}>Previous</button>
+        <button className="secondary-button" disabled={!next} onClick={() => next && onSelect(next)}>Next</button>
+        <button className="secondary-button" disabled={!next} onClick={() => next && onSelect(next)}>Skip</button>
+      </div>
       <section className="review-layout">
         <div className="panel review-details">
           <h2>Transaction details</h2>
           <div className="detail-list">
             <span>
-              <small>Payee</small>
-              <strong>{transaction.payee}</strong>
-            </span>
-            <span>
               <small>Date</small>
               <strong>{transaction.date}</strong>
+            </span>
+            <span>
+              <small>Vendor / payee</small>
+              <strong>{transaction.payee}</strong>
             </span>
             <span>
               <small>Amount</small>
               <strong>{transaction.amount}</strong>
             </span>
             <span>
-              <small>Description</small>
+              <small>Account (paid from)</small>
+              <strong>{transaction.account || NOT_AVAILABLE}</strong>
+            </span>
+            <span>
+              <small>Category</small>
+              <strong>{categoryLabel(transaction)}</strong>
+            </span>
+            <span>
+              <small>Description / memo</small>
               <strong>{transaction.description}</strong>
             </span>
             <span>
-              <small>Current category</small>
-              <strong>{transaction.category}</strong>
+              <small>Lines</small>
+              <strong>{lines.length}</strong>
             </span>
             <span>
-              <small>Status</small>
+              <small>Review status</small>
               <strong>{transaction.status}</strong>
             </span>
           </div>
         </div>
-        {readOnly ? (
-          <div className="panel review-choice">
-            <h2>QuickBooks Sandbox transaction</h2>
-            <p className="muted">Sandbox · Write Enabled · Test Data Only</p>
-            <div className="detail-list"><span><small>Current QuickBooks category/account</small><strong>{transaction.category}</strong></span><span><small>Change to</small><strong>{selectedCategory}</strong></span></div>
-            {historyItems.length > 0 && <div className="category-history"><strong>Previously used for {transaction.payee}</strong>{historyItems.map(([category, count]) => <span key={category}>{category} — {count} times</span>)}</div>}
-            {suggestedCategory && <div className="suggestion-box"><small>Suggested Category</small><strong>{suggestedCategory}</strong><span>Confidence: {suggestionConfidence}</span><button className="secondary-button" onClick={() => setSelectedCategory(suggestedCategory)}>Use suggestion</button></div>}
-            {showRequestComposer && <div className="confirmation-box"><strong>Ask the client</strong><textarea value={question} onChange={(event) => setQuestion(event.target.value)} /><div><button className="secondary-button" onClick={() => setShowRequestComposer(false)}>Cancel</button><button className="primary-button" onClick={() => { onCreateQuickBooksRequest(transaction, question); setShowRequestComposer(false); }}>Save Request</button></div></div>}
-            {supportedWrite ? <><div className="category-grid">{categories.map((category) => <button className={`category-button ${selectedCategory === category ? "selected" : ""}`} key={category} onClick={() => setSelectedCategory(category)}>{category}{selectedCategory === category && <span>✓</span>}</button>)}</div><div className="change-preview"><strong>Change preview</strong><span>Current: {transaction.category}</span><span>Change to: {selectedCategory}</span></div>{suggestedCategory && suggestionConfidence === "High" && <button className="secondary-button" onClick={() => { setSelectedCategory(suggestedCategory); setShowConfirmation(true); }}>Approve Suggestion <span>✓</span></button>}{updated && <div className="data-state-message">Updated in QuickBooks</div>}{updateError && <div className="data-state-message error">{updateError}</div>}<button className="primary-button" disabled={selectedCategory === transaction.category || updating} onClick={() => setShowConfirmation(true)}>Approve & Update QuickBooks <span>→</span></button>{showConfirmation && <div className="confirmation-box"><strong>You are about to update this transaction in QuickBooks Sandbox.</strong><span>Transaction: {transaction.payee}</span><span>Amount: {transaction.amount}</span><span>Current category: {transaction.category}</span><span>New category: {selectedCategory}</span><div><button className="secondary-button" onClick={() => setShowConfirmation(false)}>Cancel</button><button className="primary-button" disabled={updating} onClick={confirmUpdate}>{updating ? "Updating..." : "Confirm Update"}</button></div></div>}</> : <p className="data-state-message">This transaction type is read-only for now.</p>}
-          </div>
-        ) : (
-          <div className="panel review-choice">
-            <h2>What was this purchase for?</h2>
-            <p className="muted">
-              Choose a category to clean up this transaction.
-            </p>
-            <div className="category-grid">
-              {categories.map((category) => (
-                <button
-                  className={`category-button ${transaction.category === category ? "selected" : ""}`}
-                  key={category}
-                  onClick={() => chooseCategory(category)}
-                >
-                  {category}
-                  {transaction.category === category && <span>✓</span>}
-                </button>
-              ))}
-            </div>
-            {transaction.suggestedCategory &&
-              transaction.status === "Needs Review" && (
-                <div className="suggestion-box">
-                  <div>
-                    <small>Suggested category</small>
-                    <strong>{transaction.suggestedCategory}</strong>
-                    <span>{transaction.confidence}% confidence</span>
+        <div className="panel review-choice">
+          <h2>{lines.length > 1 ? "Split transaction lines" : "Transaction line"}</h2>
+          <p className="muted">{isQuickBooks ? "QuickBooks Sandbox · Write Enabled · Test Data Only" : "Demo data · changes stay in this browser session"}</p>
+          {readOnlyReason && <p className="data-state-message" role="status">Read-only: {readOnlyReason}</p>}
+          <div className="line-list">
+            {lines.map((line, index) => {
+              const suggestion = suggestions[line.id];
+              const stagedName = staged[line.id];
+              const suggestionOption = suggestion ? optionFor(suggestion.category) : undefined;
+              return (
+                <div className="line-card" key={line.id} data-testid="transaction-line">
+                  <div className="line-card-head">
+                    <strong>{lines.length > 1 ? `Line ${index + 1}: ` : ""}{line.description || "No description"}</strong>
+                    <strong>{formatMoney(line.amount)}</strong>
                   </div>
-                  <button
-                    className="primary-button"
-                    onClick={() =>
-                      chooseCategory(transaction.suggestedCategory!)
-                    }
-                  >
-                    Accept suggestion <span>✓</span>
-                  </button>
+                  <div className="line-card-body">
+                    <span><small>Confirmed category</small><strong>{isUncategorized(line.category) ? "Needs a category" : line.category}</strong></span>
+                    {stagedName && <span><small>Staged change (not saved)</small><strong>{stagedName}</strong></span>}
+                  </div>
+                  {suggestion && !readOnlyReason && !stagedName && (
+                    <div className="suggestion-box">
+                      <small>Suggested, not applied</small>
+                      <strong>{suggestion.category}</strong>
+                      <span>Confidence: {suggestion.confidence}</span>
+                      <ul className="reason-list">{suggestion.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                      <button className="secondary-button" disabled={!suggestionOption} onClick={() => stage(line.id, suggestion.category)}>
+                        {suggestionOption ? "Use suggestion" : "Account not available"}
+                      </button>
+                    </div>
+                  )}
+                  {!readOnlyReason && (
+                    <label className="line-picker">
+                      Change category
+                      <select aria-label={`Category for ${line.description || `line ${index + 1}`}`} value={stagedName ?? ""} onChange={(event) => stage(line.id, event.target.value)}>
+                        <option value="">Keep current</option>
+                        {categoryOptions.map((option) => <option key={option.id ?? option.name} value={option.name}>{option.name}</option>)}
+                      </select>
+                    </label>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {!readOnlyReason && (
+            <>
+              {usable.length > 1 && (
+                <button className="secondary-button" onClick={() => usable.forEach((line) => stage(line.id, suggestions[line.id].category))}>
+                  Stage all {usable.length} suggestions <span>✓</span>
+                </button>
+              )}
+              {changes.length > 0 && (
+                <div className="change-preview">
+                  <strong>Change preview</strong>
+                  {changes.map((change) => {
+                    const line = lines.find((item) => item.id === change.lineId)!;
+                    return <span key={change.lineId}>{line.description || "Line"}: {line.category} → {change.category}</span>;
+                  })}
+                  <span>Transaction total stays {transaction.amount}</span>
                 </div>
               )}
-            <button className="secondary-button" onClick={requestInformation}>
-              Request More Information <span>→</span>
-            </button>
-          </div>
-        )}
+              {validation && !validation.ok && <div className="data-state-message error" role="alert">{validation.error}</div>}
+              {savedCount > 0 && <div className="data-state-message" role="status">{isQuickBooks ? "Updated in QuickBooks Sandbox" : "Saved (demo data only)"} · {savedCount} {savedCount === 1 ? "line" : "lines"}</div>}
+              {updateError && (
+                <div className="data-state-message error" role="alert">
+                  {updateError.message}
+                  {needsReload && <button className="secondary-button" onClick={() => void onReload(transaction)}>Reload from QuickBooks</button>}
+                </div>
+              )}
+              <button className="primary-button" disabled={!validation?.ok || updating} onClick={() => setShowConfirmation(true)}>
+                Review {changes.length || ""} {changes.length === 1 ? "change" : "changes"} <span>→</span>
+              </button>
+              {showConfirmation && validation?.ok && (
+                <div className="confirmation-box">
+                  <strong>{isQuickBooks ? "You are about to update this transaction in QuickBooks Sandbox." : "Save these changes to the demo transaction?"}</strong>
+                  <span>Transaction: {transaction.payee} · {transaction.amount}</span>
+                  {changes.map((change) => {
+                    const line = lines.find((item) => item.id === change.lineId)!;
+                    return <span key={change.lineId}>{line.description || "Line"} ({formatMoney(line.amount)}): {line.category} → {change.category}</span>;
+                  })}
+                  <span>Other lines will not change.</span>
+                  <div>
+                    <button className="secondary-button" onClick={() => setShowConfirmation(false)}>Cancel</button>
+                    <button className="primary-button" disabled={updating} onClick={confirmUpdate}>{updating ? "Updating..." : isQuickBooks ? "Confirm update" : "Confirm (demo)"}</button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+          {savedCount > 0 && next && <button className="primary-button" onClick={() => onSelect(next)}>Open next transaction needing review <span>→</span></button>}
+          {showRequestComposer && <div className="confirmation-box"><strong>Ask the client</strong><textarea value={question} onChange={(event) => setQuestion(event.target.value)} /><div><button className="secondary-button" onClick={() => setShowRequestComposer(false)}>Cancel</button><button className="primary-button" onClick={() => { onCreateQuickBooksRequest(transaction, question); setShowRequestComposer(false); }}>Save Request</button></div></div>}
+          <button className="secondary-button" onClick={requestInformation}>
+            Request More Information <span>→</span>
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -2276,7 +2572,15 @@ function Settings({
           {!quickBooksStatus.connected ? (
             <button
               className="primary-button"
-              onClick={quickBooksService.connect}
+              onClick={() =>
+                quickBooksService.connect().catch((connectError: unknown) =>
+                  setError(
+                    connectError instanceof Error
+                      ? connectError.message
+                      : "Unable to start the QuickBooks connection.",
+                  ),
+                )
+              }
             >
               Connect QuickBooks <span>→</span>
             </button>
@@ -2389,7 +2693,7 @@ function Reports({
     },
     {
       name: "Balance Sheet",
-      description: "See what ABC Plumbing owns and owes.",
+      description: "See what this client owns and owes.",
     },
     { name: "Cash Flow", description: "See how cash moved during the period." },
     {
@@ -2398,7 +2702,7 @@ function Reports({
     },
     {
       name: "Accounts Payable",
-      description: "See bills ABC Plumbing needs to pay.",
+      description: "See bills this client needs to pay.",
     },
   ];
   const loadQuickBooksReport = async (
@@ -2483,7 +2787,7 @@ function Reports({
       <section className="welcome-row">
         <div>
           <h2>Reports</h2>
-          <p className="muted">Simple financial reports for ABC Plumbing.</p>
+          <p className="muted">Simple financial reports for <ClientName />.</p>
         </div>
         <div className="period-selector" aria-label="Report period">
           {reportPeriods.map((option) => (
@@ -2650,7 +2954,7 @@ function QuickBooksReportDetail({
       </div>
       <section className="report-detail-heading">
         <div>
-          <p className="eyebrow">ABC PLUMBING · {period.toUpperCase()}</p>
+          <p className="eyebrow"><ClientName upper /> · {period.toUpperCase()}</p>
           <h2>{name}</h2>
           <p className="muted">Live QuickBooks Online report</p>
         </div>
@@ -2798,7 +3102,7 @@ function ReportDetail({
       </div>
       <section className="report-detail-heading">
         <div>
-          <p className="eyebrow">ABC PLUMBING · {period.toUpperCase()}</p>
+          <p className="eyebrow"><ClientName upper /> · {period.toUpperCase()}</p>
           <h2>{name}</h2>
           <p className="muted">August 2026 · Fake demo report</p>
         </div>
@@ -2808,22 +3112,21 @@ function ReportDetail({
   );
 }
 
-function buildQuickBooksMonthEndChecklist(data: { transactions: LedgerTransaction[]; accounts: LedgerAccount[]; invoices: LedgerInvoice[]; bills: LedgerBill[] }, requests: ClientRequest[], reconciliationAccounts: ReconciliationAccount[]): MonthEndItem[] {
-  const reviewItems = buildReviewItems("quickbooks", data, requests, reconciliationAccounts);
-  const transactionIssues = reviewItems.filter((item) => item.category === "Transactions");
+function buildQuickBooksMonthEndChecklist(data: QuickBooksReviewData, requests: ClientRequest[]): MonthEndItem[] {
+  const reviewItems = buildReviewTasks({ client: { id: QUICKBOOKS_CLIENT_ID, name: "QuickBooks Sandbox" }, transactions: data.transactions, invoices: data.invoices, bills: data.bills, accounts: data.accounts, reconciliations: [], requests: [], monthEnd: [] });
+  const transactionIssues = reviewItems.filter((item) => item.type === "Transactions");
+  const hasIssue = (kind: WorkTask["kind"]) => reviewItems.some((review) => review.kind === kind);
   const overdueInvoices = data.invoices.filter((invoice) => invoice.status === "Overdue");
   const overdueBills = data.bills.filter((bill) => bill.status === "Overdue");
   const openRequests = requests.filter((request) => request.status !== "Resolved");
-  const bankReady = data.accounts.some((account) => account.accountType === "Bank" && account.active);
-  const cardReady = data.accounts.some((account) => account.accountType === "Credit Card" && account.active);
   const item = (id: string, label: string, status: MonthEndItem["status"], explanation?: string, relatedView?: MonthEndItem["relatedView"], relatedLabel?: string): MonthEndItem => ({ id, label, status, explanation, relatedView, relatedLabel });
   return [
-    item("qb-bank", "Bank accounts reviewed", bankReady ? "Complete" : "Not Started", bankReady ? undefined : "No active QuickBooks bank account was available.", "Reconcile", "Go to Reconcile"),
-    item("qb-card", "Credit card accounts reviewed", cardReady ? "Complete" : "Not Started", cardReady ? undefined : "No active QuickBooks credit card account was available.", "Reconcile", "Go to Reconcile"),
+    item("qb-bank", "Bank accounts reviewed", "Not Available", "Account review tracking is not available yet.", "Reconcile", "Go to Reconcile"),
+    item("qb-card", "Credit card accounts reviewed", "Not Available", "Account review tracking is not available yet.", "Reconcile", "Go to Reconcile"),
     item("qb-transactions", "Transactions needing review", transactionIssues.length === 0 ? "Complete" : "Needs Attention", transactionIssues.length ? `${transactionIssues.length} transactions still need attention` : undefined, "Transactions", "Go to Transactions"),
-    item("qb-category", "Missing categories", reviewItems.some((review) => review.issueType === "Missing category") ? "Needs Attention" : "Complete", reviewItems.some((review) => review.issueType === "Missing category") ? "Some transactions still need categories." : undefined, "Transactions", "Go to Transactions"),
-    item("qb-payee", "Missing payees", reviewItems.some((review) => review.issueType === "Unknown payee") ? "Needs Attention" : "Complete", reviewItems.some((review) => review.issueType === "Unknown payee") ? "Some transactions have unknown payees." : undefined, "Transactions", "Go to Transactions"),
-    item("qb-receipts", "Missing receipts", reviewItems.some((review) => review.issueType === "May need receipt") ? "Needs Attention" : "Complete", reviewItems.some((review) => review.issueType === "May need receipt") ? "Some transactions may need receipts." : undefined, "Transactions", "Go to Transactions"),
+    item("qb-category", "Missing categories", hasIssue("uncategorized") ? "Needs Attention" : "Complete", hasIssue("uncategorized") ? "Some transactions still need categories." : undefined, "Transactions", "Go to Transactions"),
+    item("qb-payee", "Missing payees", hasIssue("missing-payee") ? "Needs Attention" : "Complete", hasIssue("missing-payee") ? "Some transactions have unknown payees." : undefined, "Transactions", "Go to Transactions"),
+    item("qb-receipts", "Missing receipts", hasIssue("needs-receipt") ? "Needs Attention" : "Complete", hasIssue("needs-receipt") ? "Some transactions may need receipts." : undefined, "Transactions", "Go to Transactions"),
     item("qb-invoices", "Overdue invoices reviewed", overdueInvoices.length === 0 ? "Complete" : "Needs Attention", overdueInvoices.length ? `${overdueInvoices.length} overdue invoices need review` : undefined, "Receivables", "Go to Receivables"),
     item("qb-bills", "Overdue bills reviewed", overdueBills.length === 0 ? "Complete" : "Needs Attention", overdueBills.length ? `${overdueBills.length} overdue bills need review` : undefined, "Payables", "Go to Payables"),
     item("qb-requests", "Open client requests", openRequests.length === 0 ? "Complete" : "Needs Attention", openRequests.length ? `${openRequests.length} questions are waiting for client responses` : undefined, "Client Requests", "Go to Client Requests"),
@@ -2841,7 +3144,6 @@ function MonthEnd({
   quickBooksInvoices,
   quickBooksBills,
   reviewRequests,
-  reviewReconciliationAccounts,
   completed,
   onUpdate,
   onComplete,
@@ -2855,14 +3157,13 @@ function MonthEnd({
   quickBooksInvoices: LedgerInvoice[];
   quickBooksBills: LedgerBill[];
   reviewRequests: ClientRequest[];
-  reviewReconciliationAccounts: ReconciliationAccount[];
   completed: boolean;
   onUpdate: (item: MonthEndItem) => void;
   onComplete: (status: string) => void;
   history: MonthEndCompletion[];
   onNavigate: (destination: NonNullable<MonthEndItem["relatedView"]>) => void;
 }) {
-  const activeChecklist = source === "quickbooks" ? buildQuickBooksMonthEndChecklist({ transactions: quickBooksTransactions, accounts: quickBooksAccounts, invoices: quickBooksInvoices, bills: quickBooksBills }, reviewRequests, reviewReconciliationAccounts) : checklist;
+  const activeChecklist = source === "quickbooks" ? buildQuickBooksMonthEndChecklist({ transactions: quickBooksTransactions, accounts: quickBooksAccounts, invoices: quickBooksInvoices, bills: quickBooksBills }, reviewRequests) : checklist;
   const completedCount = activeChecklist.filter(
     (item) => item.status === "Complete",
   ).length;
@@ -2889,7 +3190,7 @@ function MonthEnd({
     <div className="page-content">
       <section className="month-end-hero">
         <div>
-          <p className="eyebrow">ABC PLUMBING · AUGUST 2026</p>
+          <p className="eyebrow"><ClientName upper /> · AUGUST 2026</p>
           <h2>Month End</h2>
           <p className="muted">
             Finish the monthly checklist and get the books ready.
@@ -2908,7 +3209,7 @@ function MonthEnd({
           <div>
             <h2>August books are ready</h2>
             <p className="muted">
-              ABC Plumbing's August 2026 month end is complete.
+              <ClientName />'s August 2026 month end is complete.
             </p>
           </div>
           <span>✓</span>
@@ -2995,36 +3296,39 @@ function MonthEnd({
 
 function Reconcile({
   source,
+  clientRef,
   accounts,
   isLoading,
   error,
-  selectedAccount,
-  onSelect,
-  onBack,
+  today,
   onSourceChange,
 }: {
   source: AccountSource;
+  clientRef: { id: string; name: string };
   accounts: LedgerAccount[];
   isLoading: boolean;
   error: string | null;
-  selectedAccount: ReconciliationAccount | null;
-  onSelect: (account: ReconciliationAccount) => void;
-  onBack: () => void;
+  today: string;
   onSourceChange: (source: AccountSource) => void;
 }) {
-  if (source === "demo" && selectedAccount)
-    return (
-      <ReconciliationWorkspace
-        account={selectedAccount}
-        onBack={onBack}
-        onUpdate={onSelect}
-      />
-    );
-  const quickBooksAccounts = accounts.filter(
-    (account) =>
-      account.active &&
-      (account.accountType === "Bank" || account.accountType === "Credit Card"),
-  );
+  const options: ReconAccount[] =
+    source === "demo"
+      ? demoReconSources.map((item) => ({
+          id: item.id,
+          name: item.name,
+          kind: item.kind,
+          lastReconciled: item.lastReconciled,
+          defaults: { periodStart: item.periodStart, periodEnd: item.periodEnd, statementDate: item.statementDate, beginningCents: item.beginningCents, endingCents: item.endingCents, statementLines: item.statementLines },
+        }))
+      : accounts
+          .filter((account) => account.active && account.quickBooksId && (account.accountType === "Bank" || account.accountType === "Credit Card"))
+          .map((account) => ({ id: account.quickBooksId!, name: account.name, kind: account.accountType === "Bank" ? ("bank" as const) : ("credit_card" as const), detail: `QuickBooks balance today ${formatMoney(account.currentBalance)}` }));
+  const loadAccountData = async (accountId: string, through: string) => {
+    if (source === "quickbooks") return quickBooksService.getReconciliationData(accountId, through);
+    const item = demoReconSources.find((candidate) => candidate.id === accountId);
+    if (!item) throw new Error("That demo account was not found.");
+    return { transactions: item.transactions, completeness: { complete: true, reasons: [] } };
+  };
 
   return (
     <div className="page-content">
@@ -3033,7 +3337,7 @@ function Reconcile({
           <h2>Reconcile</h2>
           <p className="muted">Make sure each account matches its statement.</p>
         </div>
-        <span className="count-pill">ABC Plumbing</span>
+        <span className="count-pill"><ClientName /></span>
       </section>
       <AccountSourceSwitch source={source} onChange={onSourceChange} />
       {isLoading && (
@@ -3042,68 +3346,7 @@ function Reconcile({
         </div>
       )}
       {error && <div className="data-state-message error">{error}</div>}
-      {source === "demo" ? (
-        <div className="reconciliation-account-grid">
-          {reconciliationAccounts.map((account) => (
-            <button
-              className="reconciliation-account-card"
-              key={account.id}
-              onClick={() => onSelect(account)}
-            >
-              <div className="account-card-header">
-                <span className="account-icon">$</span>
-                <span>
-                  <strong>{account.name}</strong>
-                  <small>Last reconciled {account.lastReconciled}</small>
-                </span>
-                <span className="row-arrow">→</span>
-              </div>
-              <div className="account-card-details">
-                <span>
-                  <small>Statement ending</small>
-                  <strong>{account.statementEnding}</strong>
-                </span>
-                <span>
-                  <small>QuickBooks balance</small>
-                  <strong>{formatMoney(account.quickBooksBalance)}</strong>
-                </span>
-                <span>
-                  <small>Statement balance</small>
-                  <strong>{formatMoney(account.statementBalance)}</strong>
-                </span>
-              </div>
-              <div className="account-card-footer">
-                <span
-                  className={`transaction-status ${account.status === "Ready to complete" ? "matched" : "needs-review"}`}
-                >
-                  {account.status}
-                </span>
-                <span
-                  className={
-                    account.quickBooksBalance === account.statementBalance
-                      ? "success-text"
-                      : "attention-number"
-                  }
-                >
-                  Difference{" "}
-                  {formatMoney(
-                    account.statementBalance - account.quickBooksBalance,
-                  )}
-                </span>
-              </div>
-            </button>
-          ))}
-        </div>
-      ) : (
-        <div className="reconciliation-account-grid">
-          {quickBooksAccounts.map((account) => (
-            <QuickBooksAccountCard
-              account={account}
-              key={account.quickBooksId || account.name}
-            />
-          ))}
-        </div>
-      )}
+      <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} />
     </div>
   );
 }
@@ -3134,233 +3377,6 @@ function AccountSourceSwitch({
   );
 }
 
-function QuickBooksAccountCard({ account }: { account: LedgerAccount }) {
-  return (
-    <div className="reconciliation-account-card quickbooks-account-card">
-      <div className="account-card-header">
-        <span className="account-icon">$</span>
-        <span>
-          <strong>{account.name}</strong>
-          <small>QuickBooks Sandbox · {account.accountType}</small>
-        </span>
-      </div>
-      <div className="account-card-details">
-        <span>
-          <small>Account type</small>
-          <strong>{account.accountType}</strong>
-        </span>
-        <span>
-          <small>Subtype</small>
-          <strong>{account.accountSubType || "Not provided"}</strong>
-        </span>
-        <span>
-          <small>Current balance</small>
-          <strong>{formatMoney(account.currentBalance)}</strong>
-        </span>
-      </div>
-      <div className="account-card-footer">
-        <span className="transaction-status matched">Read only</span>
-        <span>{account.currency || "USD"}</span>
-      </div>
-    </div>
-  );
-}
-
-function ReconciliationWorkspace({
-  account,
-  onBack,
-  onUpdate,
-}: {
-  account: ReconciliationAccount;
-  onBack: () => void;
-  onUpdate: (account: ReconciliationAccount) => void;
-}) {
-  const [completed, setCompleted] = useState(false);
-  const toggleTransaction = (transactionId: string) =>
-    onUpdate({
-      ...account,
-      transactions: account.transactions.map((transaction) =>
-        transaction.id === transactionId
-          ? { ...transaction, cleared: !transaction.cleared }
-          : transaction,
-      ),
-    });
-  const clearedBalance = account.transactions.reduce(
-    (balance, transaction) =>
-      transaction.cleared
-        ? balance +
-          (transaction.type === "Deposit"
-            ? transaction.amount
-            : -transaction.amount)
-        : balance,
-    0,
-  );
-  const totalTransactionChange = account.transactions.reduce(
-    (balance, transaction) =>
-      balance +
-      (transaction.type === "Deposit"
-        ? transaction.amount
-        : -transaction.amount),
-    0,
-  );
-  const isBalanced =
-    Math.abs(
-      account.statementBalance -
-        (account.quickBooksBalance - totalTransactionChange + clearedBalance),
-    ) < 0.005;
-  const beginningBalance = account.quickBooksBalance - totalTransactionChange;
-  const displayedClearedBalance = beginningBalance + clearedBalance;
-  const actualDifference = account.statementBalance - displayedClearedBalance;
-  const likelyProblems = account.possibleProblems || [
-    "No likely problems found.",
-  ];
-
-  return (
-    <div className="page-content">
-      <button className="back-button" onClick={onBack}>
-        ← All accounts
-      </button>
-      <section className="reconcile-header">
-        <div>
-          <p className="eyebrow">ABC PLUMBING · RECONCILIATION</p>
-          <h2>{account.name.toUpperCase()}</h2>
-          <p className="muted">Statement ending {account.statementEnding}</p>
-        </div>
-        <span
-          className={`reconcile-status ${isBalanced ? "ready" : "problem"}`}
-        >
-          {isBalanced ? "Ready to Complete" : "Something doesn't match."}
-        </span>
-      </section>
-      <section className="reconcile-summary">
-        <BalanceItem
-          label="Beginning balance"
-          value={formatMoney(beginningBalance)}
-        />
-        <BalanceItem
-          label="Statement ending balance"
-          value={formatMoney(account.statementBalance)}
-        />
-        <BalanceItem
-          label="Cleared balance"
-          value={formatMoney(displayedClearedBalance)}
-        />
-        <BalanceItem
-          label="Difference"
-          value={formatMoney(actualDifference)}
-          tone={isBalanced ? "good" : "bad"}
-        />
-      </section>
-      {!isBalanced && (
-        <div className="problem-panel">
-          <div>
-            <h2>Something doesn't match.</h2>
-            <p className="muted">Check these common causes:</p>
-            <ul>
-              {[
-                "Missing transaction",
-                "Duplicate transaction",
-                "Wrong transaction amount",
-                "Transaction not cleared",
-              ].map((cause) => (
-                <li key={cause}>{cause}</li>
-              ))}
-            </ul>
-          </div>
-          <button
-            className="secondary-button problem-button"
-            onClick={() =>
-              document
-                .getElementById("likely-problems")
-                ?.scrollIntoView({ behavior: "smooth" })
-            }
-          >
-            Find the Problem <span>→</span>
-          </button>
-        </div>
-      )}
-      <section className="panel reconciliation-workspace">
-        <div className="panel-heading">
-          <div>
-            <h2>Transactions included</h2>
-            <p className="muted">
-              Check each transaction that cleared the bank.
-            </p>
-          </div>
-          <span className="count-pill">
-            {
-              account.transactions.filter((transaction) => transaction.cleared)
-                .length
-            }{" "}
-            cleared
-          </span>
-        </div>
-        <div className="reconcile-transaction-heading">
-          <span>Cleared</span>
-          <span>Date</span>
-          <span>Payee</span>
-          <span>Amount</span>
-          <span>Type</span>
-        </div>
-        {account.transactions.map((transaction) => (
-          <button
-            className="reconcile-transaction-row"
-            key={transaction.id}
-            onClick={() => toggleTransaction(transaction.id)}
-          >
-            <span
-              className={`clear-check ${transaction.cleared ? "checked" : ""}`}
-            >
-              {transaction.cleared ? "✓" : ""}
-            </span>
-            <span>{transaction.date}</span>
-            <strong>{transaction.payee}</strong>
-            <span>{formatMoney(transaction.amount)}</span>
-            <span
-              className={transaction.type === "Deposit" ? "success-text" : ""}
-            >
-              {transaction.type}
-            </span>
-          </button>
-        ))}
-      </section>
-      {!isBalanced && (
-        <div className="likely-problems" id="likely-problems">
-          <h2>Likely problem transactions</h2>
-          {likelyProblems.map((problem) => (
-            <p key={problem}>! {problem}</p>
-          ))}
-        </div>
-      )}
-      <button
-        className="primary-button complete-button"
-        disabled={!isBalanced || completed}
-        onClick={() => setCompleted(true)}
-      >
-        {completed ? "Reconciliation Complete" : "Complete Reconciliation"}{" "}
-        <span>{completed ? "✓" : "→"}</span>
-      </button>
-    </div>
-  );
-}
-
-function BalanceItem({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "good" | "bad";
-}) {
-  return (
-    <div className={`balance-item ${tone || ""}`}>
-      <small>{label}</small>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
 function formatMoney(amount: number) {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -3376,12 +3392,18 @@ function quickBooksBalance(accounts: LedgerAccount[], accountType: string) {
 
 function ClientDashboard({
   client,
-  accountSource,
+  companyName,
+  source,
+  available,
+  tasks,
+  monthEndProgress,
   quickBooksAccounts,
   accountLoading,
   accountError,
-  onAccountSourceChange,
+  onSourceChange,
   onBack,
+  onOpenInbox,
+  onOpenTask,
   onTransactions,
   onReconcile,
   onMonthEnd,
@@ -3389,13 +3411,19 @@ function ClientDashboard({
   onPayables,
   onReports,
 }: {
-  client: Client;
-  accountSource: AccountSource;
+  client: Client | null;
+  companyName: string;
+  source: AccountSource;
+  available: boolean;
+  tasks: WorkTask[];
+  monthEndProgress: number | null;
   quickBooksAccounts: LedgerAccount[];
   accountLoading: boolean;
   accountError: string | null;
-  onAccountSourceChange: (source: AccountSource) => void;
+  onSourceChange: (source: AccountSource) => void;
   onBack: () => void;
+  onOpenInbox: () => void;
+  onOpenTask: (task: WorkTask) => void;
   onTransactions: () => void;
   onReconcile: () => void;
   onMonthEnd: () => void;
@@ -3403,20 +3431,25 @@ function ClientDashboard({
   onPayables: () => void;
   onReports: () => void;
 }) {
-  const bankBalance =
-    accountSource === "quickbooks"
-      ? formatMoney(quickBooksBalance(quickBooksAccounts, "Bank"))
-      : client.bankBalance;
-  const accountsReceivable =
-    accountSource === "quickbooks"
-      ? formatMoney(
-          quickBooksBalance(quickBooksAccounts, "Accounts Receivable"),
-        )
-      : client.accountsReceivable;
-  const accountsPayable =
-    accountSource === "quickbooks"
-      ? formatMoney(quickBooksBalance(quickBooksAccounts, "Accounts Payable"))
-      : client.accountsPayable;
+  const isDemo = source === "demo";
+  // Demo clients other than the one with full records only have summary counts.
+  const hasRecords = !isDemo || client?.id === demoClient.id;
+  const summary = summarizeTasks(tasks);
+  const kindCount = (kind: WorkTask["kind"]) => tasks.filter((task) => task.kind === kind).reduce((sum, task) => sum + task.count, 0);
+  const balances = quickBooksAccounts.length > 0;
+  const money = (type: string) => (balances ? formatMoney(quickBooksBalance(quickBooksAccounts, type)) : NOT_AVAILABLE);
+  const bankBalance = isDemo ? client!.bankBalance : money("Bank");
+  const accountsReceivable = isDemo ? client!.accountsReceivable : money("Accounts Receivable");
+  const accountsPayable = isDemo ? client!.accountsPayable : money("Accounts Payable");
+  const status = (value: number, available_: boolean, unit: string) => (!available_ ? NOT_AVAILABLE : value === 0 ? "None" : `${value} ${unit}`);
+  const toneFor = (value: number, text: string) => (text === NOT_AVAILABLE ? "amber" : value === 0 ? "green" : "red");
+  const transactionsOpen = summary.transactions;
+  const reconciliationOpen = summary.reconciliation;
+  const questionsOpen = summary.clientQuestions;
+  const uncategorized = kindCount("uncategorized");
+  const receipts = kindCount("needs-receipt");
+  const hasHigh = summary.high > 0;
+  const name = client?.name ?? companyName;
   return (
     <div className="page-content">
       <button className="back-button" onClick={onBack}>
@@ -3424,18 +3457,17 @@ function ClientDashboard({
       </button>
       <section className="client-hero">
         <div>
-          <span className="status-badge warning">Needs attention</span>
-          <h2>{client.name}</h2>
-          <p className="muted">Books for {client.month}</p>
+          <span className={`status-badge ${!available ? "warning" : tasks.length === 0 ? "success" : "warning"}`}>
+            {!available ? NOT_AVAILABLE : tasks.length === 0 ? "On track" : hasHigh ? "Needs attention" : "Some items open"}
+          </span>
+          <h2>{name}</h2>
+          <p className="muted">{isDemo ? `Books for ${client!.month}` : "QuickBooks Sandbox company"}</p>
         </div>
         <button className="primary-button" onClick={onTransactions}>
           Review transactions <span>→</span>
         </button>
       </section>
-      <AccountSourceSwitch
-        source={accountSource}
-        onChange={onAccountSourceChange}
-      />
+      <AccountSourceSwitch source={source} onChange={onSourceChange} />
       {accountLoading && (
         <div className="data-state-message">
           Loading QuickBooks Sandbox account balances...
@@ -3447,50 +3479,58 @@ function ClientDashboard({
       <section className="metrics-grid finance-grid">
         <MetricCard
           label="Income"
-          value={client.income}
-          note="This month"
+          value={isDemo ? client!.income : NOT_AVAILABLE}
+          note={isDemo ? "This month (demo)" : "See Reports"}
           tone="green"
         />
         <MetricCard
           label="Expenses"
-          value={client.expenses}
-          note="This month"
+          value={isDemo ? client!.expenses : NOT_AVAILABLE}
+          note={isDemo ? "This month (demo)" : "See Reports"}
           tone="amber"
         />
         <MetricCard
           label="Profit"
-          value={client.profit}
-          note="This month"
+          value={isDemo ? client!.profit : NOT_AVAILABLE}
+          note={isDemo ? "This month (demo)" : "See Reports"}
           tone="blue"
         />
         <MetricCard
           label="Bank balance"
           value={bankBalance}
-          note={
-            accountSource === "quickbooks"
-              ? "QuickBooks balance"
-              : "As of today"
-          }
+          note={isDemo ? "Demo balance" : "QuickBooks balance"}
           tone="purple"
         />
         <MetricCard
           label="Accounts receivable"
           value={accountsReceivable}
-          note={
-            accountSource === "quickbooks" ? "QuickBooks balance" : "To collect"
-          }
+          note={isDemo ? "To collect (demo)" : "QuickBooks balance"}
           tone="green"
         />
         <MetricCard
           label="Accounts payable"
           value={accountsPayable}
-          note={
-            accountSource === "quickbooks" ? "QuickBooks balance" : "To pay"
-          }
+          note={isDemo ? "To pay (demo)" : "QuickBooks balance"}
           tone="red"
         />
       </section>
       <section className="content-grid">
+        <div className="panel work-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Next up for {name}</h2>
+              <p className="muted">The most important items first.</p>
+            </div>
+            <span className="count-pill">{available ? `${tasks.length} tasks` : NOT_AVAILABLE}</span>
+          </div>
+          {available && tasks.length === 0 && <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">Nothing needs attention for this client.</p></div>}
+          <TaskCardList tasks={tasks.slice(0, 5)} showClient={false} onOpenTask={onOpenTask} />
+          {tasks.length > 5 && (
+            <button className="text-button" onClick={onOpenInbox}>
+              See all {tasks.length} tasks in the Inbox <span>→</span>
+            </button>
+          )}
+        </div>
         <div className="panel">
           <div className="panel-heading">
             <div>
@@ -3499,36 +3539,17 @@ function ClientDashboard({
             </div>
           </div>
           <div className="status-list">
-            <StatusRow
-              label="Transactions needing review"
-              value="14"
-              tone="red"
-            />
-            <StatusRow
-              label="Uncategorized transactions"
-              value="3"
-              tone="amber"
-            />
-            <StatusRow label="Reconciliation" value="Ready" tone="green" />
-            <StatusRow label="Missing receipts" value="1" tone="amber" />
-            <StatusRow
-              label="Client questions"
-              value="1 waiting"
-              tone="purple"
-            />
-            <StatusRow
-              label="Month-end progress"
-              value={`${client.monthEnd}%`}
-              tone="blue"
-            />
-          </div>
-        </div>
-        <div className="panel action-panel">
-          <div className="panel-heading">
-            <div>
-              <h2>Quick actions</h2>
-              <p className="muted">Choose the next thing to work on.</p>
-            </div>
+            {(() => {
+              const rows = [
+                { label: "Transactions needing review", count: transactionsOpen, text: status(transactionsOpen, available, "to review") },
+                { label: "Uncategorized transactions", count: uncategorized, text: status(uncategorized, available && hasRecords, "found") },
+                { label: "Reconciliation", count: reconciliationOpen, text: status(reconciliationOpen, available, "to check") },
+                { label: "Possible missing receipts", count: receipts, text: status(receipts, available && hasRecords, "flagged") },
+                { label: "Client questions", count: questionsOpen, text: status(questionsOpen, available, "open") },
+              ];
+              return rows.map((row) => <StatusRow key={row.label} label={row.label} value={row.text} tone={toneFor(row.count, row.text)} />);
+            })()}
+            <StatusRow label="Month-end progress" value={monthEndProgress === null ? NOT_AVAILABLE : `${monthEndProgress}%`} tone="blue" />
           </div>
           <div className="action-grid">
             <button onClick={onTransactions}>
@@ -3573,22 +3594,6 @@ function MetricCard({
       <strong>{value}</strong>
       <span className="metric-note">{note}</span>
     </div>
-  );
-}
-function WorkRow({ item }: { item: (typeof todaysWork)[number] }) {
-  return (
-    <button className="work-row">
-      <span className={`work-icon ${item.tone}`}>
-        {item.tone === "red" ? "!" : item.tone === "amber" ? "◷" : "✓"}
-      </span>
-      <span className="work-copy">
-        <strong>{item.title}</strong>
-        <span>
-          {item.client} · {item.detail}
-        </span>
-      </span>
-      <span className="row-arrow">→</span>
-    </button>
   );
 }
 function StatusRow({

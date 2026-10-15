@@ -7,28 +7,43 @@
     "dev": "vite",
     "server:dev": "tsx server/index.ts",
     "dev:all": "concurrently \"npm run server:dev\" \"npm run dev\"",
-    "build": "tsc -b && npm run build:server && vite build",
+    "build": "tsc -b && npm run build:server && npm run build:pages && npm run build:render",
+    "build:pages": "vite build",
+    "build:render": "vite build --mode render --outDir dist-render",
     "build:server": "tsc --project tsconfig.server.json",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
     "preview": "vite preview",
     "start": "node dist-server/server/index.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "typescript": "latest",
+    "connect-pg-simple": "^10.0.0",
+    "cors": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "express-session": "^1.19.0",
+    "openid-client": "^6.8.8",
+    "pg": "^8.23.1",
     "react": "latest",
-    "react-dom": "latest"
-    ,"cors": "latest"
-    ,"dotenv": "latest"
-    ,"express": "latest"
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
   },
   "devDependencies": {
-    "@types/express": "latest",
+    "@playwright/test": "^1.64.1",
+    "@types/connect-pg-simple": "^7.0.3",
     "@types/cors": "latest",
+    "@types/express": "latest",
+    "@types/express-session": "^1.19.0",
     "@types/node": "latest",
+    "@types/pg": "^8.23.1",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "@types/supertest": "^7.2.1",
     "concurrently": "latest",
-    "tsx": "latest"
+    "supertest": "^7.3.1",
+    "tsx": "latest",
+    "vitest": "^5.0.5"
   }
 }

@@ -1,6 +1,9 @@
 node_modules/
 dist/
+dist-render/
 dist-server/
+test-results/
+playwright-report/
 *.local
 .env
 .env.*

@@ -1,0 +1,71 @@
+import { computeReconciliation, labelsFor, formatCents, type Computation, type ReconTxn, type ReconciliationRecord } from '../../shared/reconciliation'
+
+const money = (cents: number) => (cents / 100).toFixed(2)
+// Statement text is untrusted; stop spreadsheet apps from treating it as a formula.
+const text = (value: string) => {
+  const safe = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value
+  return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe
+}
+const row = (...cells: (string | number)[]) => cells.map((cell) => (typeof cell === 'number' ? String(cell) : text(cell))).join(',')
+
+export function reportFileName(record: Pick<ReconciliationRecord, 'accountName' | 'periodEnd'>) {
+  return `reconciliation-${record.accountName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'account'}-${record.periodEnd}.csv`
+}
+
+/** A plain CSV summary built only from the saved record and its calculation. */
+export function buildReconciliationCsv(record: ReconciliationRecord, storage: { durable: boolean }, computation: Computation = computeReconciliation(record)): string {
+  const labels = labelsFor(record.accountKind)
+  const lines: string[] = []
+  const section = (title: string) => lines.push('', row(title))
+  const txnRow = (item: ReconTxn, kind: string) => row(item.date, item.payee, item.memo, kind, money(item.direction === 'increase' ? item.amountCents : -item.amountCents))
+
+  lines.push(row('LedgerOps reconciliation summary'))
+  lines.push(row('Client', record.clientName), row('Account', `${record.accountName} (${record.accountKind === 'bank' ? 'bank account' : 'credit card'})`))
+  lines.push(row('Data source', record.source === 'demo' ? 'Demo data' : 'QuickBooks Sandbox (read only)'))
+  lines.push(row('Statement period', `${record.periodStart} to ${record.periodEnd}`), row('Statement date', record.statementDate))
+  lines.push(row('Status', record.status === 'completed' ? `Completed ${record.completedAt ?? ''} by ${record.completedBy ?? ''}` : 'Draft - not completed'))
+  lines.push(row('Statement detail', record.statementMode === 'csv' ? `Imported (${record.statementLines.length} lines)` : 'Entered manually; cleared items are user-asserted'))
+  lines.push(row('Record storage', storage.durable ? 'Saved in the LedgerOps database' : 'Temporary local development record; it will be lost when the server restarts'))
+  lines.push(row('Note', 'This reconciliation is tracked in LedgerOps only. Nothing was written to QuickBooks.'))
+
+  section('Balances (US dollars)')
+  lines.push(row('Beginning balance', money(record.beginningCents)))
+  lines.push(row(`Cleared ${labels.increase.toLowerCase()}s`, money(computation.clearedIncreaseCents)))
+  lines.push(row(`Cleared ${labels.decrease.toLowerCase()}s`, money(computation.clearedDecreaseCents)))
+  lines.push(row('Cleared balance', money(computation.clearedBalanceCents)))
+  lines.push(row('Statement ending balance', money(record.endingCents)))
+  lines.push(row('Difference', money(computation.differenceCents)))
+  lines.push(row(`${labels.outstandingIncrease}s`, money(computation.outstandingIncreaseCents)))
+  lines.push(row(`${labels.outstandingDecrease}s`, money(computation.outstandingDecreaseCents)))
+  lines.push(row('Adjusted statement balance', money(computation.adjustedBankBalanceCents)))
+  lines.push(row('Book balance at statement date', money(computation.bookBalanceCents)))
+
+  section('Cleared transactions')
+  lines.push(row('Date', 'Payee', 'Memo', 'Type', 'Amount'))
+  computation.cleared.forEach((item) => lines.push(txnRow(item, item.direction === 'increase' ? labels.increase : labels.decrease)))
+
+  section('Outstanding items')
+  lines.push(row('Date', 'Payee', 'Memo', 'Type', 'Amount'))
+  computation.outstandingIncrease.forEach((item) => lines.push(txnRow(item, labels.outstandingIncrease)))
+  computation.outstandingDecrease.forEach((item) => lines.push(txnRow(item, labels.outstandingDecrease)))
+
+  if (record.statementMode === 'csv') {
+    section('Statement lines not matched to your books')
+    lines.push(row('Date', 'Description', 'Amount'))
+    computation.unmatchedLines.forEach((item) => lines.push(row(item.date, item.description, money(item.direction === 'increase' ? item.amountCents : -item.amountCents))))
+  }
+
+  section('Issues')
+  lines.push(row('Severity', 'Message'))
+  computation.issues.forEach((issue) => lines.push(row(issue.severity, issue.message)))
+  if (computation.issues.length === 0) lines.push(row('none', 'No issues found'))
+  computation.explanations.forEach((explanation) => lines.push(row('explanation', explanation)))
+
+  section('History')
+  lines.push(row('When', 'Who', 'Action', 'Reason', 'Difference'))
+  record.history.forEach((event) => lines.push(row(event.at, event.by, event.action, event.reason ?? '', event.differenceCents === undefined ? '' : money(event.differenceCents))))
+  if (record.history.length === 0) lines.push(row('', '', 'no events recorded yet', '', ''))
+
+  lines.push('', row('Generated by LedgerOps', formatCents(computation.differenceCents) === '$0.00' ? 'Balanced' : 'Not balanced'))
+  return `${lines.join('\r\n')}\r\n`
+}

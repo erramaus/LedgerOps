@@ -18,7 +18,7 @@ export type {
   WorkItem,
 } from '../data/demoData'
 
-export type { Transaction } from '../data/demoData'
+export type { Transaction, TransactionLine } from '../data/demoData'
 
 export type LedgerContact = {
   quickBooksId?: string
@@ -45,6 +45,11 @@ export type LedgerTransaction = Transaction & {
   quickBooksId?: string
   transactionType?: string
   source?: 'demo' | 'quickbooks'
+  /** Needed to detect that a transaction changed in QuickBooks after it was opened. */
+  syncToken?: string
+  totalAmount?: number
+  /** Present when the transaction cannot be safely categorized here. */
+  readOnlyReason?: string
 }
 
 export type LedgerAccount = {

@@ -1,12 +1,15 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
-  base: '/LedgerOps/',
+// 'render' mode is served by Express at the site root; every other mode targets GitHub Pages.
+export default defineConfig(({ mode }) => ({
+  base: mode === 'render' ? '/' : '/LedgerOps/',
   plugins: [react()],
+  // Force same-origin API calls in the Render bundle regardless of any .env files.
+  define: mode === 'render' ? { 'import.meta.env.VITE_API_BASE_URL': '""' } : {},
   server: {
     proxy: {
       '/api': 'http://localhost:3001',
     },
   },
-})
+}))
