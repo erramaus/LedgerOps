@@ -86,6 +86,7 @@ type MonthEndCompletion = {
 };
 
 function App() {
+  const [currentDate, setCurrentDate] = useState(() => new Date());
   const [view, setView] = useState<View>("Dashboard");
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [transactions, setTransactions] =
@@ -154,6 +155,11 @@ function App() {
   const [appDataSource, setAppDataSource] = useState<AccountSource>("demo");
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
   const [monthEndHistory, setMonthEndHistory] = useState<MonthEndCompletion[]>([]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setCurrentDate(new Date()), 60_000);
+    return () => window.clearInterval(intervalId);
+  }, []);
 
   useEffect(() => {
     quickBooksService.getStatus().then(setQuickBooksStatus).catch(() => undefined);
@@ -545,12 +551,19 @@ function App() {
       <main className="main-content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Monday, September 7, 2026</p>
+            <p className="eyebrow">
+              {new Intl.DateTimeFormat("en-US", {
+                weekday: "long",
+                month: "long",
+                day: "numeric",
+                year: "numeric",
+              }).format(currentDate)}
+            </p>
             <h1>
               {view === "Dashboard"
                 ? selectedClient
                   ? selectedClient.name
-                  : "Good morning, Jordan"
+                  : "Let's get to work!"
                 : view}
             </h1>
           </div>
