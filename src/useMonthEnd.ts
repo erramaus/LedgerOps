@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DEMO_CLIENT_ID } from "../shared/demoBooks";
-import { demoMonthEndInputs } from "../shared/demoMonthEnd";
+import { demoMonthEndInputs, type DemoLedger } from "../shared/demoMonthEnd";
 import { allUnavailable, buildChecklist, monthEndId, validateClose, type Checklist, type MonthEndInputs, type MonthEndRecord, type Source } from "../shared/monthEnd";
 import { monthLabel, periodEnd, periodKey, periodStart, type Period } from "../shared/period";
 import type { ClientRequest, LedgerAccount, LedgerBill, LedgerInvoice, LedgerTransaction, Transaction } from "./services/bookkeepingTypes";
@@ -19,6 +19,8 @@ type Args = {
   period: Period;
   today: string;
   demoTransactions: Transaction[];
+  /** Demo data only: the base demo books plus manually entered transactions. */
+  ledger?: DemoLedger;
   requests: ClientRequest[];
   quickBooksData: QuickBooksReviewData | null;
   /** Changes whenever other workflows may have changed what Month End depends on (for example after visiting Reconcile). */
@@ -46,7 +48,7 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
 
 /** Gathers everything the month-end checklist depends on, for one source, client and month, and keeps the actions in one place. */
 export function useMonthEnd(args: Args): MonthEndView {
-  const { enabled, source, client, period, today, demoTransactions, requests, quickBooksData, refreshToken } = args;
+  const { enabled, source, client, period, today, demoTransactions, requests, quickBooksData, refreshToken, ledger } = args;
   const key = periodKey(period);
   const recordId = monthEndId(source, client.id, key);
   const [status, setStatus] = useState<MonthEndView["status"]>("idle");
@@ -85,11 +87,11 @@ export function useMonthEnd(args: Args): MonthEndView {
 
       let inputs: MonthEndInputs;
       if (source === "demo") {
-        if (client.id !== DEMO_CLIENT_ID) {
-          inputs = allUnavailable(key, `Detailed demo records are not set up for ${client.name}. Only ABC Plumbing has them.`, context.signoffs, context.closing);
-        } else {
+        if (client.id === DEMO_CLIENT_ID || ledger?.clientId === client.id) {
           const live = transactionFacts(period, demoTransactions, requests);
-          inputs = demoMonthEndInputs(period, { records: reconciliationRecords, signoffs: context.signoffs, closing: context.closing, liveTransactions: live.facts.total > 0 && live.undated === 0 ? live.facts : null });
+          inputs = demoMonthEndInputs(period, { records: reconciliationRecords, signoffs: context.signoffs, closing: context.closing, liveTransactions: live.facts.total > 0 && live.undated === 0 ? live.facts : null, ledger, clientId: client.id });
+        } else {
+          inputs = allUnavailable(key, `Detailed demo records are not set up for ${client.name}.`, context.signoffs, context.closing);
         }
       } else {
         const start = periodStart(period), end = periodEnd(period);
@@ -134,7 +136,7 @@ export function useMonthEnd(args: Args): MonthEndView {
       latest.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, source, client.id, key, reloadCount, refreshToken, demoTransactions, requests, quickBooksData]);
+  }, [enabled, source, client.id, key, reloadCount, refreshToken, demoTransactions, requests, quickBooksData, ledger]);
 
   const inputs = useMemo(() => (base ? { ...base, signoffs: record?.signoffs ?? {}, closing: record?.closing } : null), [base, record]);
   const checklist = useMemo(() => (inputs ? buildChecklist(inputs) : null), [inputs]);

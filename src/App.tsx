@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { demoDataService } from "./services/demoDataService";
 import type {
   Bill,
@@ -57,20 +57,33 @@ import { suggestCategories } from "./services/categorySuggestions";
 import { ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
 import { demoReconSources } from "./data/demoReconciliation";
 import { DEMO_RECONCILIATION_ACCOUNTS, demoEarlierRegister } from "../shared/demoBooks";
+import { ADDITIONAL_DEMO_CLIENT_IDS, getAdditionalDemoCompany } from "../shared/demoCompanyBooks";
+import { additionRegister, mergedLedger, type DemoEntryRecord } from "../shared/demoEntries";
+import { activePaymentCents, mergeDemoPayments, paymentRegister, type DemoPaymentBook, type DemoPaymentInput, type DocumentPaymentKind } from "../shared/demoPayments";
+import { demoClientFigures } from "../shared/demoMonthEnd";
+import { DEMO_RESET_CLIENTS } from "../shared/demoReset";
+import { formatCents } from "../shared/reconciliation";
+import { demoEntryService, entryTransactions } from "./services/demoEntryService";
+import { billsWithPayments, bookForDocument, demoPaymentService, invoicesWithPayments, paymentTransactions } from "./services/demoPaymentService";
+import { demoResetService } from "./services/demoResetService";
+import type { EntryTools } from "./MissingTransaction";
+import { DocumentPaymentActions } from "./DocumentPaymentActions";
+import { companyBills, companyClient, companyInvoices, companyLedgerRegister, companyReconciliationAccounts, companyReconSources, companyRequests, companyTransactions } from "./services/demoCompanyData";
 import { MonthEnd } from "./MonthEnd";
 import { PeriodPicker } from "./PeriodPicker";
 import { Reports } from "./Reports";
 import { useMonthEnd } from "./useMonthEnd";
 import { toMonthEndItems } from "./services/monthEndData";
+import { summarizeOpenItems } from "./services/openItems";
 import { completionPercent, type StepView } from "../shared/monthEnd";
-import { lastCompleteMonth, type Period } from "../shared/period";
+import { lastCompleteMonth, periodEnd, type Period } from "../shared/period";
 
 // The demo books run from May to August 2026; August is the month the live demo transactions belong to.
 const DEMO_DEFAULT_PERIOD: Period = { year: 2026, month: 8 };
 
 const {
   bills: demoBills,
-  clients,
+  clients: baseClients,
   clientRequests,
   demoClient,
   invoices: demoInvoices,
@@ -130,17 +143,17 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [view, setView] = useState<View>("Dashboard");
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [companyOpen, setCompanyOpen] = useState(false);
-  const [transactions, setTransactions] =
+  const [ownTransactions, setTransactions] =
     useState<Transaction[]>(demoTransactions);
   const [selectedTransaction, setSelectedTransaction] =
     useState<Transaction | null>(null);
   const [period, setPeriod] = useState<Period>(DEMO_DEFAULT_PERIOD);
+  // Bumped when the user clicks the sidebar item for the page they are already on, meaning "take me back to the start".
+  const [homeSignal, setHomeSignal] = useState(0);
   const [requests, setRequests] = useState<ClientRequest[]>(clientRequests);
   const [selectedRequest, setSelectedRequest] = useState<ClientRequest | null>(
     null,
   );
-  const [invoices, setInvoices] = useState<Invoice[]>(demoInvoices);
-  const [bills, setBills] = useState<Bill[]>(demoBills);
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
   const [selectedBill, setSelectedBill] = useState<Bill | null>(null);
   const [transactionSource, setTransactionSource] =
@@ -190,6 +203,33 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [appDataSource, setAppDataSource] = useState<AccountSource>("demo");
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
+  const [demoResetRevision, setDemoResetRevision] = useState(0);
+  const resetDemoState = (clientIds: string[]) => {
+    const targets = new Set(clientIds);
+    if (targets.has(demoClient.id)) setTransactions(demoTransactions);
+    setRequests((current) => [
+      ...current.filter((request) => !request.clientId || !targets.has(request.clientId)),
+      ...clientRequests.filter((request) => request.clientId && targets.has(request.clientId)),
+    ]);
+    setSelectedTransaction(null);
+    setSelectedInvoice(null);
+    setSelectedBill(null);
+    setSelectedRequest(null);
+    setDemoResetRevision((revision) => revision + 1);
+  };
+  useEffect(() => {
+    const receiveReset = (event: StorageEvent) => {
+      if (event.key !== "ledgerops-demo-reset" || !event.newValue) return;
+      try {
+        const clientIds = JSON.parse(event.newValue) as unknown;
+        if (Array.isArray(clientIds) && clientIds.every((id) => typeof id === "string")) resetDemoState(clientIds);
+      } catch {
+        return;
+      }
+    };
+    window.addEventListener("storage", receiveReset);
+    return () => window.removeEventListener("storage", receiveReset);
+  }, []);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => setCurrentDate(new Date()), 60_000);
@@ -199,6 +239,79 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   useEffect(() => {
     quickBooksService.getStatus().then(setQuickBooksStatus).catch(() => undefined);
   }, []);
+
+  // Transactions entered by hand in Demo Mode. The ref always holds the latest list so a reload right after a save sees it.
+  const [demoEntries, setDemoEntries] = useState<DemoEntryRecord[]>([]);
+  const [entriesError, setEntriesError] = useState<string | null>(null);
+  const entriesRef = useRef<DemoEntryRecord[]>([]);
+  const entryLoadGeneration = useRef(0);
+  const applyEntries = (next: DemoEntryRecord[]) => {
+    entryLoadGeneration.current += 1;
+    entriesRef.current = next;
+    setDemoEntries(next);
+  };
+  useEffect(() => {
+    const generation = ++entryLoadGeneration.current;
+    const clientId = selectedClient?.id ?? demoClient.id;
+    entriesRef.current = [];
+    setDemoEntries([]);
+    demoEntryService.list(clientId).then((records) => { if (generation === entryLoadGeneration.current) { entriesRef.current = records; setDemoEntries(records); setEntriesError(null); } }, (error: unknown) => { if (generation === entryLoadGeneration.current) setEntriesError(error instanceof Error ? error.message : "Unknown error."); });
+  }, [selectedClient?.id, demoResetRevision]);
+  const [paymentBooks, setPaymentBooks] = useState<DemoPaymentBook[]>([]);
+  const paymentBooksRef = useRef<DemoPaymentBook[]>([]);
+  const paymentLoadGeneration = useRef(0);
+  useEffect(() => {
+    const generation = ++paymentLoadGeneration.current;
+    const clientId = selectedClient?.id ?? demoClient.id;
+    paymentBooksRef.current = [];
+    setPaymentBooks([]);
+    demoPaymentService.list(clientId).then((books) => { if (generation === paymentLoadGeneration.current) { paymentBooksRef.current = books; setPaymentBooks(books); } }, () => undefined);
+  }, [selectedClient?.id, demoResetRevision]);
+  const activeDemoCompany = selectedClient ? getAdditionalDemoCompany(selectedClient.id) : undefined;
+  const activeDemoClient = activeDemoCompany ? companyClient(activeDemoCompany) : selectedClient?.id === demoClient.id ? demoClient : null;
+  const activeDemoClientId = activeDemoCompany?.clientId ?? demoClient.id;
+  const baseLedger = activeDemoCompany?.ledger;
+  const mergedEntries = useMemo(() => mergedLedger(demoEntries, baseLedger ?? undefined, activeDemoClientId), [demoEntries, baseLedger, activeDemoClientId]);
+  const ledger = useMemo(() => mergeDemoPayments(paymentBooks, mergedEntries, activeDemoClientId), [paymentBooks, mergedEntries, activeDemoClientId]);
+  const invoices = useMemo(() => activeDemoCompany ? companyInvoices(activeDemoCompany, paymentBooks) : invoicesWithPayments(demoInvoices, paymentBooks), [activeDemoCompany, paymentBooks]);
+  const bills = useMemo(() => activeDemoCompany ? companyBills(activeDemoCompany, paymentBooks) : billsWithPayments(demoBills, paymentBooks), [activeDemoCompany, paymentBooks]);
+  const transactions = useMemo(() => activeDemoCompany
+    ? [...companyTransactions(activeDemoCompany), ...entryTransactions(demoEntries, activeDemoClientId), ...paymentTransactions(paymentBooks, activeDemoClientId)]
+    : [...ownTransactions, ...entryTransactions(demoEntries), ...paymentTransactions(paymentBooks)],
+    [activeDemoCompany, activeDemoClientId, ownTransactions, demoEntries, paymentBooks]);
+  // Dashboard figures for all five companies are derived from their own ledgers; ABC keeps its original scenario ledger.
+  const clients = useMemo(() => {
+    return baseClients.map((client) => {
+      if (client.id === demoClient.id) {
+        const figures = demoClientFigures({ year: 2026, month: 8 }, mergeDemoPayments(paymentBooks, mergedLedger(demoEntries), demoClient.id));
+        return { ...client, income: formatCents(figures.incomeCents), expenses: formatCents(figures.expensesCents), profit: formatCents(figures.profitCents), bankBalance: formatCents(figures.bankBalanceCents), accountsReceivable: formatCents(figures.receivableCents), accountsPayable: formatCents(figures.payableCents) };
+      }
+      const company = getAdditionalDemoCompany(client.id);
+      if (!company) return client;
+      const companyPaymentBooks = paymentBooks.filter((book) => book.clientId === company.clientId);
+      const figures = demoClientFigures({ year: 2026, month: 8 }, mergeDemoPayments(companyPaymentBooks, mergedLedger(demoEntries.filter((record) => record.clientId === company.clientId), company.ledger, company.clientId), company.clientId));
+      return { ...client, income: formatCents(figures.incomeCents), expenses: formatCents(figures.expensesCents), profit: formatCents(figures.profitCents), bankBalance: formatCents(figures.bankBalanceCents), accountsReceivable: formatCents(figures.receivableCents), accountsPayable: formatCents(figures.payableCents) };
+    });
+  }, [baseClients, demoEntries, paymentBooks]);
+  // The books-versus-statement figures behind the work queue include manual entries, so a fixed difference stops being a task.
+  const reconciliationAccountsNow = useMemo(
+    () => activeDemoCompany ? companyReconciliationAccounts(activeDemoCompany).map((account) => {
+      const ledgerId = activeDemoCompany.reconciliationAccounts.find((item) => item.id === account.id)?.ledgerId;
+      const rows = ledgerId ? [...additionRegister(demoEntries, ledgerId, activeDemoClientId), ...(ledgerId === "checking" ? paymentRegister(paymentBooks, "checking", activeDemoClientId) : [])] : [];
+      const delta = rows.reduce((total, row) => total + (row.direction === "increase" ? row.amountCents : -row.amountCents), 0);
+      if (!delta) return account;
+      const quickBooksBalance = Math.round(account.quickBooksBalance * 100 + delta) / 100;
+      return { ...account, quickBooksBalance, status: Math.round(quickBooksBalance * 100) === Math.round(account.statementBalance * 100) ? "Ready to complete" : "Difference to resolve" };
+    }) : reconciliationAccounts.map((account) => {
+      const ledgerId = DEMO_RECONCILIATION_ACCOUNTS.find((item) => item.id === account.id)?.ledgerId as "checking" | "card" | undefined;
+      const rows = ledgerId ? [...additionRegister(demoEntries, ledgerId), ...(ledgerId === "checking" ? paymentRegister(paymentBooks, "checking") : [])] : [];
+      const delta = rows.reduce((total, row) => total + (row.direction === "increase" ? row.amountCents : -row.amountCents), 0);
+      if (delta === 0) return account;
+      const quickBooksBalance = Math.round(account.quickBooksBalance * 100 + delta) / 100;
+      return { ...account, quickBooksBalance, status: Math.round(quickBooksBalance * 100) === Math.round(account.statementBalance * 100) ? "Ready to complete" : "Difference to resolve" };
+    }),
+    [activeDemoCompany, activeDemoClientId, demoEntries, paymentBooks],
+  );
 
   const sandboxName = quickBooksCompany?.CompanyName || "QuickBooks Sandbox company";
   const todayLabel = () => new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
@@ -230,6 +343,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   };
 
   const openReconcile = () => {
+    if (view === "Reconcile") setHomeSignal((count) => count + 1);
     setView("Reconcile");
   };
 
@@ -250,7 +364,10 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setSelectedBill(null);
     setView("Payables");
   };
-  const openReports = () => setView("Reports");
+  const openReports = () => {
+    if (view === "Reports") setHomeSignal((count) => count + 1);
+    setView("Reports");
+  };
   const openStepView = (destination: StepView) =>
     destination === "Transactions" ? openTransactions()
       : destination === "Bookkeeping Review" ? setView("Bookkeeping Review")
@@ -342,6 +459,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     const request: ClientRequest = {
       id: `request-${transaction.id}`,
       client: demoClient.name,
+      clientId: transaction.clientId ?? activeDemoClientId,
       dateCreated: todayLabel(),
       relatedTransaction: transaction.payee,
       relatedAmount: transaction.amount,
@@ -376,11 +494,9 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   };
 
   const updateRequest = (updatedRequest: ClientRequest) => {
-    setRequests((currentRequests) =>
-      currentRequests.map((request) =>
-        request.id === updatedRequest.id ? updatedRequest : request,
-      ),
-    );
+    setRequests((currentRequests) => currentRequests.some((request) => request.id === updatedRequest.id)
+      ? currentRequests.map((request) => request.id === updatedRequest.id ? updatedRequest : request)
+      : [...currentRequests, updatedRequest]);
     setSelectedRequest(updatedRequest);
   };
 
@@ -407,7 +523,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   ) => {
     const request: ClientRequest = {
       id: `request-${Date.now()}`,
-      client: demoClient.name,
+      client: activeDemoClient?.name ?? demoClient.name,
+      clientId: activeDemoClientId,
       dateCreated: todayLabel(),
       relatedTransaction,
       relatedAmount,
@@ -417,17 +534,25 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setRequests((currentRequests) => [...currentRequests, request]);
   };
 
-  const updateInvoice = (invoice: Invoice) => {
-    setInvoices((currentInvoices) =>
-      currentInvoices.map((item) => (item.id === invoice.id ? invoice : item)),
-    );
-    setSelectedInvoice(invoice);
+  const savePaymentBook = (book: DemoPaymentBook) => {
+    paymentLoadGeneration.current += 1;
+    const next = [...paymentBooksRef.current.filter((item) => item.id !== book.id), book];
+    paymentBooksRef.current = next;
+    setPaymentBooks(next);
   };
-  const updateBill = (bill: Bill) => {
-    setBills((currentBills) =>
-      currentBills.map((item) => (item.id === bill.id ? bill : item)),
-    );
-    setSelectedBill(bill);
+  const recordDocumentPayment = async (kind: DocumentPaymentKind, documentId: string, input: DemoPaymentInput) => {
+    if (appDataSource !== "demo") throw new Error("QuickBooks payments must be recorded in QuickBooks.");
+    const clientId = activeDemoClientId;
+    const current = bookForDocument(paymentBooksRef.current, kind, documentId, clientId);
+    const next = await demoPaymentService.create(clientId, kind, documentId, current?.version ?? 0, input);
+    savePaymentBook(next);
+  };
+  const reverseDocumentPayment = async (kind: DocumentPaymentKind, documentId: string, paymentId: string, reason: string) => {
+    if (appDataSource !== "demo") throw new Error("QuickBooks payments must be reversed in QuickBooks.");
+    const current = bookForDocument(paymentBooksRef.current, kind, documentId, activeDemoClientId);
+    if (!current) throw new Error("The payment history could not be found.");
+    const next = await demoPaymentService.reverse(current.id, paymentId, current.version, reason);
+    savePaymentBook(next);
   };
 
   const changeTransactionSource = async (source: TransactionSource) => {
@@ -526,7 +651,14 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   };
 
   const source = appDataSource;
-  const scopedRequests = useMemo(() => scopeRequests(requests, source), [requests, source]);
+  const scopedRequests = useMemo(() => {
+    if (source !== "demo" || !activeDemoCompany) return scopeRequests(requests, source);
+    const saved = requests.filter((request) => request.clientId === activeDemoCompany.clientId);
+    const byId = new Map(saved.map((request) => [request.id, request]));
+    const scenarios = companyRequests(activeDemoCompany).map((request) => byId.get(request.id) ?? request);
+    const scenarioIds = new Set(scenarios.map((request) => request.id));
+    return [...scenarios, ...saved.filter((request) => !scenarioIds.has(request.id))];
+  }, [requests, source, activeDemoCompany]);
   // The client and month are chosen once here, so every workflow keeps showing the same ones.
   const monthEndClient = source === "demo" ? { id: (selectedClient ?? demoClient).id, name: (selectedClient ?? demoClient).name } : { id: QUICKBOOKS_CLIENT_ID, name: sandboxName };
   const todayIso = currentDate.toISOString().slice(0, 10);
@@ -537,25 +669,48 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     period,
     today: todayIso,
     demoTransactions: transactions,
+    ledger: source === "demo" ? ledger : undefined,
     requests: scopedRequests,
     quickBooksData: reviewData,
-    refreshToken: view,
+    refreshToken: `${view}:${demoResetRevision}`,
   });
   const monthEndItemsNow = toMonthEndItems(monthEndView.checklist);
-  // Demo records exist for one client only; QuickBooks is one connected company and is never a demo client.
+  // Demo records are scoped to the selected fictional company; unselected clients contribute summary tasks only.
   const queueAvailable = source === "demo" || reviewData !== null;
+  const dataClient = activeDemoClient ?? demoClient;
   const records: ClientRecords =
     source === "demo"
-      ? { client: { id: demoClient.id, name: demoClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts, requests: scopedRequests, monthEnd: monthEndItemsNow }
+      ? { client: { id: dataClient.id, name: dataClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccountsNow, requests: scopedRequests, monthEnd: monthEndItemsNow }
       : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: monthEndItemsNow };
-  const allTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== demoClient.id) : []) : [];
-  const activeClient = source === "demo" ? selectedClient : null;
+  const allTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== records.client.id) : []) : [];
+  const activeClient = source === "demo" && selectedClient ? clients.find((client) => client.id === selectedClient.id) ?? selectedClient : null;
   const visibleTasks = filterTasks(allTasks, { clientId: activeClient?.id });
-  const hasDetail = !activeClient || activeClient.id === demoClient.id;
+  const hasDetail = !activeClient || activeClient.id === demoClient.id || ADDITIONAL_DEMO_CLIENT_IDS.includes(activeClient.id);
   const showNoDetail = Boolean(activeClient) && !hasDetail && detailViews.includes(view);
-  const scopeName = source === "demo" ? demoClient.name : sandboxName;
-  const clientMonthEnd = (client: Client) => (client.id === demoClient.id ? (monthEndView.checklist ? completionPercent(monthEndView.checklist) : null) : client.monthEnd);
+  const scopeName = source === "demo" ? activeClient?.name ?? demoClient.name : sandboxName;
+  const clientMonthEnd = (client: Client) => (client.id === demoClient.id || ADDITIONAL_DEMO_CLIENT_IDS.includes(client.id) ? (selectedClient?.id === client.id && monthEndView.checklist ? completionPercent(monthEndView.checklist) : client.monthEnd) : null);
   const openedMonthEnd = source === "demo" ? (selectedClient ? clientMonthEnd(selectedClient) : null) : monthEndView.checklist ? completionPercent(monthEndView.checklist) : null;
+
+  const entryTools: EntryTools | undefined = source === "demo"
+    ? {
+        clientId: activeDemoClientId,
+        chart: ledger.accounts,
+        records: demoEntries,
+        loadError: entriesError,
+        create: async (input, confirmed) => {
+          const record = await demoEntryService.create(activeDemoClientId, input, confirmed);
+          applyEntries([...entriesRef.current, record]);
+        },
+        edit: async (record, input, reason, confirmed) => {
+          const saved = await demoEntryService.edit(record.id, record.version, input, reason, confirmed);
+          applyEntries(entriesRef.current.map((item) => (item.id === saved.id ? saved : item)));
+        },
+        reverse: async (record, reason) => {
+          const saved = await demoEntryService.reverse(record.id, record.version, reason);
+          applyEntries(entriesRef.current.map((item) => (item.id === saved.id ? saved : item)));
+        },
+      }
+    : undefined;
 
   const openTask = (task: WorkTask) => {
     if (source === "demo") {
@@ -563,9 +718,18 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       if (owner && owner.id !== selectedClient?.id) selectClient(owner);
     }
     if (task.requestId) {
-      setSelectedRequest(requests.find((item) => item.id === task.requestId) ?? null);
+      setSelectedRequest(scopedRequests.find((item) => item.id === task.requestId) ?? null);
       setView("Client Requests");
       return;
+    }
+    // A task about one record opens that record, so the user does not have to find it again.
+    if (task.recordId) {
+      const transaction = (source === "demo" ? transactions : reviewData?.transactions ?? []).find((item) => item.id === task.recordId);
+      const invoice = (source === "demo" ? invoices : reviewData?.invoices ?? []).find((item) => item.id === task.recordId);
+      const bill = (source === "demo" ? bills : reviewData?.bills ?? []).find((item) => item.id === task.recordId);
+      if (task.destination === "Transactions" && transaction) { setSelectedTransaction(transaction); setView("Transactions"); return; }
+      if (task.destination === "Receivables" && invoice) { setSelectedInvoice(invoice); setView("Receivables"); return; }
+      if (task.destination === "Payables" && bill) { setSelectedBill(bill); setView("Payables"); return; }
     }
     const open = { Transactions: openTransactions, Receivables: openReceivables, Payables: openPayables, Reconcile: openReconcile, "Month End": openMonthEnd, "Client Requests": openRequests }[task.destination];
     open();
@@ -757,34 +921,46 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             error={quickBooksAccountsError}
             today={currentDate.toISOString().slice(0, 10)}
             period={period}
+            homeSignal={homeSignal}
+            entryTools={entryTools}
+            loadEntries={() => entriesRef.current}
+            paymentBooks={appDataSource === "demo" ? paymentBooks : []}
             onPeriodChange={setPeriod}
             onSourceChange={changeAppDataSource}
           />
         ) : view === "Receivables" ? (
           <Receivables
             source={appDataSource}
+            clientId={activeDemoCompany?.clientId ?? demoClient.id}
             invoices={invoices}
             quickBooksInvoices={quickBooksInvoices}
             isLoading={quickBooksReceivablesLoading}
             error={quickBooksReceivablesError}
-            selectedInvoice={selectedInvoice}
+            selectedInvoice={selectedInvoice ? invoices.find((item) => item.id === selectedInvoice.id) ?? selectedInvoice : null}
+            paymentBooks={appDataSource === "demo" ? paymentBooks : []}
+            paymentDateDefault={periodEnd(period)}
             onSelect={setSelectedInvoice}
             onBack={() => setSelectedInvoice(null)}
-            onUpdate={updateInvoice}
+            onRecordPayment={recordDocumentPayment}
+            onReversePayment={reverseDocumentPayment}
             onAskClient={createPageRequest}
             onSourceChange={changeAppDataSource}
           />
         ) : view === "Payables" ? (
           <Payables
             source={appDataSource}
+            clientId={activeDemoCompany?.clientId ?? demoClient.id}
             bills={bills}
             quickBooksBills={quickBooksBills}
             isLoading={quickBooksPayablesLoading}
             error={quickBooksPayablesError}
-            selectedBill={selectedBill}
+            selectedBill={selectedBill ? bills.find((item) => item.id === selectedBill.id) ?? selectedBill : null}
+            paymentBooks={appDataSource === "demo" ? paymentBooks : []}
+            paymentDateDefault={periodEnd(period)}
             onSelect={setSelectedBill}
             onBack={() => setSelectedBill(null)}
-            onUpdate={updateBill}
+            onRecordPayment={recordDocumentPayment}
+            onReversePayment={reverseDocumentPayment}
             onAskClient={createPageRequest}
             onSourceChange={changeAppDataSource}
           />
@@ -799,6 +975,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             sourceSwitch={<AccountSourceSwitch source={appDataSource} onChange={changeAppDataSource} />}
             onPeriodChange={setPeriod}
             onOpenReconcile={openReconcile}
+            homeSignal={homeSignal}
+            ledger={source === "demo" ? ledger : undefined}
           />
         ) : view === "Month End" ? (
           <MonthEnd
@@ -827,6 +1005,11 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onStatusChange={setQuickBooksStatus}
             onCompanyChange={setQuickBooksCompany}
             auditLog={auditLog}
+            selectedClientId={selectedClient?.id ?? null}
+            onReset={(clientIds) => {
+              resetDemoState(clientIds);
+              localStorage.setItem("ledgerops-demo-reset", JSON.stringify(clientIds));
+            }}
           />
         )}
       </main>
@@ -885,7 +1068,7 @@ function ClientSwitcher({ source, clients, selected, sandboxName, onSelect }: { 
 function ScopeNotice({ source, client }: { source: AccountSource; client: Client | null }) {
   if (source === "quickbooks")
     return <div className="scope-notice">QuickBooks Sandbox shows one connected company. It is not linked to any demo client, and connecting several companies is not supported yet.</div>;
-  if (client && client.id !== demoClient.id)
+  if (client && client.id !== demoClient.id && !ADDITIONAL_DEMO_CLIENT_IDS.includes(client.id))
     return <div className="scope-notice">Only {demoClient.name} has detailed demo records. {client.name} shows summary figures only and is not connected to QuickBooks.</div>;
   return null;
 }
@@ -1581,38 +1764,47 @@ function ClientRequestDetail({
   );
 }
 
-const invoiceFilters = ["All", "Open", "Overdue", "Paid"] as const;
+const invoiceFilters = ["All", "Open", "Overdue", "Partially Paid", "Paid"] as const;
 const billFilters = [
   "All",
   "Open",
   "Due Soon",
   "Overdue",
+  "Partially Paid",
   "Needs Review",
   "Paid",
 ] as const;
 
 function Receivables({
   source,
+  clientId,
   invoices,
   quickBooksInvoices,
   isLoading,
   error,
   selectedInvoice,
+  paymentBooks,
+  paymentDateDefault,
   onSelect,
   onBack,
-  onUpdate,
+  onRecordPayment,
+  onReversePayment,
   onAskClient,
   onSourceChange,
 }: {
   source: AccountSource;
+  clientId: string;
   invoices: Invoice[];
   quickBooksInvoices: LedgerInvoice[];
   isLoading: boolean;
   error: string | null;
   selectedInvoice: Invoice | null;
+  paymentBooks: DemoPaymentBook[];
+  paymentDateDefault: string;
   onSelect: (invoice: Invoice) => void;
   onBack: () => void;
-  onUpdate: (invoice: Invoice) => void;
+  onRecordPayment: (kind: DocumentPaymentKind, documentId: string, input: DemoPaymentInput) => Promise<void>;
+  onReversePayment: (kind: DocumentPaymentKind, documentId: string, paymentId: string, reason: string) => Promise<void>;
   onAskClient: (question: string, transaction: string, amount: string) => void;
   onSourceChange: (source: AccountSource) => void;
 }) {
@@ -1621,17 +1813,19 @@ function Receivables({
   if (selectedInvoice)
     return (
       <InvoiceDetail
+        clientId={clientId}
         invoice={selectedInvoice}
+        book={bookForDocument(paymentBooks, 'invoice', selectedInvoice.id, clientId)}
+        originalPaidCents={Math.round(selectedInvoice.amountPaid * 100) - activePaymentCents(bookForDocument(paymentBooks, 'invoice', selectedInvoice.id, clientId))}
+        dateDefault={paymentDateDefault}
         readOnly={source === "quickbooks"}
         onBack={onBack}
-        onUpdate={onUpdate}
+        onRecordPayment={(input) => onRecordPayment('invoice', selectedInvoice.id, input)}
+        onReversePayment={(payment, reason) => onReversePayment('invoice', selectedInvoice.id, payment.id, reason)}
         onAskClient={onAskClient}
       />
     );
-  const outstanding = displayedInvoices.reduce(
-    (total, invoice) => total + invoice.amount - invoice.amountPaid,
-    0,
-  );
+  const aging = summarizeOpenItems(displayedInvoices, new Date().toISOString().slice(0, 10));
   const filtered =
     filter === "All"
       ? displayedInvoices
@@ -1641,7 +1835,7 @@ function Receivables({
       <section className="welcome-row">
         <div>
           <h2>Accounts Receivable</h2>
-          <p className="muted"><ClientName /> · Money customers owe you.</p>
+          <p className="muted"><ClientName /> · Money customers owe you. Balances are as of today; Reports show the balance at the end of the month you choose.</p>
         </div>
         <span className="count-pill">{displayedInvoices.length} invoices</span>
       </section>
@@ -1654,27 +1848,28 @@ function Receivables({
       {error && <div className="data-state-message error">{error}</div>}
       <div className="finance-summary-grid">
         <SummaryCard
-          value={formatMoney(outstanding)}
+          value={formatMoney(aging.totalCents / 100)}
           label="Total Outstanding"
           tone="red"
         />
-        <SummaryCard value={formatMoney(4780)} label="Current" tone="green" />
+        <SummaryCard value={formatMoney(aging.currentCents / 100)} label="Current (not yet due)" tone="green" />
         <SummaryCard
-          value={formatMoney(2840)}
+          value={formatMoney(aging.days1to30Cents / 100)}
           label="1-30 Days Overdue"
           tone="amber"
         />
         <SummaryCard
-          value={formatMoney(0)}
+          value={formatMoney(aging.days31to60Cents / 100)}
           label="31-60 Days Overdue"
           tone="blue"
         />
         <SummaryCard
-          value={formatMoney(0)}
+          value={formatMoney(aging.over60Cents / 100)}
           label="60+ Days Overdue"
           tone="purple"
         />
       </div>
+      {aging.unreadable > 0 && <div className="data-state-message">{aging.unreadable} open invoice{aging.unreadable === 1 ? " has" : "s have"} no readable due date, so {aging.unreadable === 1 ? "it is" : "they are"} counted in the total but in no aging column.</div>}
       <div className="filter-row">
         {invoiceFilters.map((option) => (
           <button
@@ -1730,21 +1925,29 @@ function Receivables({
 }
 
 function InvoiceDetail({
+  clientId,
   invoice,
+  book,
+  originalPaidCents,
+  dateDefault,
   readOnly,
   onBack,
-  onUpdate,
+  onRecordPayment,
+  onReversePayment,
   onAskClient,
 }: {
+  clientId: string;
   invoice: Invoice;
+  book: DemoPaymentBook | undefined;
+  originalPaidCents: number;
+  dateDefault: string;
   readOnly: boolean;
   onBack: () => void;
-  onUpdate: (invoice: Invoice) => void;
+  onRecordPayment: (input: DemoPaymentInput) => Promise<void>;
+  onReversePayment: (payment: NonNullable<DemoPaymentBook['payments'][number]>, reason: string) => Promise<void>;
   onAskClient: (question: string, transaction: string, amount: string) => void;
 }) {
   const remaining = invoice.amount - invoice.amountPaid;
-  const markPayment = () =>
-    onUpdate({ ...invoice, amountPaid: invoice.amount, status: "Paid" });
   return (
     <div className="page-content">
       <button className="back-button" onClick={onBack}>
@@ -1803,21 +2006,7 @@ function InvoiceDetail({
           </div>
         </div>
         <div className="panel finance-actions">
-          <h2>Payment history</h2>
-          <p className="muted">
-            {invoice.amountPaid > 0
-              ? `Payment received: ${formatMoney(invoice.amountPaid)}`
-              : "No payments recorded yet."}
-          </p>
-          {!readOnly && (
-            <button
-              className="primary-button"
-              disabled={remaining === 0}
-              onClick={markPayment}
-            >
-              Mark Payment Received <span>✓</span>
-            </button>
-          )}
+          <DocumentPaymentActions kind="invoice" clientId={clientId} book={book} originalPaidCents={originalPaidCents} amountCents={Math.round(invoice.amount * 100)} dateDefault={dateDefault} readOnly={readOnly} onRecord={onRecordPayment} onReverse={onReversePayment} />
           {!readOnly && (
             <button
               className="secondary-button"
@@ -1832,11 +2021,6 @@ function InvoiceDetail({
               Ask Client About Invoice <span>→</span>
             </button>
           )}
-          {readOnly && (
-            <p className="data-state-message">
-              QuickBooks Sandbox data is read-only.
-            </p>
-          )}
         </div>
       </section>
     </div>
@@ -1845,26 +2029,34 @@ function InvoiceDetail({
 
 function Payables({
   source,
+  clientId,
   bills,
   quickBooksBills,
   isLoading,
   error,
   selectedBill,
+  paymentBooks,
+  paymentDateDefault,
   onSelect,
   onBack,
-  onUpdate,
+  onRecordPayment,
+  onReversePayment,
   onAskClient,
   onSourceChange,
 }: {
   source: AccountSource;
+  clientId: string;
   bills: Bill[];
   quickBooksBills: LedgerBill[];
   isLoading: boolean;
   error: string | null;
   selectedBill: Bill | null;
+  paymentBooks: DemoPaymentBook[];
+  paymentDateDefault: string;
   onSelect: (bill: Bill) => void;
   onBack: () => void;
-  onUpdate: (bill: Bill) => void;
+  onRecordPayment: (kind: DocumentPaymentKind, documentId: string, input: DemoPaymentInput) => Promise<void>;
+  onReversePayment: (kind: DocumentPaymentKind, documentId: string, paymentId: string, reason: string) => Promise<void>;
   onAskClient: (question: string, transaction: string, amount: string) => void;
   onSourceChange: (source: AccountSource) => void;
 }) {
@@ -1873,17 +2065,19 @@ function Payables({
   if (selectedBill)
     return (
       <BillDetail
+        clientId={clientId}
         bill={selectedBill}
+        book={bookForDocument(paymentBooks, 'bill', selectedBill.id, clientId)}
+        originalPaidCents={Math.round(selectedBill.amountPaid * 100) - activePaymentCents(bookForDocument(paymentBooks, 'bill', selectedBill.id, clientId))}
+        dateDefault={paymentDateDefault}
         readOnly={source === "quickbooks"}
         onBack={onBack}
-        onUpdate={onUpdate}
+        onRecordPayment={(input) => onRecordPayment('bill', selectedBill.id, input)}
+        onReversePayment={(payment, reason) => onReversePayment('bill', selectedBill.id, payment.id, reason)}
         onAskClient={onAskClient}
       />
     );
-  const outstanding = displayedBills.reduce(
-    (total, bill) => total + bill.amount - bill.amountPaid,
-    0,
-  );
+  const aging = summarizeOpenItems(displayedBills, new Date().toISOString().slice(0, 10));
   const filtered =
     filter === "All"
       ? displayedBills
@@ -1894,7 +2088,7 @@ function Payables({
         <div>
           <h2>Accounts Payable</h2>
           <p className="muted">
-            <ClientName /> · Bills your company needs to pay.
+            <ClientName /> · Bills your company needs to pay. Balances are as of today; Reports show the balance at the end of the month you choose.
           </p>
         </div>
         <span className="count-pill">{displayedBills.length} bills</span>
@@ -1908,22 +2102,23 @@ function Payables({
       {error && <div className="data-state-message error">{error}</div>}
       <div className="finance-summary-grid">
         <SummaryCard
-          value={formatMoney(outstanding)}
+          value={formatMoney(aging.totalCents / 100)}
           label="Total Bills Due"
           tone="red"
         />
         <SummaryCard
-          value={formatMoney(986.44)}
-          label="Due This Week"
+          value={formatMoney(aging.dueWithin7DaysCents / 100)}
+          label="Due Within 7 Days"
           tone="amber"
         />
-        <SummaryCard value={formatMoney(286)} label="Overdue" tone="purple" />
+        <SummaryCard value={formatMoney((aging.days1to30Cents + aging.days31to60Cents + aging.over60Cents) / 100)} label="Overdue" tone="purple" />
         <SummaryCard
-          value={formatMoney(210)}
-          label="Paid This Month"
+          value={formatMoney(aging.paidCents / 100)}
+          label="Paid So Far"
           tone="green"
         />
       </div>
+      {aging.unreadable > 0 && <div className="data-state-message">{aging.unreadable} open bill{aging.unreadable === 1 ? " has" : "s have"} no readable due date, so {aging.unreadable === 1 ? "it is" : "they are"} counted in the total but not in the overdue or due-soon figures.</div>}
       <div className="filter-row">
         {billFilters.map((option) => (
           <button
@@ -1978,16 +2173,26 @@ function Payables({
 }
 
 function BillDetail({
+  clientId,
   bill,
+  book,
+  originalPaidCents,
+  dateDefault,
   readOnly,
   onBack,
-  onUpdate,
+  onRecordPayment,
+  onReversePayment,
   onAskClient,
 }: {
+  clientId: string;
   bill: Bill;
+  book: DemoPaymentBook | undefined;
+  originalPaidCents: number;
+  dateDefault: string;
   readOnly: boolean;
   onBack: () => void;
-  onUpdate: (bill: Bill) => void;
+  onRecordPayment: (input: DemoPaymentInput) => Promise<void>;
+  onReversePayment: (payment: DemoPaymentBook['payments'][number], reason: string) => Promise<void>;
   onAskClient: (question: string, transaction: string, amount: string) => void;
 }) {
   const remaining = bill.amount - bill.amountPaid;
@@ -2053,19 +2258,7 @@ function BillDetail({
           </div>
         </div>
         <div className="panel finance-actions">
-          <h2>Bill actions</h2>
-          <p className="muted">Update this fake bill as you work through it.</p>
-          {!readOnly && (
-            <button
-              className="primary-button"
-              disabled={remaining === 0}
-              onClick={() =>
-                onUpdate({ ...bill, amountPaid: bill.amount, status: "Paid" })
-              }
-            >
-              Mark Bill Paid <span>✓</span>
-            </button>
-          )}
+          <DocumentPaymentActions kind="bill" clientId={clientId} book={book} originalPaidCents={originalPaidCents} amountCents={Math.round(bill.amount * 100)} dateDefault={dateDefault} readOnly={readOnly} onRecord={onRecordPayment} onReverse={onReversePayment} />
           {!readOnly && (
             <button
               className="secondary-button"
@@ -2079,11 +2272,6 @@ function BillDetail({
             >
               Ask Client <span>→</span>
             </button>
-          )}
-          {readOnly && (
-            <p className="data-state-message">
-              QuickBooks Sandbox data is read-only.
-            </p>
           )}
         </div>
       </section>
@@ -2306,7 +2494,7 @@ function TransactionReview({
 }) {
   const isQuickBooks = source === "quickbooks";
   const lines = getLines(transaction);
-  const readOnlyReason = isQuickBooks ? transaction.readOnlyReason : undefined;
+  const readOnlyReason = transaction.readOnlyReason;
   const suggestions = suggestCategories(transaction, history);
   const [staged, setStaged] = useState<Record<string, string>>({});
   const [question, setQuestion] = useState("What was this purchase for?");
@@ -2526,15 +2714,25 @@ function Settings({
   onStatusChange,
   onCompanyChange,
   auditLog,
+  selectedClientId,
+  onReset,
 }: {
   quickBooksStatus: QuickBooksStatus;
   company: QuickBooksCompany | null;
   onStatusChange: (status: QuickBooksStatus) => void;
   onCompanyChange: (company: QuickBooksCompany) => void;
   auditLog: AuditLogEntry[];
+  selectedClientId: string | null;
+  onReset: (clientIds: string[]) => void;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [loadingCompany, setLoadingCompany] = useState(false);
+  const [resetTarget, setResetTarget] = useState(selectedClientId ?? DEMO_RESET_CLIENTS[0].id);
+  const [resetReview, setResetReview] = useState<string[] | null>(null);
+  const [resetConfirmed, setResetConfirmed] = useState(false);
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [resetSuccess, setResetSuccess] = useState<string | null>(null);
 
   useEffect(() => {
     quickBooksService
@@ -2544,6 +2742,31 @@ function Settings({
         setError("Start the backend server to check QuickBooks status."),
       );
   }, [onStatusChange]);
+
+  const reviewReset = () => {
+    setResetReview(resetTarget === "all" ? DEMO_RESET_CLIENTS.map((client) => client.id) : [resetTarget]);
+    setResetConfirmed(false);
+    setResetError(null);
+    setResetSuccess(null);
+  };
+
+  const confirmReset = async () => {
+    if (!resetReview || !resetConfirmed) return;
+    setResetLoading(true);
+    setResetError(null);
+    setResetSuccess(null);
+    try {
+      await demoResetService.reset(resetReview);
+      const names = DEMO_RESET_CLIENTS.filter((client) => resetReview.includes(client.id)).map((client) => client.name);
+      onReset(resetReview);
+      setResetReview(null);
+      setResetSuccess(`Demo data restored for ${names.join(", ")}.`);
+    } catch (resetFailure) {
+      setResetError(resetFailure instanceof Error ? resetFailure.message : "Demo data could not be reset. No changes were kept.");
+    } finally {
+      setResetLoading(false);
+    }
+  };
 
   const loadCompany = async () => {
     setLoadingCompany(true);
@@ -2642,6 +2865,30 @@ function Settings({
             </div>
           )}
         </section>
+        <section className="panel settings-card demo-reset-card">
+          <h2>Reset Demo Data</h2>
+          <p className="muted">Restore the original demo books for one company or all five.</p>
+          <label className="reset-target-label">
+            <span>Company</span>
+            <select value={resetTarget} onChange={(event) => { setResetTarget(event.target.value); setResetReview(null); setResetSuccess(null); }}>
+              {DEMO_RESET_CLIENTS.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+              <option value="all">All five demo companies</option>
+            </select>
+          </label>
+          {!resetReview ? <button className="secondary-button" onClick={reviewReset}>Review reset</button> : (
+            <div className="reset-confirmation" role="group" aria-label="Confirm demo data reset">
+              <strong>Reset {DEMO_RESET_CLIENTS.filter((client) => resetReview.includes(client.id)).map((client) => client.name).join(", ")}?</strong>
+              <p>This permanently removes manual transactions, invoice and bill payments, reconciliation changes, Month End sign-offs, and client request changes for the listed companies. Original demo data will be restored. QuickBooks data, authentication, and sessions are not affected.</p>
+              <label><input type="checkbox" checked={resetConfirmed} onChange={(event) => setResetConfirmed(event.target.checked)} /> I understand these demo changes will be deleted.</label>
+              <div className="reset-actions">
+                <button className="text-button" disabled={resetLoading} onClick={() => setResetReview(null)}>Cancel</button>
+                <button className="danger-button" disabled={!resetConfirmed || resetLoading} onClick={confirmReset}>{resetLoading ? "Resetting..." : "Reset demo data"}</button>
+              </div>
+            </div>
+          )}
+          {resetError && <p className="settings-error" role="alert">{resetError}</p>}
+          {resetSuccess && <p className="reset-success" role="status">{resetSuccess}</p>}
+        </section>
         <section className="panel settings-card audit-log-card">
           <h2>Audit Log</h2>
           <p className="muted">Local test record of QuickBooks Sandbox write attempts.</p>
@@ -2660,6 +2907,10 @@ function Reconcile({
   error,
   today,
   period,
+  homeSignal,
+  entryTools,
+  loadEntries,
+  paymentBooks,
   onPeriodChange,
   onSourceChange,
 }: {
@@ -2670,28 +2921,49 @@ function Reconcile({
   error: string | null;
   today: string;
   period: Period;
+  homeSignal: number;
+  entryTools?: EntryTools;
+  loadEntries: () => DemoEntryRecord[];
+  paymentBooks: DemoPaymentBook[];
   onPeriodChange: (period: Period) => void;
   onSourceChange: (source: AccountSource) => void;
 }) {
+  const company = source === "demo" ? getAdditionalDemoCompany(clientRef.id) : undefined;
+  const companyStatements = company ? companyReconSources(company, period) : [];
   const options: ReconAccount[] =
     source === "demo"
-      ? demoReconSources.map((item) => ({
-          id: item.id,
-          name: item.name,
-          kind: item.kind,
-          lastReconciled: item.lastReconciled,
-          defaults: { periodStart: item.periodStart, periodEnd: item.periodEnd, statementDate: item.statementDate, beginningCents: item.beginningCents, endingCents: item.endingCents, statementLines: item.statementLines },
-        }))
+      ? company
+        ? company.reconciliationAccounts.map((account) => {
+            const statement = companyStatements.find((item) => item.accountId === account.id);
+            return { id: account.id, name: account.name, kind: account.kind, lastReconciled: statement?.lastReconciled, ...(statement ? { defaults: { periodStart: statement.periodStart, periodEnd: statement.periodEnd, statementDate: statement.statementDate, beginningCents: statement.beginningCents, endingCents: statement.endingCents, statementLines: statement.statementLines } } : {}) };
+          })
+        : demoReconSources.map((item) => ({
+            id: item.id,
+            name: item.name,
+            kind: item.kind,
+            lastReconciled: item.lastReconciled,
+            defaults: { periodStart: item.periodStart, periodEnd: item.periodEnd, statementDate: item.statementDate, beginningCents: item.beginningCents, endingCents: item.endingCents, statementLines: item.statementLines },
+          }))
       : accounts
           .filter((account) => account.active && account.quickBooksId && (account.accountType === "Bank" || account.accountType === "Credit Card"))
           .map((account) => ({ id: account.quickBooksId!, name: account.name, kind: account.accountType === "Bank" ? ("bank" as const) : ("credit_card" as const), detail: `QuickBooks balance today ${formatMoney(account.currentBalance)}` }));
   const loadAccountData = async (accountId: string, through: string) => {
     if (source === "quickbooks") return quickBooksService.getReconciliationData(accountId, through);
+    if (company) {
+      const account = company.reconciliationAccounts.find((candidate) => candidate.id === accountId);
+      if (!account) throw new Error("That demo account was not found for this company.");
+      const earlier = companyLedgerRegister(company, account.ledgerId, through);
+      const entered = additionRegister(loadEntries(), account.ledgerId, company.clientId).filter((transaction) => transaction.date <= through);
+      const payments = account.ledgerId === "checking" ? paymentRegister(paymentBooks, "checking", company.clientId).filter((transaction) => transaction.date <= through) : [];
+      return { transactions: [...earlier, ...entered, ...payments], completeness: { complete: true, reasons: [] } };
+    }
     const item = demoReconSources.find((candidate) => candidate.id === accountId);
     if (!item) throw new Error("That demo account was not found.");
     const ledgerId = DEMO_RECONCILIATION_ACCOUNTS.find((account) => account.id === accountId)?.ledgerId as "checking" | "card" | undefined;
     const earlier = ledgerId ? demoEarlierRegister(ledgerId).filter((transaction) => transaction.date <= through) : [];
-    return { transactions: [...earlier, ...item.transactions.filter((transaction) => transaction.date <= through)], completeness: { complete: true, reasons: [] } };
+    const entered = ledgerId ? additionRegister(loadEntries(), ledgerId).filter((transaction) => transaction.date <= through) : [];
+    const payments = ledgerId === "checking" ? paymentRegister(paymentBooks, "checking").filter((transaction) => transaction.date <= through) : [];
+    return { transactions: [...earlier, ...item.transactions.filter((transaction) => transaction.date <= through), ...entered, ...payments], completeness: { complete: true, reasons: [] } };
   };
 
   return (
@@ -2710,7 +2982,7 @@ function Reconcile({
         </div>
       )}
       {error && <div className="data-state-message error">{error}</div>}
-      <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} period={period} />
+      <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} period={period} homeSignal={homeSignal} entryTools={entryTools} />
     </div>
   );
 }
@@ -2797,7 +3069,7 @@ function ClientDashboard({
 }) {
   const isDemo = source === "demo";
   // Demo clients other than the one with full records only have summary counts.
-  const hasRecords = !isDemo || client?.id === demoClient.id;
+  const hasRecords = !isDemo || client?.id === demoClient.id || Boolean(client && ADDITIONAL_DEMO_CLIENT_IDS.includes(client.id));
   const summary = summarizeTasks(tasks);
   const kindCount = (kind: WorkTask["kind"]) => tasks.filter((task) => task.kind === kind).reduce((sum, task) => sum + task.count, 0);
   const balances = quickBooksAccounts.length > 0;

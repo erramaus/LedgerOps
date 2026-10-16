@@ -24,8 +24,10 @@ export type TaskKind =
   | 'needs-receipt'
   | 'possible-duplicate'
   | 'overdue-invoice'
+  | 'partially-paid-invoice'
   | 'large-unpaid-invoice'
   | 'overdue-bill'
+  | 'partially-paid-bill'
   | 'bill-due-soon'
   | 'bill-needs-review'
   | 'negative-balance'
@@ -56,6 +58,8 @@ export type WorkTask = {
   destination: TaskDestination
   action: string
   requestId?: string
+  /** The single transaction, invoice or bill this task is about, when it is about exactly one. */
+  recordId?: string
 }
 
 export type ClientRef = { id: string; name: string }
@@ -136,6 +140,8 @@ export function buildReviewTasks(records: ClientRecords): WorkTask[] {
     const dueDate = toIsoDate(invoice.dueDate)
     if (invoice.status === 'Overdue') {
       add({ id: `${invoice.id}-overdue`, type: 'Receivables', kind: 'overdue-invoice', issue: 'Overdue invoice', description: `${invoice.customer} invoice ${invoice.number} is overdue.`, amount, dueDate, priority: amount >= 1000 ? 'High' : 'Medium', destination: 'Receivables', action: 'Review invoice' })
+    } else if (invoice.status === 'Partially Paid' && amount > 0) {
+      add({ id: `${invoice.id}-partial`, type: 'Receivables', kind: 'partially-paid-invoice', issue: 'Invoice partially paid', description: `${invoice.customer} still has a balance on partially paid invoice ${invoice.number}.`, amount, dueDate, priority: amount >= 1000 ? 'High' : 'Medium', destination: 'Receivables', action: 'Review invoice' })
     } else if (amount >= 1000 && invoice.status !== 'Paid') {
       add({ id: `${invoice.id}-large`, type: 'Receivables', kind: 'large-unpaid-invoice', issue: 'Large unpaid invoice', description: `${invoice.customer} still owes a large balance on ${invoice.number}.`, amount, dueDate, priority: 'Medium', destination: 'Receivables', action: 'Review invoice' })
     }
@@ -146,6 +152,8 @@ export function buildReviewTasks(records: ClientRecords): WorkTask[] {
     const dueDate = toIsoDate(bill.dueDate)
     if (bill.status === 'Overdue') {
       add({ id: `${bill.id}-overdue`, type: 'Payables', kind: 'overdue-bill', issue: 'Overdue bill', description: `${bill.vendor} bill ${bill.number} is overdue.`, amount, dueDate, priority: 'High', destination: 'Payables', action: 'Review bill' })
+    } else if (bill.status === 'Partially Paid' && amount > 0) {
+      add({ id: `${bill.id}-partial`, type: 'Payables', kind: 'partially-paid-bill', issue: 'Bill partially paid', description: `${bill.vendor} still has a balance on partially paid bill ${bill.number}.`, amount, dueDate, priority: 'Medium', destination: 'Payables', action: 'Review bill' })
     } else if (bill.status === 'Due Soon') {
       add({ id: `${bill.id}-soon`, type: 'Payables', kind: 'bill-due-soon', issue: 'Bill due soon', description: `${bill.vendor} bill ${bill.number} is due soon.`, amount, dueDate, priority: 'Medium', destination: 'Payables', action: 'Review bill' })
     } else if (bill.status === 'Needs Review') {
@@ -164,6 +172,14 @@ export function buildReviewTasks(records: ClientRecords): WorkTask[] {
     .forEach((account) => {
       add({ id: `${account.id}-difference`, type: 'Reconciliation', kind: 'reconciliation-difference', issue: 'Reconciliation difference', description: `${account.name}: the books and the statement differ.`, amount: Math.abs(account.statementBalance - account.quickBooksBalance), priority: 'High', destination: 'Reconcile', action: 'Find the difference' })
     })
+
+  // Task ids are `${client}/${record id}-${rule}`, so the record a task is about can be read back from them.
+  const recordIds = new Set([...records.transactions, ...records.invoices, ...records.bills].map((record) => record.id))
+  for (const task of tasks) {
+    const local = task.id.slice(records.client.id.length + 1)
+    const match = [...recordIds].find((recordId) => local.startsWith(`${recordId}-`))
+    if (match && ['Transactions', 'Receivables', 'Payables'].includes(task.destination)) task.recordId = match
+  }
 
   return tasks
 }

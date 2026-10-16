@@ -1,9 +1,14 @@
 import type { Page, Route } from '@playwright/test'
 import express from 'express'
 import request from 'supertest'
-import { buildDemoMonthEndRecords, buildDemoReconciliations } from '../shared/demoMonthEnd'
+import { buildAdditionalDemoMonthEndRecords, buildAdditionalDemoReconciliations, buildDemoMonthEndRecords, buildDemoReconciliations } from '../shared/demoMonthEnd'
 import type { QbReportJson } from '../shared/qbReports'
 import { createMonthEndRouter } from '../server/monthEnd'
+import { createDemoEntryRouter } from '../server/demoEntries'
+import { MemoryDemoEntryStore } from '../server/demoEntryStore'
+import { createDemoResetRouter, MemoryDemoResetRepository } from '../server/demoReset'
+import { createDemoPaymentRouter } from '../server/demoPayments'
+import { MemoryDemoPaymentStore } from '../server/demoPaymentStore'
 import { MemoryMonthEndStore } from '../server/monthEndStore'
 import type { ReconciliationStore } from '../server/reconciliationStore'
 import { previousFrom, summarizeResult, validateCompletion, type Completeness, type ReconTxn } from '../shared/reconciliation'
@@ -101,6 +106,7 @@ export class FakeReconciliations {
   /** The demo scenario reconciliations (May to July 2026) that the real server seeds at startup. */
   seedDemo() {
     for (const record of buildDemoReconciliations()) this.records.set(record.id, record)
+    for (const record of buildAdditionalDemoReconciliations()) this.records.set(record.id, record)
   }
 
   /** Lets the real month-end router read exactly the records this fake serves. */
@@ -109,6 +115,7 @@ export class FakeReconciliations {
       get durable() { return false },
       list: async ({ source, clientId }) => [...this.records.values()].filter((record) => record.source === source && record.clientId === clientId),
       get: async (id) => this.records.get(id) ?? null,
+      deleteDemoClients: async (clientIds) => this.deleteDemoClients(clientIds),
       put: async (record, expectedVersion) => {
         if ((this.records.get(record.id)?.version ?? 0) !== expectedVersion) return false
         this.records.set(record.id, record)
@@ -117,6 +124,11 @@ export class FakeReconciliations {
     }
   }
   private at = () => `${TODAY}T12:00:00.000Z`
+
+  async deleteDemoClients(clientIds: string[]) {
+    const ids = new Set(clientIds)
+    for (const [id, record] of this.records) if (record.source === 'demo' && ids.has(record.clientId)) this.records.delete(id)
+  }
 
   handle(method: string, url: URL, body: any, csrf?: string): { status: number; json: unknown } { // eslint-disable-line @typescript-eslint/no-explicit-any
     if (method !== 'GET' && csrf !== CSRF_TOKEN) { this.badCsrf += 1; return { status: 403, json: { error: 'Invalid CSRF token.' } } }
@@ -164,11 +176,52 @@ export class FakeReconciliations {
   }
 }
 
-export async function mockApp(page: Page, options: { authenticated?: boolean; quickBooks?: FakeQuickBooks; reconciliations?: FakeReconciliations; monthEnd?: FakeMonthEnd } = {}) {
+export class FakeDemoReset {
+  badCsrf = 0
+  mutations = 0
+  calls: string[][] = []
+  private app: express.Express
+
+  constructor(
+    stores: { demoEntries: FakeDemoEntries; demoPayments: FakeDemoPayments; reconciliations: FakeReconciliations; monthEnd: FakeMonthEnd },
+    beforeSeed?: () => void,
+  ) {
+    this.app = express()
+    this.app.use(express.json())
+    this.app.use((incoming, _response, next) => {
+      ;(incoming as unknown as { session: unknown }).session = { user: { email: 'e2e@example.com' } }
+      next()
+    })
+    this.app.use('/api/demo-reset', createDemoResetRouter(new MemoryDemoResetRepository({
+      entries: stores.demoEntries.store,
+      payments: stores.demoPayments.store,
+      reconciliations: stores.reconciliations.asStore(),
+      monthEnd: stores.monthEnd.store,
+    }, beforeSeed)))
+  }
+
+  async handle(method: string, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {
+    if (method !== 'GET' && csrf !== CSRF_TOKEN) {
+      this.badCsrf += 1
+      return { status: 403, json: { error: 'Invalid CSRF token.' } }
+    }
+    if (method !== 'GET') this.mutations += 1
+    const payload = (body ?? {}) as { clientIds?: unknown }
+    if (Array.isArray(payload.clientIds)) this.calls.push(payload.clientIds.filter((id): id is string => typeof id === 'string'))
+    const agent = request(this.app)
+    const response = method === 'GET' ? await agent.get('/api/demo-reset') : await agent.post('/api/demo-reset').send((body ?? {}) as object)
+    return { status: response.status, json: response.body }
+  }
+}
+
+export async function mockApp(page: Page, options: { authenticated?: boolean; quickBooks?: FakeQuickBooks; reconciliations?: FakeReconciliations; monthEnd?: FakeMonthEnd; demoEntries?: FakeDemoEntries; demoPayments?: FakeDemoPayments; demoReset?: FakeDemoReset; beforeDemoResetSeed?: () => void } = {}) {
   const quickBooks = options.quickBooks ?? new FakeQuickBooks()
   const reconciliations = options.reconciliations ?? new FakeReconciliations()
   reconciliations.register = () => quickBooks.register
   const monthEnd = options.monthEnd ?? new FakeMonthEnd(reconciliations)
+  const demoEntries = options.demoEntries ?? new FakeDemoEntries(reconciliations, monthEnd)
+  const demoPayments = options.demoPayments ?? new FakeDemoPayments(reconciliations, monthEnd)
+  const demoReset = options.demoReset ?? new FakeDemoReset({ demoEntries, demoPayments, reconciliations, monthEnd }, options.beforeDemoResetSeed)
   const unexpected: string[] = []
   const json = (route: Route, body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   await page.clock.setFixedTime(new Date(`${TODAY}T12:00:00Z`))
@@ -220,9 +273,84 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; qu
     const result = quickBooks.onWrite(body, quickBooks)
     return json(route, result.json, result.status)
   })
-  return { quickBooks, reconciliations, monthEnd, unexpected }
+  await page.route(/\/api\/demo-entries/, async (route) => {
+    const incoming = route.request()
+    const result = await demoEntries.handle(incoming.method(), new URL(incoming.url()), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
+  await page.route(/\/api\/demo-payments/, async (route) => {
+    const incoming = route.request()
+    const result = await demoPayments.handle(incoming.method(), new URL(incoming.url()), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
+  await page.route('**/api/demo-reset', async (route) => {
+    const incoming = route.request()
+    const result = await demoReset.handle(incoming.method(), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
+  return { quickBooks, reconciliations, monthEnd, demoEntries, demoPayments, demoReset, unexpected }
 }
 
+/** The real demo-entries router, run in-process on memory stores, so browser tests exercise the actual validation and period rules. */
+export class FakeDemoEntries {
+  readonly store = new MemoryDemoEntryStore()
+  badCsrf = 0
+  mutations = 0
+  listLoads = 0
+  private app: express.Express
+
+  constructor(reconciliations: FakeReconciliations, monthEnd: FakeMonthEnd) {
+    this.app = express()
+    this.app.use(express.json())
+    this.app.use((incoming, _response, next) => {
+      ;(incoming as unknown as { session: unknown }).session = { user: { email: 'e2e@example.com' } }
+      next()
+    })
+    this.app.use('/api/demo-entries', createDemoEntryRouter({ store: this.store, reconciliations: reconciliations.asStore(), monthEnd: monthEnd.store, now: () => Date.parse(`${TODAY}T12:00:00Z`) }))
+  }
+
+  async handle(method: string, url: URL, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {
+    if (method !== 'GET' && csrf !== CSRF_TOKEN) {
+      this.badCsrf += 1
+      return { status: 403, json: { error: 'Invalid CSRF token.' } }
+    }
+    if (method !== 'GET') this.mutations += 1
+    const target = `${url.pathname}${url.search}`
+    const agent = request(this.app)
+    const response = method === 'GET' ? await agent.get(target) : await agent.post(target).send((body ?? {}) as object)
+    return { status: response.status, json: response.body }
+  }
+}
+
+/** The real demo-payment router on isolated memory stores, so e2e tests cover payment validation and reversals. */
+export class FakeDemoPayments {
+  readonly store = new MemoryDemoPaymentStore()
+  badCsrf = 0
+  mutations = 0
+  private app: express.Express
+
+  constructor(reconciliations: FakeReconciliations, monthEnd: FakeMonthEnd) {
+    this.app = express()
+    this.app.use(express.json())
+    this.app.use((incoming, _response, next) => {
+      ;(incoming as unknown as { session: unknown }).session = { user: { email: 'e2e@example.com' } }
+      next()
+    })
+    this.app.use('/api/demo-payments', createDemoPaymentRouter({ store: this.store, reconciliations: reconciliations.asStore(), monthEnd: monthEnd.store, now: () => Date.parse(`${TODAY}T12:00:00Z`) }))
+  }
+
+  async handle(method: string, url: URL, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {
+    if (method !== 'GET' && csrf !== CSRF_TOKEN) {
+      this.badCsrf += 1
+      return { status: 403, json: { error: 'Invalid CSRF token.' } }
+    }
+    if (method !== 'GET') this.mutations += 1
+    const target = `${url.pathname}${url.search}`
+    const agent = request(this.app)
+    const response = method === 'GET' ? await agent.get(target) : await agent.post(target).send((body ?? {}) as object)
+    return { status: response.status, json: response.body }
+  }
+}
 /** The real month-end router, run in-process on memory stores, so browser tests exercise the actual closing and verification rules. */
 export class FakeMonthEnd {
   readonly store = new MemoryMonthEndStore()
@@ -243,6 +371,7 @@ export class FakeMonthEnd {
 
   async seedDemo() {
     for (const record of buildDemoMonthEndRecords()) await this.store.put(record, 0)
+    for (const record of buildAdditionalDemoMonthEndRecords()) await this.store.put(record, 0)
   }
 
   async handle(method: string, url: URL, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {

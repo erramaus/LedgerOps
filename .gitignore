@@ -10,3 +10,12 @@ playwright-report/
 !.env.example
 .env
 !.env.production
+browser-phase6-*.txt
+browser-phase6-*.exit
+browser-phase6-groups/
+browser-results*.txt
+greenleaf-*.txt
+phase6-payment-server*.txt
+stepA.txt
+stepB.txt
+tsc.txt

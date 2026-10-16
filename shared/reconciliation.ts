@@ -92,8 +92,8 @@ export const signedCents = (transaction: { direction: Direction; amountCents: nu
 
 export function labelsFor(kind: AccountKind) {
   return kind === 'bank'
-    ? { increase: 'Deposit', decrease: 'Withdrawal', outstandingIncrease: 'Deposit in transit', outstandingDecrease: 'Outstanding check or payment', owed: false }
-    : { increase: 'Charge', decrease: 'Payment or credit', outstandingIncrease: 'Charge not yet on statement', outstandingDecrease: 'Payment not yet on statement', owed: true }
+    ? { increase: 'Deposit', decrease: 'Withdrawal', outstandingIncrease: 'Deposit in transit', outstandingDecrease: 'Outstanding check or payment', outstandingIncreasePlural: 'Deposits in transit', outstandingDecreasePlural: 'Outstanding checks and payments', owed: false }
+    : { increase: 'Charge', decrease: 'Payment or credit', outstandingIncrease: 'Charge not yet on statement', outstandingDecrease: 'Payment not yet on statement', outstandingIncreasePlural: 'Charges not yet on statement', outstandingDecreasePlural: 'Payments not yet on statement', owed: true }
 }
 
 // ---- Eligibility -------------------------------------------------------------------------------

@@ -233,12 +233,14 @@ test.describe('Month End: reopening and keeping the books verified', () => {
     await expect(page.getByTestId('other-months')).toContainText('Reopened')
   })
 
-  test('a demo client with no detailed records is not given figures', async ({ page }) => {
+  test('a generated demo client receives its own Month End checklist and figures', async ({ page }) => {
     await start(page)
     await page.getByLabel('Client').selectOption({ label: 'Green Leaf Landscaping' })
     await nav(page, /Month End/).click()
-    await expect(page.getByText(/No detailed records for Green Leaf Landscaping/)).toBeVisible()
-    await expect(page.locator('li.me-step')).toHaveCount(0)
+    await expect(page.locator('.month-end-hero')).toContainText('GREEN LEAF LANDSCAPING')
+    await expect(page.locator('li.me-step')).toHaveCount(9)
+    await expect(page.getByTestId('step-receivables')).toContainText('totalling')
+    await expect(page.getByTestId('step-payables')).toContainText('totalling')
   })
 })
 

@@ -8,6 +8,9 @@ import * as quickbooks from './quickbooks.js'
 import { createPostgresSessionStore } from './sessionStore.js'
 import { MemoryReconciliationStore, PostgresReconciliationStore } from './reconciliationStore.js'
 import { MemoryMonthEndStore, PostgresMonthEndStore } from './monthEndStore.js'
+import { MemoryDemoEntryStore, PostgresDemoEntryStore } from './demoEntryStore.js'
+import { MemoryDemoPaymentStore, PostgresDemoPaymentStore } from './demoPaymentStore.js'
+import { MemoryDemoResetRepository, PostgresDemoResetRepository } from './demoReset.js'
 import { seedDemoRecords } from './demoSeed.js'
 
 const port = Number(process.env.PORT || 3001)
@@ -37,7 +40,14 @@ const monthEndStore = loaded.databaseUrl ? new PostgresMonthEndStore(loaded.data
 if (!monthEndStore.durable) console.warn('DATABASE_URL is not set: month-end records are temporary development records and will be lost on restart.')
 seedDemoRecords(reconciliationStore, monthEndStore).catch((error) => console.warn('Demo scenario records could not be created:', error instanceof Error ? error.message : error))
 
-const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore })
+const demoEntryStore = loaded.databaseUrl ? new PostgresDemoEntryStore(loaded.databaseUrl) : new MemoryDemoEntryStore()
+if (!demoEntryStore.durable) console.warn('DATABASE_URL is not set: manually entered demo transactions are temporary development records and will be lost on restart.')
+const demoPaymentStore = loaded.databaseUrl ? new PostgresDemoPaymentStore(loaded.databaseUrl) : new MemoryDemoPaymentStore()
+if (!demoPaymentStore.durable) console.warn('DATABASE_URL is not set: manually entered demo payments are temporary development records and will be lost on restart.')
+const demoResetRepository = loaded.databaseUrl
+  ? new PostgresDemoResetRepository(loaded.databaseUrl)
+  : new MemoryDemoResetRepository({ entries: demoEntryStore, payments: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
+const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore, demoEntryStore, demoPaymentStore, demoResetRepository })
 
 app.listen(port, () => {
   console.log(`LedgerOps backend listening on port ${port}`)

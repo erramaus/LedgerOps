@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { ClientRequest, LedgerAccount, LedgerInvoice, LedgerTransaction } from './bookkeepingTypes'
+import type { ClientRequest, LedgerAccount, LedgerBill, LedgerInvoice, LedgerTransaction } from './bookkeepingTypes'
 import { demoDataService } from './demoDataService'
 import { needsCategory } from './transactionReview'
 import {
@@ -123,6 +123,14 @@ describe('priorities', () => {
     const tasks = buildReviewTasks(sandboxRecords({ invoices: [invoice('big', 2500), invoice('small', 200)] }))
     expect(tasks.find((task) => task.id.includes('big'))?.priority).toBe('High')
     expect(tasks.find((task) => task.id.includes('small'))?.priority).toBe('Medium')
+  })
+
+  it('keeps partial invoice and bill balances in the review queues', () => {
+    const partialInvoice: LedgerInvoice = { id: 'partial-invoice', customer: 'Customer', number: 'PI-1', invoiceDate: '2026-08-01', dueDate: '2026-08-31', amount: 500, amountPaid: 200, status: 'Partially Paid' }
+    const partialBill: LedgerBill = { id: 'partial-bill', vendor: 'Vendor', number: 'PB-1', billDate: '2026-08-01', dueDate: '2026-08-31', amount: 800, amountPaid: 300, category: 'Materials', status: 'Partially Paid' }
+    const tasks = buildReviewTasks(sandboxRecords({ invoices: [partialInvoice], bills: [partialBill] }))
+    expect(tasks.find((task) => task.kind === 'partially-paid-invoice')).toMatchObject({ amount: 300, destination: 'Receivables' })
+    expect(tasks.find((task) => task.kind === 'partially-paid-bill')).toMatchObject({ amount: 500, destination: 'Payables' })
   })
 
   it('carries ISO due dates from both demo and QuickBooks date formats', () => {

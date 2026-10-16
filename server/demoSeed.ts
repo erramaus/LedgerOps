@@ -1,4 +1,4 @@
-import { buildDemoMonthEndRecords, buildDemoReconciliations } from '../shared/demoMonthEnd.js'
+import { buildAdditionalDemoMonthEndRecords, buildAdditionalDemoReconciliations, buildDemoMonthEndRecords, buildDemoReconciliations } from '../shared/demoMonthEnd.js'
 import type { MonthEndStore } from './monthEndStore.js'
 import type { ReconciliationStore } from './reconciliationStore.js'
 
@@ -10,5 +10,7 @@ export async function seedDemoRecords(reconciliations: ReconciliationStore, mont
   let added = 0
   for (const record of buildDemoReconciliations()) if (await reconciliations.put(record, 0)) added += 1
   for (const record of buildDemoMonthEndRecords()) if (await monthEnd.put(record, 0)) added += 1
+  for (const record of buildAdditionalDemoReconciliations()) if (await reconciliations.put(record, 0)) added += 1
+  for (const record of buildAdditionalDemoMonthEndRecords()) if (await monthEnd.put(record, 0)) added += 1
   return added
 }

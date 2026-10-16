@@ -18,6 +18,11 @@ import { createReconciliationRouter } from './reconciliations.js'
 import { MemoryReconciliationStore, type ReconciliationStore } from './reconciliationStore.js'
 import { createMonthEndRouter } from './monthEnd.js'
 import { MemoryMonthEndStore, type MonthEndStore } from './monthEndStore.js'
+import { createDemoEntryRouter } from './demoEntries.js'
+import { MemoryDemoEntryStore, type DemoEntryStore } from './demoEntryStore.js'
+import { createDemoPaymentRouter } from './demoPayments.js'
+import { MemoryDemoPaymentStore, type DemoPaymentStore } from './demoPaymentStore.js'
+import { createDemoResetRouter, MemoryDemoResetRepository, type DemoResetRepository } from './demoReset.js'
 import type { QuickBooksReportKey } from './quickbooks.js'
 import { isValidIsoDate } from '../shared/period.js'
 
@@ -43,6 +48,9 @@ export type AppDependencies = {
   sessionStore?: session.Store
   reconciliationStore?: ReconciliationStore
   monthEndStore?: MonthEndStore
+  demoEntryStore?: DemoEntryStore
+  demoPaymentStore?: DemoPaymentStore
+  demoResetRepository?: DemoResetRepository
   now?: () => number
 }
 
@@ -201,7 +209,14 @@ export function createApp(dependencies: AppDependencies) {
   app.use('/api/quickbooks', requireAuth, requireCsrf, router)
   const reconciliationStore = dependencies.reconciliationStore ?? new MemoryReconciliationStore()
   app.use('/api/reconciliations', requireAuth, requireCsrf, createReconciliationRouter({ store: reconciliationStore, quickbooks, now }))
-  app.use('/api/month-end', requireAuth, requireCsrf, createMonthEndRouter({ store: dependencies.monthEndStore ?? new MemoryMonthEndStore(), reconciliations: reconciliationStore, quickbooks, now }))
+  const monthEndStore = dependencies.monthEndStore ?? new MemoryMonthEndStore()
+  app.use('/api/month-end', requireAuth, requireCsrf, createMonthEndRouter({ store: monthEndStore, reconciliations: reconciliationStore, quickbooks, now }))
+  const demoEntryStore = dependencies.demoEntryStore ?? new MemoryDemoEntryStore()
+  const demoPaymentStore = dependencies.demoPaymentStore ?? new MemoryDemoPaymentStore()
+  app.use('/api/demo-entries', requireAuth, requireCsrf, createDemoEntryRouter({ store: demoEntryStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
+  app.use('/api/demo-payments', requireAuth, requireCsrf, createDemoPaymentRouter({ store: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
+  const demoResetRepository = dependencies.demoResetRepository ?? new MemoryDemoResetRepository({ entries: demoEntryStore, payments: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
+  app.use('/api/demo-reset', requireAuth, requireCsrf, createDemoResetRouter(demoResetRepository))
 
   const fail = (response: Response, error: unknown, fallback: string) =>
     response.status(400).json({ error: error instanceof Error ? error.message : fallback })

@@ -1,5 +1,6 @@
 import { withComparison, type ReportId, type ReportTable } from '../../shared/accounting'
-import { DEMO_NO_BOOKS, demoComparison, demoReport, hasDemoBooks } from '../../shared/demoMonthEnd'
+import { DEMO_CLIENT_ID } from '../../shared/demoBooks'
+import { DEMO_NO_BOOKS, demoComparison, demoReport, hasDemoBooks, type DemoLedger } from '../../shared/demoMonthEnd'
 import { parseQbReport } from '../../shared/qbReports'
 import { parsePeriodKey, type DateRange } from '../../shared/period'
 import { failed, loaded, type Loaded } from './monthEndData'
@@ -28,20 +29,23 @@ export const REPORT_DESCRIPTIONS: Record<ReportId, string> = {
   'ap-aging': 'What is owed to vendors, by how late it is.',
 }
 
-const FIRST_DEMO_DATE = '2026-05-01'
-
 /** Why a demo report cannot be produced, or null. Ranges that start before the demo books would silently understate the figures. */
-export function demoUnsupported(id: ReportId, range: DateRange): string | null {
+export function demoUnsupported(id: ReportId, range: DateRange, ledger?: DemoLedger): string | null {
   const end = parsePeriodKey(range.end.slice(0, 7))
-  if (!end || !hasDemoBooks(end)) return DEMO_NO_BOOKS
-  if (!AS_OF_ONLY.includes(id) && range.start < FIRST_DEMO_DATE) return 'The demo books start in May 2026, so a range that begins earlier would leave out figures. Choose a month or a range that starts in May or later.'
+  const clientId = ledger?.clientId
+  if (!end || !hasDemoBooks(end, clientId)) return DEMO_NO_BOOKS
+  const firstPeriod = (ledger?.periods ?? [{ year: 2026, month: 5 }])[0]
+  const firstDate = `${firstPeriod.year}-${String(firstPeriod.month).padStart(2, '0')}-01`
+  if (!AS_OF_ONLY.includes(id) && range.start < firstDate) return clientId === undefined || clientId === DEMO_CLIENT_ID
+    ? 'The demo books start in May 2026, so a range that begins earlier would leave out figures. Choose a month or a range that starts in May or later.'
+    : `The ${ledger?.clientId} demo books start in ${firstDate}. Choose a month or a range that starts in this company's books.`
   return null
 }
 
-export async function loadReport(source: Source, id: ReportId, range: DateRange): Promise<Loaded<ReportTable>> {
+export async function loadReport(source: Source, id: ReportId, range: DateRange, ledger?: DemoLedger): Promise<Loaded<ReportTable>> {
   if (source === 'demo') {
-    const reason = demoUnsupported(id, range)
-    return reason ? failed(reason) : loaded(demoReport(id, range))
+    const reason = demoUnsupported(id, range, ledger)
+    return reason ? failed(reason) : loaded(demoReport(id, range, ledger))
   }
   try {
     const json = await quickBooksService.getReportData(id, range.start, range.end)
@@ -53,13 +57,13 @@ export async function loadReport(source: Source, id: ReportId, range: DateRange)
 }
 
 /** The report for `current` with a previous-period column, or the reason no comparison can be shown. */
-export async function loadComparison(source: Source, id: ReportId, current: DateRange, previous: DateRange): Promise<Loaded<ReportTable>> {
+export async function loadComparison(source: Source, id: ReportId, current: DateRange, previous: DateRange, ledger?: DemoLedger): Promise<Loaded<ReportTable>> {
   if (id === 'general-ledger') return failed('A general ledger is a list of entries, so it is not compared with another period.')
   const labels = { current: current.label, previous: previous.label }
   if (source === 'demo') {
-    const reason = demoUnsupported(id, previous)
+    const reason = demoUnsupported(id, previous, ledger)
     if (reason) return failed(`There is no reliable previous period to compare with. ${reason}`)
-    const table = demoComparison(id, current, previous)
+    const table = demoComparison(id, current, previous, ledger)
     return table ? loaded(table) : failed(`The demo books have no data for ${previous.label}.`)
   }
   const [now, then] = await Promise.all([loadReport(source, id, current), loadReport(source, id, previous)])

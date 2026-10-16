@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { PeriodPicker } from "./PeriodPicker";
 import type { ReportCheck, ReportId, ReportRow, ReportTable } from "../shared/accounting";
 import { DEMO_CLIENT_ID, DEMO_RECONCILIATION_ACCOUNTS } from "../shared/demoBooks";
+import type { DemoLedger } from "../shared/demoMonthEnd";
 import type { Source } from "../shared/monthEnd";
 import { reconFactsFor } from "../shared/monthEndFacts";
 import { monthLabel, periodKey, previousRangeFor, rangeFor, type Period, type RangeMode } from "../shared/period";
@@ -75,6 +76,8 @@ export function Reports({
   sourceSwitch,
   onPeriodChange,
   onOpenReconcile,
+  homeSignal,
+  ledger,
 }: {
   source: Source;
   clientId: string;
@@ -85,8 +88,15 @@ export function Reports({
   sourceSwitch: ReactNode;
   onPeriodChange: (period: Period) => void;
   onOpenReconcile: () => void;
+  /** Changes when the user clicks Reports in the sidebar while already here. */
+  homeSignal?: number;
+  /** Demo data only: the base demo books plus manually entered transactions. */
+  ledger?: DemoLedger;
 }) {
   const [selected, setSelected] = useState<ReportId | null>(null);
+  useEffect(() => {
+    if (homeSignal) setSelected(null);
+  }, [homeSignal]);
   const [mode, setMode] = useState<RangeMode>("month");
   const [compare, setCompare] = useState(false);
   const [report, setReport] = useState<Loaded<ReportTable> | null>(null);
@@ -105,9 +115,9 @@ export function Reports({
     setReport(null);
     setComparison(null);
     const load = async () => {
-      const [main, other] = await Promise.all([loadReport(source, selected, range), compare ? loadComparison(source, selected, range, previous) : Promise.resolve(null)]);
+      const [main, other] = await Promise.all([loadReport(source, selected, range, ledger), compare ? loadComparison(source, selected, range, previous, ledger) : Promise.resolve(null)]);
       const found: string[] = [];
-      const wanted = source === "demo" ? (clientId === DEMO_CLIENT_ID ? DEMO_RECONCILIATION_ACCOUNTS.map((account) => ({ id: account.id, name: account.name, kind: account.kind })) : []) : quickBooksAccounts.filter((account) => account.active && account.quickBooksId && (account.accountType === "Bank" || account.accountType === "Credit Card")).map((account) => ({ id: account.quickBooksId!, name: account.name, kind: account.accountType === "Bank" ? ("bank" as const) : ("credit_card" as const) }));
+      const wanted = source === "demo" ? (ledger?.reconAccounts ?? (clientId === DEMO_CLIENT_ID ? DEMO_RECONCILIATION_ACCOUNTS : [])).map((account) => ({ id: account.id, name: account.name, kind: account.kind })) : quickBooksAccounts.filter((account) => account.active && account.quickBooksId && (account.accountType === "Bank" || account.accountType === "Credit Card")).map((account) => ({ id: account.quickBooksId!, name: account.name, kind: account.accountType === "Bank" ? ("bank" as const) : ("credit_card" as const) }));
       if (main.ok && wanted.length > 0) {
         try {
           const saved = await reconciliationService.list(source, clientId);
@@ -138,7 +148,7 @@ export function Reports({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, source, clientId, key, mode, compare, quickBooksAccounts]);
+  }, [selected, source, clientId, key, mode, compare, quickBooksAccounts, ledger]);
 
   const sourceLabel = source === "demo" ? "Demo data" : "QuickBooks Sandbox (read only)";
   const header = (

@@ -2,7 +2,7 @@ import session from 'express-session'
 import request from 'supertest'
 import { describe, expect, it, vi } from 'vitest'
 import { DEMO_CLIENT_ID } from '../shared/demoBooks.js'
-import { buildDemoMonthEndRecords, buildDemoReconciliations, demoMonthEndInputs } from '../shared/demoMonthEnd.js'
+import { buildAdditionalDemoMonthEndRecords, buildAdditionalDemoReconciliations, buildDemoMonthEndRecords, buildDemoReconciliations, demoMonthEndInputs } from '../shared/demoMonthEnd.js'
 import { buildChecklist, STEP_ORDER, validateClose, type MonthEndRecord } from '../shared/monthEnd.js'
 import { parsePeriodKey } from '../shared/period.js'
 import { createApp, type QuickBooksGateway } from './app.js'
@@ -114,7 +114,7 @@ describe('storage and persistence', () => {
 
   it('seeding adds the demo scenarios once and never overwrites real work', async () => {
     const harness = build()
-    expect(await seedDemoRecords(harness.reconciliations, harness.monthEnd)).toBe(buildDemoReconciliations().length + buildDemoMonthEndRecords().length)
+    expect(await seedDemoRecords(harness.reconciliations, harness.monthEnd)).toBe(buildDemoReconciliations().length + buildDemoMonthEndRecords().length + buildAdditionalDemoReconciliations().length + buildAdditionalDemoMonthEndRecords().length)
     const may = (await harness.monthEnd.get(id('2026-05')))!
     await harness.monthEnd.put({ ...may, version: may.version + 1, clientName: 'Edited by a person' }, may.version)
     expect(await seedDemoRecords(harness.reconciliations, harness.monthEnd)).toBe(0)
@@ -259,7 +259,7 @@ describe('closing a month', () => {
     expect((await harness.monthEnd.get(id('2026-07')))!.status).toBe('open')
   })
 
-  it('cannot close a month that has not ended, a month with no demo books, or a demo client without books', async () => {
+  it('cannot close a month that has not ended, a month with no demo books, or a generated month without checklist completion', async () => {
     const { harness, agent, csrf } = await seeded()
     const body = { expectedVersion: 1, exceptions: [], checklist: [] }
     await signoff(agent, csrf, id('2026-10'), 'receivables', 0)
@@ -270,7 +270,7 @@ describe('closing a month', () => {
     expect(noBooks.body.code).toBe('NO_BOOKS')
     await signoff(agent, csrf, id('2026-07', 'demo', 'green-leaf-landscaping'), 'receivables', 0)
     const otherClient = await post(agent, csrf, id('2026-07', 'demo', 'green-leaf-landscaping'), '/close', { ...(await closeBodyForFake()), expectedVersion: 1 })
-    expect(otherClient.body.code).toBe('NO_BOOKS')
+    expect(otherClient.body.code).toBe('NOT_COMPLETABLE')
     expect(harness.getAccounts).not.toHaveBeenCalled()
   })
 

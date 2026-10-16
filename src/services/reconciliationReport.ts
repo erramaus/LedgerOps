@@ -35,8 +35,8 @@ export function buildReconciliationCsv(record: ReconciliationRecord, storage: { 
   lines.push(row('Cleared balance', money(computation.clearedBalanceCents)))
   lines.push(row('Statement ending balance', money(record.endingCents)))
   lines.push(row('Difference', money(computation.differenceCents)))
-  lines.push(row(`${labels.outstandingIncrease}s`, money(computation.outstandingIncreaseCents)))
-  lines.push(row(`${labels.outstandingDecrease}s`, money(computation.outstandingDecreaseCents)))
+  lines.push(row(labels.outstandingIncreasePlural, money(computation.outstandingIncreaseCents)))
+  lines.push(row(labels.outstandingDecreasePlural, money(computation.outstandingDecreaseCents)))
   lines.push(row('Adjusted statement balance', money(computation.adjustedBankBalanceCents)))
   lines.push(row('Book balance at statement date', money(computation.bookBalanceCents)))
 

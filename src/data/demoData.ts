@@ -1,4 +1,5 @@
 import { demoClientFigures } from '../../shared/demoMonthEnd'
+import { DEMO_CLIENT_ID } from '../../shared/demoBooks'
 import { formatCents } from '../../shared/reconciliation'
 
 export type Client = {
@@ -104,6 +105,7 @@ export type ClientRequestStatus = 'Draft' | 'Waiting for Client' | 'Answered' | 
 export type ClientRequest = {
   id: string
   client: string
+  clientId?: string
   dateCreated: string
   relatedTransaction?: string
   relatedAmount?: string
@@ -132,7 +134,7 @@ export type Invoice = {
   status: InvoiceStatus
 }
 
-export type BillStatus = 'Open' | 'Due Soon' | 'Overdue' | 'Paid' | 'Needs Review'
+export type BillStatus = 'Open' | 'Due Soon' | 'Overdue' | 'Partially Paid' | 'Paid' | 'Needs Review'
 
 export type Bill = {
   id: string
@@ -292,9 +294,9 @@ export const inboxItems: InboxItem[] = [
 ]
 
 export const clientRequests: ClientRequest[] = [
-  { id: 'request-home-depot', client: 'ABC Plumbing', dateCreated: 'August 18, 2026', relatedTransaction: 'Home Depot', relatedAmount: '$1,284.00', question: 'What was this purchase for?', status: 'Waiting for Client' },
-  { id: 'request-deposit', client: 'ABC Plumbing', dateCreated: 'August 16, 2026', relatedTransaction: 'Bank deposit', relatedAmount: '$2,450.00', question: 'Who sent this deposit?', status: 'Answered', answer: 'Payment from Westview Apartments for the July service call.' },
-  { id: 'request-vendor', client: 'ABC Plumbing', dateCreated: 'August 12, 2026', relatedTransaction: 'PlumbPro Supply', relatedAmount: '$680.00', question: 'Is this a business purchase or a personal expense?', status: 'Resolved', answer: 'Business purchase for the Oak Street job.' },
+  { id: 'request-home-depot', client: 'ABC Plumbing', clientId: DEMO_CLIENT_ID, dateCreated: 'August 18, 2026', relatedTransaction: 'Home Depot', relatedAmount: '$1,284.00', question: 'What was this purchase for?', status: 'Waiting for Client' },
+  { id: 'request-deposit', client: 'ABC Plumbing', clientId: DEMO_CLIENT_ID, dateCreated: 'August 16, 2026', relatedTransaction: 'Bank deposit', relatedAmount: '$2,450.00', question: 'Who sent this deposit?', status: 'Answered', answer: 'Payment from Westview Apartments for the July service call.' },
+  { id: 'request-vendor', client: 'ABC Plumbing', clientId: DEMO_CLIENT_ID, dateCreated: 'August 12, 2026', relatedTransaction: 'PlumbPro Supply', relatedAmount: '$680.00', question: 'Is this a business purchase or a personal expense?', status: 'Resolved', answer: 'Business purchase for the Oak Street job.' },
 ]
 
 export const demoInvoices: Invoice[] = [

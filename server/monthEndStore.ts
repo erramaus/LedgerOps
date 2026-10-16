@@ -6,6 +6,7 @@ export interface MonthEndStore {
   readonly durable: boolean
   list(filter: { source: Source; clientId: string }): Promise<MonthEndRecord[]>
   get(id: string): Promise<MonthEndRecord | null>
+  deleteDemoClients(clientIds: string[]): Promise<void>
   /** Writes only if the stored version equals `expectedVersion` (0 means the record must not exist yet). */
   put(record: MonthEndRecord, expectedVersion: number): Promise<boolean>
 }
@@ -28,6 +29,11 @@ export class MemoryMonthEndStore implements MonthEndStore {
     if ((current?.version ?? 0) !== expectedVersion) return false
     this.records.set(record.id, structuredClone(record))
     return true
+  }
+
+  async deleteDemoClients(clientIds: string[]) {
+    const ids = new Set(clientIds)
+    for (const [id, record] of this.records) if (record.source === 'demo' && ids.has(record.clientId)) this.records.delete(id)
   }
 }
 
@@ -76,5 +82,10 @@ export class PostgresMonthEndStore implements MonthEndStore {
     }
     const updated = await this.pool.query('UPDATE month_end_records SET status = $5, version = $6, data = $7, updated_at = now() WHERE id = $1 AND version = $8', [values[0], values[1], values[2], values[3], values[4], values[5], values[6], expectedVersion])
     return updated.rowCount === 1
+  }
+
+  async deleteDemoClients(clientIds: string[]) {
+    await this.ensureTable()
+    await this.pool.query("DELETE FROM month_end_records WHERE source = 'demo' AND client_id = ANY($1::text[])", [clientIds])
   }
 }

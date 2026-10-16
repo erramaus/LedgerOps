@@ -6,6 +6,7 @@ export interface ReconciliationStore {
   readonly durable: boolean
   list(filter: { source: Source; clientId: string }): Promise<ReconciliationRecord[]>
   get(id: string): Promise<ReconciliationRecord | null>
+  deleteDemoClients(clientIds: string[]): Promise<void>
   /** Writes only if the stored version equals `expectedVersion` (0 means the record must not exist yet). */
   put(record: ReconciliationRecord, expectedVersion: number): Promise<boolean>
 }
@@ -28,6 +29,11 @@ export class MemoryReconciliationStore implements ReconciliationStore {
     if ((current?.version ?? 0) !== expectedVersion) return false
     this.records.set(record.id, structuredClone(record))
     return true
+  }
+
+  async deleteDemoClients(clientIds: string[]) {
+    const ids = new Set(clientIds)
+    for (const [id, record] of this.records) if (record.source === 'demo' && ids.has(record.clientId)) this.records.delete(id)
   }
 }
 
@@ -83,5 +89,10 @@ export class PostgresReconciliationStore implements ReconciliationStore {
       [values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], expectedVersion],
     )
     return updated.rowCount === 1
+  }
+
+  async deleteDemoClients(clientIds: string[]) {
+    await this.ensureTable()
+    await this.pool.query("DELETE FROM reconciliation_records WHERE source = 'demo' AND client_id = ANY($1::text[])", [clientIds])
   }
 }

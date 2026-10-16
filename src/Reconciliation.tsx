@@ -20,6 +20,7 @@ import { applyMapping, parseCsv, suggestMapping, type CsvMapping } from "../shar
 import { periodEnd, periodStart, type Period } from "../shared/period";
 import { buildReconciliationCsv, reportFileName } from "./services/reconciliationReport";
 import { ReconciliationApiError, reconciliationService, type RecordSummary, type Storage } from "./services/reconciliationService";
+import { MissingTransactionPanel, type EntryPrefill, type EntryTools } from "./MissingTransaction";
 
 export type ReconAccount = {
   id: string;
@@ -64,6 +65,8 @@ export function ReconcileWorkspace({
   loadAccountData,
   today,
   period,
+  homeSignal,
+  entryTools,
 }: {
   source: Source;
   client: { id: string; name: string };
@@ -72,6 +75,10 @@ export function ReconcileWorkspace({
   today: string;
   /** The accounting month chosen elsewhere in the app; statements default to it. */
   period?: Period;
+  /** Changes when the user clicks Reconcile in the sidebar while already here: go back to the account list. */
+  homeSignal?: number;
+  /** Demo data only: lets the person record a transaction that is missing from the books. */
+  entryTools?: EntryTools;
 }) {
   const [step, setStep] = useState<Step>("accounts");
   const [storage, setStorage] = useState<Storage | null>(null);
@@ -85,6 +92,18 @@ export function ReconcileWorkspace({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!homeSignal) return;
+    if (work?.dirty && work.record.status !== "completed") {
+      setNotice("You have unsaved progress on this reconciliation. Use Save progress first, then go back to the account list.");
+      return;
+    }
+    setStep("accounts");
+    setWork(null);
+    setError(null);
+    setNotice(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [homeSignal]);
   const refresh = async () => {
     try {
       const result = await reconciliationService.list(source, client.id);
@@ -345,7 +364,7 @@ export function ReconcileWorkspace({
       {step === "statement" && account && (
         <StatementStep account={account} form={form} setForm={setForm} lines={statementLines} setLines={setStatementLines} previous={completedFor(account.id).slice(-1)[0]} locked={Boolean(completed)} busy={busy} onContinue={() => void startWork(true)} />
       )}
-      {step === "match" && work && computation && <MatchStep work={work} computation={computation} update={update} locked={Boolean(completed)} busy={busy} onReload={() => void reload()} onNext={() => setStep("review")} />}
+      {step === "match" && work && computation && <MatchStep work={work} computation={computation} update={update} locked={Boolean(completed)} busy={busy} entryTools={entryTools} onReload={() => void reload()} onNext={() => setStep("review")} />}
       {step === "review" && work && computation && (
         <ReviewStep work={work} computation={computation} storage={storage} busy={busy} onSave={() => void save()} onComplete={() => void complete()} onReopen={(reason) => void reopen(reason)} onDownload={download} />
       )}
@@ -537,9 +556,10 @@ function StatementStep({ account, form, setForm, lines, setLines, previous, lock
   );
 }
 
-function MatchStep({ work, computation, update, locked, busy, onReload, onNext }: { work: Work; computation: ReturnType<typeof computeReconciliation>; update: (change: (record: ReconciliationRecord) => ReconciliationRecord) => void; locked: boolean; busy: boolean; onReload: () => void; onNext: () => void }) {
+function MatchStep({ work, computation, update, locked, busy, entryTools, onReload, onNext }: { work: Work; computation: ReturnType<typeof computeReconciliation>; update: (change: (record: ReconciliationRecord) => ReconciliationRecord) => void; locked: boolean; busy: boolean; entryTools?: EntryTools; onReload: () => void; onNext: () => void }) {
   const { record } = work;
   const labels = labelsFor(record.accountKind);
+  const [prefill, setPrefill] = useState<EntryPrefill | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "cleared" | "outstanding" | "suggested" | "flagged">("all");
   const csv = record.statementMode === "csv";
@@ -582,7 +602,7 @@ function MatchStep({ work, computation, update, locked, busy, onReload, onNext }
     <div className="recon-match">
       <h3>Match transactions to the statement</h3>
       <p className="muted">
-        Mark each transaction that appears on the statement as cleared. Items you leave uncleared are shown as {labels.outstandingIncrease.toLowerCase()}s and {labels.outstandingDecrease.toLowerCase()}s. Marking items here does not mark them reconciled in QuickBooks.
+        Mark each transaction that appears on the statement as cleared. Items you leave uncleared are shown as {labels.outstandingIncreasePlural.toLowerCase()} and {labels.outstandingDecreasePlural.toLowerCase()}. Marking items here does not mark them reconciled in QuickBooks.
       </p>
       {!work.record.completeness.complete && (
         <div className="data-state-message error" role="alert">
@@ -652,15 +672,27 @@ function MatchStep({ work, computation, update, locked, busy, onReload, onNext }
           {computation.unmatchedLines.length === 0 ? <p className="muted">Every statement line is matched.</p> : (
             <ul className="recon-problems">
               {computation.unmatchedLines.map((line) => (
-                <li key={line.id}>{line.date} · {line.description || "Statement line"} · {signed(line)}. {suggestionHint(line, computation)}</li>
+                <li key={line.id}>
+                  {line.date} · {line.description || "Statement line"} · {signed(line)}. {suggestionHint(line, computation, Boolean(entryTools))}
+                  {entryTools && !locked && !computation.suggestions.some((suggestion) => suggestion.lineId === line.id) && !computation.nearMatches.some((near) => near.lineId === line.id) && (
+                    <>{" "}<button className="text-button" onClick={() => setPrefill({ key: Date.now(), accountId: record.accountId, date: line.date, payee: line.description, amountCents: line.amountCents, direction: line.direction })} aria-label={`Start entering ${line.description || "statement line"} ${formatCents(line.amountCents)}`}>Start entering this transaction</button></>
+                  )}
+                </li>
               ))}
             </ul>
           )}
         </div>
       )}
+      {entryTools && <MissingTransactionPanel tools={entryTools} accountId={record.accountId} locked={locked} prefill={prefill} onChanged={onReload} />}
+      {!entryTools && record.source === "quickbooks" && (
+        <div className="panel" data-testid="quickbooks-missing-note">
+          <h4>Something missing from the books?</h4>
+          <p className="muted">LedgerOps cannot create or change QuickBooks transactions yet. Create the missing transaction in QuickBooks, then use Reload transactions here. It will appear in this list to be cleared.</p>
+        </div>
+      )}
       <div className="recon-summary-grid">
-        <div><small>{labels.outstandingIncrease}s</small><strong>{formatCents(computation.outstandingIncreaseCents)}</strong><span>{computation.outstandingIncrease.length} item{computation.outstandingIncrease.length === 1 ? "" : "s"}</span></div>
-        <div><small>{labels.outstandingDecrease}s</small><strong>{formatCents(computation.outstandingDecreaseCents)}</strong><span>{computation.outstandingDecrease.length} item{computation.outstandingDecrease.length === 1 ? "" : "s"}</span></div>
+        <div><small>{labels.outstandingIncreasePlural}</small><strong>{formatCents(computation.outstandingIncreaseCents)}</strong><span>{computation.outstandingIncrease.length} item{computation.outstandingIncrease.length === 1 ? "" : "s"}</span></div>
+        <div><small>{labels.outstandingDecreasePlural}</small><strong>{formatCents(computation.outstandingDecreaseCents)}</strong><span>{computation.outstandingDecrease.length} item{computation.outstandingDecrease.length === 1 ? "" : "s"}</span></div>
         <div><small>Cleared balance</small><strong>{formatCents(computation.clearedBalanceCents)}</strong><span>{computation.cleared.length} cleared</span></div>
         <div><small>Statement ending balance</small><strong>{formatCents(record.endingCents)}</strong><span>from the statement</span></div>
       </div>
@@ -669,9 +701,10 @@ function MatchStep({ work, computation, update, locked, busy, onReload, onNext }
   );
 }
 
-function suggestionHint(line: StatementLine, computation: ReturnType<typeof computeReconciliation>) {
+function suggestionHint(line: StatementLine, computation: ReturnType<typeof computeReconciliation>, canEnter: boolean) {
   if (computation.suggestions.some((suggestion) => suggestion.lineId === line.id)) return "A matching transaction is suggested above.";
   if (computation.nearMatches.some((near) => near.lineId === line.id)) return "A similar transaction exists with a different amount.";
+  if (canEnter) return "Not found in your books. If it is genuinely missing, enter it with Add a missing transaction below. LedgerOps does not add it for you.";
   return "Not found in your books. Record it in QuickBooks, then use Reload transactions. LedgerOps does not add it for you.";
 }
 
@@ -700,8 +733,8 @@ function ReviewStep({ work, computation, storage, busy, onSave, onComplete, onRe
         {line("Statement ending balance", record.endingCents)}
         {line("Difference", computation.differenceCents, true)}
         <hr />
-        {line(`${labels.outstandingIncrease}s`, computation.outstandingIncreaseCents)}
-        {line(`${labels.outstandingDecrease}s`, computation.outstandingDecreaseCents)}
+        {line(labels.outstandingIncreasePlural, computation.outstandingIncreaseCents)}
+        {line(labels.outstandingDecreasePlural, computation.outstandingDecreaseCents)}
         {line("Adjusted statement balance", computation.adjustedBankBalanceCents)}
         {line("Book balance at statement date", computation.bookBalanceCents)}
       </div>

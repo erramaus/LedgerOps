@@ -1,6 +1,7 @@
 import express, { type Response } from 'express'
 import { DEMO_CLIENT_ID, DEMO_RECONCILIATION_ACCOUNTS } from '../shared/demoBooks.js'
 import { hasDemoBooks } from '../shared/demoMonthEnd.js'
+import { getAdditionalDemoCompany } from '../shared/demoCompanyBooks.js'
 import {
   MONTH_END_ID_PATTERN,
   NOTE_REQUIRED_STEPS,
@@ -134,7 +135,7 @@ export function createMonthEndRouter(deps: { store: MonthEndStore; reconciliatio
     if (record.status === 'closed') return void send(response, problem(409, 'CLOSED', 'This month is already closed.'))
     const at = iso()
     if (parts.end >= at.slice(0, 10)) return void send(response, problem(422, 'PERIOD_NOT_ENDED', 'This month has not ended yet, so it cannot be closed.'))
-    if (parts.source === 'demo' && (parts.clientId !== DEMO_CLIENT_ID || !hasDemoBooks(parsePeriodKey(parts.period)!))) {
+    if (parts.source === 'demo' && !hasDemoBooks(parsePeriodKey(parts.period)!, parts.clientId)) {
       return void send(response, problem(422, 'NO_BOOKS', 'There are no demo books for this client and month, so it cannot be closed.'))
     }
 
@@ -164,7 +165,9 @@ export function createMonthEndRouter(deps: { store: MonthEndStore; reconciliatio
     // Reconciliation is verified here, from the reconciliation store, never taken from the browser.
     let required_accounts: { id: string; name: string }[]
     if (parts.source === 'demo') {
-      required_accounts = DEMO_RECONCILIATION_ACCOUNTS.map((account) => ({ id: account.id, name: account.name }))
+      required_accounts = parts.clientId === DEMO_CLIENT_ID
+        ? DEMO_RECONCILIATION_ACCOUNTS.map((account) => ({ id: account.id, name: account.name }))
+        : (getAdditionalDemoCompany(parts.clientId)?.reconciliationAccounts ?? []).map((account) => ({ id: account.id, name: account.name }))
     } else {
       let accounts
       try {
