@@ -3,7 +3,10 @@ import { demoDataService } from "./services/demoDataService";
 import type {
   Bill,
   Client,
+  ClientDocument,
   ClientRequest,
+  ClientRequestStatus,
+  ClientRequestType,
   Invoice,
   LedgerAccount,
   LedgerBill,
@@ -60,18 +63,46 @@ import { appendUniqueEvent, readEvents, readRecurringDecisions, readRules, write
 import { buildAutomationTasks } from "./services/automationReminders";
 import { demoRecurringHistory } from "./services/automationDemoData";
 import { historyFromTransactions, recurringFromHistory, type RecurringPattern } from "./services/recurringTransactions";
+import {
+  addDays,
+  appendMessage,
+  applyReceiptMatch,
+  createSubmittedDocument,
+  demoAuditEvent,
+  draftClientMessageRequest,
+  draftRequest,
+  fixturesForRequest,
+  normalizeDisplayDate,
+  normalizeRequest,
+  openRequest,
+  pendingDocumentCount,
+  receiptMatchCandidates,
+  receiptReadyForMatch,
+  relevantTransactionStatus,
+  requestDocumentIds,
+  requestHasResponse,
+  requestMatchesClient,
+  seededDocumentsFor,
+  statusLabel,
+  type PortalAuditEvent,
+} from "./services/clientPortal";
 import { ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
+import { AccountantTools } from "./AccountantTools";
 import { demoReconSources } from "./data/demoReconciliation";
 import { DEMO_RECONCILIATION_ACCOUNTS, demoEarlierRegister } from "../shared/demoBooks";
 import { ADDITIONAL_DEMO_CLIENT_IDS, getAdditionalDemoCompany } from "../shared/demoCompanyBooks";
 import { additionRegister, mergedLedger, type DemoEntryRecord } from "../shared/demoEntries";
+import { journalAccounts, mergeDemoJournals, type DemoJournalEntryInput, type DemoJournalRecord } from "../shared/demoJournalEntries";
 import { activePaymentCents, mergeDemoPayments, paymentRegister, type DemoPaymentBook, type DemoPaymentInput, type DocumentPaymentKind } from "../shared/demoPayments";
 import { demoClientFigures } from "../shared/demoMonthEnd";
 import { DEMO_RESET_CLIENTS } from "../shared/demoReset";
 import { formatCents } from "../shared/reconciliation";
+import { type DemoWorkpaperInput, type DemoWorkpaperRecord } from "../shared/demoWorkpapers";
 import { demoEntryService, entryTransactions } from "./services/demoEntryService";
+import { demoJournalService } from "./services/demoJournalService";
 import { billsWithPayments, bookForDocument, demoPaymentService, invoicesWithPayments, paymentTransactions } from "./services/demoPaymentService";
 import { demoResetService } from "./services/demoResetService";
+import { demoWorkpaperService } from "./services/demoWorkpaperService";
 import type { EntryTools } from "./MissingTransaction";
 import { DocumentPaymentActions } from "./DocumentPaymentActions";
 import { companyBills, companyClient, companyInvoices, companyLedgerRegister, companyReconciliationAccounts, companyReconSources, companyRequests, companyTransactions } from "./services/demoCompanyData";
@@ -116,6 +147,32 @@ type AccountSource = "demo" | "quickbooks";
 type ReviewSource = "demo" | "quickbooks";
 type QuickBooksReviewData = { transactions: LedgerTransaction[]; accounts: LedgerAccount[]; invoices: LedgerInvoice[]; bills: LedgerBill[] };
 
+const seededBaseRequests = clientRequests.map(normalizeRequest);
+
+function companyPortalRequests(company: NonNullable<ReturnType<typeof getAdditionalDemoCompany>>) {
+  return companyRequests(company).map((request) =>
+    normalizeRequest({
+      ...request,
+      requestType: request.question.toLowerCase().includes("statement") ? "Statement Request" : "Transaction Question",
+      dueDate: addDays(normalizeDisplayDate(request.dateCreated), 4),
+      priority: request.question.toLowerCase().includes("statement") ? "High" : "Medium",
+      messages: [
+        {
+          id: `${request.id}-msg-1`,
+          sender: "Bookkeeper",
+          senderLabel: "LedgerOps Bookkeeper",
+          sentAt: `${normalizeDisplayDate(request.dateCreated)}T09:00:00.000Z`,
+          message: request.question,
+        },
+      ],
+    }),
+  );
+}
+
+function clientDocumentsFor(clientId: string, clientName: string) {
+  return seededDocumentsFor(clientId, clientName);
+}
+
 // Only one demo client has individual records; these pages cannot show anything for the others.
 const detailViews: View[] = ["Transactions", "Reconcile", "Receivables", "Payables", "Reports", "Month End", "Client Requests"];
 const scopeViews: View[] = ["Dashboard", "Clients", "Inbox", "Bookkeeping Review"];
@@ -156,10 +213,23 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [period, setPeriod] = useState<Period>(DEMO_DEFAULT_PERIOD);
   // Bumped when the user clicks the sidebar item for the page they are already on, meaning "take me back to the start".
   const [homeSignal, setHomeSignal] = useState(0);
-  const [requests, setRequests] = useState<ClientRequest[]>(clientRequests);
+  const [requests, setRequests] = useState<ClientRequest[]>([
+    ...seededBaseRequests,
+    ...baseClients
+      .filter((client) => client.id !== demoClient.id)
+      .flatMap((client) => {
+        const company = getAdditionalDemoCompany(client.id);
+        return company ? companyPortalRequests(company) : [];
+      }),
+  ]);
   const [selectedRequest, setSelectedRequest] = useState<ClientRequest | null>(
     null,
   );
+  const [documents, setDocuments] = useState<ClientDocument[]>([
+    ...clientDocumentsFor(demoClient.id, demoClient.name),
+    ...baseClients.filter((client) => client.id !== demoClient.id).flatMap((client) => clientDocumentsFor(client.id, client.name)),
+  ]);
+  const [portalAudit, setPortalAudit] = useState<PortalAuditEvent[]>([]);
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
   const [selectedBill, setSelectedBill] = useState<Bill | null>(null);
   const [transactionSource, setTransactionSource] =
@@ -219,8 +289,20 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     if (targets.has(demoClient.id)) setTransactions(demoTransactions);
     setRequests((current) => [
       ...current.filter((request) => !request.clientId || !targets.has(request.clientId)),
-      ...clientRequests.filter((request) => request.clientId && targets.has(request.clientId)),
+      ...seededBaseRequests.filter((request) => request.clientId && targets.has(request.clientId)),
+      ...clientIds.filter((clientId) => clientId !== demoClient.id).flatMap((clientId) => {
+        const company = getAdditionalDemoCompany(clientId);
+        return company ? companyPortalRequests(company) : [];
+      }),
     ]);
+    setDocuments((current) => [
+      ...current.filter((document) => !targets.has(document.clientId)),
+      ...clientIds.flatMap((clientId) => {
+        const client = baseClients.find((item) => item.id === clientId);
+        return client ? clientDocumentsFor(client.id, client.name) : [];
+      }),
+    ]);
+    setPortalAudit((current) => current.filter((event) => !targets.has(event.clientId)));
     setSelectedTransaction(null);
     setSelectedInvoice(null);
     setSelectedBill(null);
@@ -279,6 +361,21 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setDemoEntries([]);
     demoEntryService.list(clientId).then((records) => { if (generation === entryLoadGeneration.current) { entriesRef.current = records; setDemoEntries(records); setEntriesError(null); } }, (error: unknown) => { if (generation === entryLoadGeneration.current) setEntriesError(error instanceof Error ? error.message : "Unknown error."); });
   }, [selectedClient?.id, demoResetRevision]);
+  const [journalRecords, setJournalRecords] = useState<DemoJournalRecord[]>([]);
+  const journalsRef = useRef<DemoJournalRecord[]>([]);
+  const journalLoadGeneration = useRef(0);
+  useEffect(() => {
+    const generation = ++journalLoadGeneration.current;
+    const clientId = selectedClient?.id ?? demoClient.id;
+    journalsRef.current = [];
+    setJournalRecords([]);
+    demoJournalService.list(clientId).then((records) => {
+      if (generation === journalLoadGeneration.current) {
+        journalsRef.current = records;
+        setJournalRecords(records);
+      }
+    }, () => undefined);
+  }, [selectedClient?.id, demoResetRevision]);
   const [paymentBooks, setPaymentBooks] = useState<DemoPaymentBook[]>([]);
   const paymentBooksRef = useRef<DemoPaymentBook[]>([]);
   const paymentLoadGeneration = useRef(0);
@@ -289,15 +386,31 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setPaymentBooks([]);
     demoPaymentService.list(clientId).then((books) => { if (generation === paymentLoadGeneration.current) { paymentBooksRef.current = books; setPaymentBooks(books); } }, () => undefined);
   }, [selectedClient?.id, demoResetRevision]);
+  const [workpapers, setWorkpapers] = useState<DemoWorkpaperRecord[]>([]);
+  const workpapersRef = useRef<DemoWorkpaperRecord[]>([]);
+  const workpaperLoadGeneration = useRef(0);
+  useEffect(() => {
+    const generation = ++workpaperLoadGeneration.current;
+    const clientId = selectedClient?.id ?? demoClient.id;
+    workpapersRef.current = [];
+    setWorkpapers([]);
+    demoWorkpaperService.list(clientId).then((records) => {
+      if (generation === workpaperLoadGeneration.current) {
+        workpapersRef.current = records;
+        setWorkpapers(records);
+      }
+    }, () => undefined);
+  }, [selectedClient?.id, demoResetRevision]);
   const activeDemoCompany = selectedClient ? getAdditionalDemoCompany(selectedClient.id) : undefined;
   const activeDemoClient = activeDemoCompany ? companyClient(activeDemoCompany) : selectedClient?.id === demoClient.id ? demoClient : null;
   const activeDemoClientId = activeDemoCompany?.clientId ?? demoClient.id;
   const baseLedger = activeDemoCompany?.ledger;
   const mergedEntries = useMemo(() => mergedLedger(demoEntries, baseLedger ?? undefined, activeDemoClientId), [demoEntries, baseLedger, activeDemoClientId]);
-  const ledger = useMemo(() => mergeDemoPayments(paymentBooks, mergedEntries, activeDemoClientId), [paymentBooks, mergedEntries, activeDemoClientId]);
+  const journalLedger = useMemo(() => mergeDemoJournals(journalRecords, mergedEntries, activeDemoClientId), [journalRecords, mergedEntries, activeDemoClientId]);
+  const ledger = useMemo(() => mergeDemoPayments(paymentBooks, journalLedger, activeDemoClientId), [paymentBooks, journalLedger, activeDemoClientId]);
   const invoices = useMemo(() => activeDemoCompany ? companyInvoices(activeDemoCompany, paymentBooks) : invoicesWithPayments(demoInvoices, paymentBooks), [activeDemoCompany, paymentBooks]);
   const bills = useMemo(() => activeDemoCompany ? companyBills(activeDemoCompany, paymentBooks) : billsWithPayments(demoBills, paymentBooks), [activeDemoCompany, paymentBooks]);
-  const transactions = useMemo(() => activeDemoCompany
+  const rawTransactions = useMemo(() => activeDemoCompany
     ? [...companyTransactions(activeDemoCompany), ...entryTransactions(demoEntries, activeDemoClientId), ...paymentTransactions(paymentBooks, activeDemoClientId)]
     : [...ownTransactions, ...entryTransactions(demoEntries), ...paymentTransactions(paymentBooks)],
     [activeDemoCompany, activeDemoClientId, ownTransactions, demoEntries, paymentBooks]);
@@ -305,16 +418,17 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const clients = useMemo(() => {
     return baseClients.map((client) => {
       if (client.id === demoClient.id) {
-        const figures = demoClientFigures({ year: 2026, month: 8 }, mergeDemoPayments(paymentBooks, mergedLedger(demoEntries), demoClient.id));
+        const figures = demoClientFigures({ year: 2026, month: 8 }, mergeDemoPayments(paymentBooks, mergeDemoJournals(journalRecords.filter((record) => record.clientId === demoClient.id), mergedLedger(demoEntries), demoClient.id), demoClient.id));
         return { ...client, income: formatCents(figures.incomeCents), expenses: formatCents(figures.expensesCents), profit: formatCents(figures.profitCents), bankBalance: formatCents(figures.bankBalanceCents), accountsReceivable: formatCents(figures.receivableCents), accountsPayable: formatCents(figures.payableCents) };
       }
       const company = getAdditionalDemoCompany(client.id);
       if (!company) return client;
       const companyPaymentBooks = paymentBooks.filter((book) => book.clientId === company.clientId);
-      const figures = demoClientFigures({ year: 2026, month: 8 }, mergeDemoPayments(companyPaymentBooks, mergedLedger(demoEntries.filter((record) => record.clientId === company.clientId), company.ledger, company.clientId), company.clientId));
+      const companyJournals = journalRecords.filter((record) => record.clientId === company.clientId);
+      const figures = demoClientFigures({ year: 2026, month: 8 }, mergeDemoPayments(companyPaymentBooks, mergeDemoJournals(companyJournals, mergedLedger(demoEntries.filter((record) => record.clientId === company.clientId), company.ledger, company.clientId), company.clientId), company.clientId));
       return { ...client, income: formatCents(figures.incomeCents), expenses: formatCents(figures.expensesCents), profit: formatCents(figures.profitCents), bankBalance: formatCents(figures.bankBalanceCents), accountsReceivable: formatCents(figures.receivableCents), accountsPayable: formatCents(figures.payableCents) };
     });
-  }, [baseClients, demoEntries, paymentBooks]);
+  }, [baseClients, demoEntries, journalRecords, paymentBooks]);
   // The books-versus-statement figures behind the work queue include manual entries, so a fixed difference stops being a task.
   const reconciliationAccountsNow = useMemo(
     () => activeDemoCompany ? companyReconciliationAccounts(activeDemoCompany).map((account) => {
@@ -361,6 +475,23 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     });
     setAutomationEvents(saved);
   }, [automationClientId, automationSource]);
+  const logPortal = useCallback((event: Omit<PortalAuditEvent, "id">) => {
+    setPortalAudit((current) => [demoAuditEvent(event), ...current].slice(0, 200));
+  }, []);
+
+  const saveRequest = useCallback((nextRequest: ClientRequest) => {
+    const normalized = normalizeRequest(nextRequest);
+    setRequests((currentRequests) => currentRequests.some((request) => request.id === normalized.id)
+      ? currentRequests.map((request) => request.id === normalized.id ? normalized : request)
+      : [...currentRequests, normalized]);
+    setSelectedRequest(normalized);
+  }, []);
+
+  const saveDocument = useCallback((nextDocument: ClientDocument) => {
+    setDocuments((current) => current.some((document) => document.id === nextDocument.id)
+      ? current.map((document) => document.id === nextDocument.id ? nextDocument : document)
+      : [...current, nextDocument]);
+  }, []);
 
   const saveRule = (draft: Omit<AutomationRule, "id" | "createdAt" | "updatedAt" | "source" | "clientId"> & { id?: string }) => {
     const now = new Date().toISOString();
@@ -548,7 +679,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const quickBooksCategoryOptions: CategoryOption[] = (quickBooksAccounts.length > 0 ? quickBooksAccounts : reviewData?.accounts ?? [])
     .filter((account) => isExpenseCategoryAccount(account) && !isUncategorized(account.name))
     .map((account) => ({ id: account.quickBooksId, name: account.name }));
-  const demoCategoryOptions: CategoryOption[] = [...new Set([...DEMO_CATEGORIES, ...categoriesIn(transactions).filter((name) => !isUncategorized(name) && name !== "Split")])].map((name) => ({ name }));
+  const demoCategoryOptions: CategoryOption[] = [...new Set([...DEMO_CATEGORIES, ...categoriesIn(rawTransactions).filter((name) => !isUncategorized(name) && name !== "Split")])].map((name) => ({ name }));
 
   const updateTransaction = (updatedTransaction: Transaction) => {
     setTransactions((currentTransactions) =>
@@ -562,30 +693,43 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   };
 
   const createRequest = (transaction: Transaction) => {
-    const request: ClientRequest = {
-      id: `request-${transaction.id}`,
-      client: demoClient.name,
+    const request = draftRequest({
+      client: activeDemoClient?.name ?? demoClient.name,
       clientId: transaction.clientId ?? activeDemoClientId,
+      requestType: transaction.status === "Needs Receipt" ? "Missing Receipt" : "Transaction Question",
+      question: transaction.status === "Needs Receipt" ? `Please send the receipt for ${transaction.payee}.` : "What was this purchase for?",
       dateCreated: todayLabel(),
+      dueDate: addDays(todayIso, 3),
+      priority: transaction.status === "Needs Receipt" ? "High" : "Medium",
+      relatedTransactionId: transaction.id,
       relatedTransaction: transaction.payee,
       relatedAmount: transaction.amount,
-      question: "What was this purchase for?",
+      requestedDocumentType: transaction.status === "Needs Receipt" ? "Receipt" : undefined,
       status: "Waiting for Client",
-    };
-    setRequests((currentRequests) =>
-      currentRequests.some((currentRequest) => currentRequest.id === request.id)
-        ? currentRequests
-        : [...currentRequests, request],
-    );
-    updateTransaction({ ...transaction, status: "Needs Receipt" });
+    });
+    saveRequest(request);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: request.clientId ?? activeDemoClientId,
+      requestId: request.id,
+      kind: "request-sent",
+      source: "demo",
+      summary: `Sent ${request.requestType.toLowerCase()} request for ${request.relatedTransaction ?? request.client}.`,
+    });
+    updateTransaction({ ...transaction, status: "Needs Receipt" as const });
   };
 
   const createQuickBooksRequest = (transaction: LedgerTransaction, question: string) => {
-    const request: ClientRequest = {
+    const request = normalizeRequest({
       id: `request-${transaction.quickBooksId || transaction.id}`,
       client: sandboxName,
+      requestType: "Transaction Question",
       dateCreated: todayLabel(),
+      dueDate: addDays(todayIso, 3),
+      priority: "Medium",
       relatedTransaction: transaction.payee,
+      relatedTransactionId: transaction.id,
       relatedAmount: transaction.amount,
       question,
       status: "Waiting for Client",
@@ -595,15 +739,12 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       transactionDate: transaction.date,
       amount: transaction.amount,
       currentCategory: transaction.category,
-    };
-    setRequests((currentRequests) => currentRequests.some((item) => item.id === request.id) ? currentRequests : [...currentRequests, request]);
+    });
+    saveRequest(request);
   };
 
   const updateRequest = (updatedRequest: ClientRequest) => {
-    setRequests((currentRequests) => currentRequests.some((request) => request.id === updatedRequest.id)
-      ? currentRequests.map((request) => request.id === updatedRequest.id ? updatedRequest : request)
-      : [...currentRequests, updatedRequest]);
-    setSelectedRequest(updatedRequest);
+    saveRequest(updatedRequest);
   };
 
   const applyClientResponse = async (request: ClientRequest) => {
@@ -617,9 +758,17 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     const option = quickBooksCategoryOptions.find((item) => item.name.toLowerCase() === wanted);
     if (!option?.id) throw new Error(`QuickBooks account "${request.responseCategory}" was not found.`);
     await applyTransactionChanges(transaction, [{ lineId: lines[0].id, category: option.name, categoryId: option.id }]);
-    const resolved = { ...request, status: "Resolved" as const };
-    setRequests((currentRequests) => currentRequests.map((item) => item.id === request.id ? resolved : item));
-    setSelectedRequest(resolved);
+    const resolved = appendMessage({ ...request, responseCategory: option.name }, "Bookkeeper", "LedgerOps Bookkeeper", `Applied your answer and updated the QuickBooks Sandbox category to ${option.name}.`, new Date().toISOString(), undefined, "Completed");
+    saveRequest(resolved);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: QUICKBOOKS_CLIENT_ID,
+      requestId: request.id,
+      kind: "request-completed",
+      source: "quickbooks",
+      summary: `Completed QuickBooks Sandbox request for ${request.relatedTransaction ?? request.client}.`,
+    });
   };
 
   const createPageRequest = (
@@ -627,17 +776,163 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     relatedTransaction: string,
     relatedAmount: string,
   ) => {
-    const request: ClientRequest = {
-      id: `request-${Date.now()}`,
+    const request = draftRequest({
       client: activeDemoClient?.name ?? demoClient.name,
       clientId: activeDemoClientId,
+      requestType: "Custom Question",
+      question,
       dateCreated: todayLabel(),
+      dueDate: addDays(todayIso, 5),
+      priority: "Medium",
       relatedTransaction,
       relatedAmount,
-      question,
       status: "Waiting for Client",
-    };
-    setRequests((currentRequests) => [...currentRequests, request]);
+    });
+    saveRequest(request);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: activeDemoClientId,
+      requestId: request.id,
+      kind: "request-created",
+      source: "demo",
+      summary: `Created custom request for ${relatedTransaction}.`,
+    });
+  };
+
+  const createManagedRequest = (input: {
+    clientId: string;
+    requestType: ClientRequestType;
+    question: string;
+    dueDate?: string;
+    status: ClientRequestStatus;
+    relatedTransactionId?: string;
+    relatedTransaction?: string;
+    relatedAmount?: string;
+  }) => {
+    const clientName = baseClients.find((client) => client.id === input.clientId)?.name ?? demoClient.name;
+    const request = draftRequest({
+      client: clientName,
+      clientId: input.clientId,
+      requestType: input.requestType,
+      question: input.question,
+      dateCreated: todayLabel(),
+      dueDate: input.dueDate,
+      priority: input.requestType === "Missing Receipt" || input.requestType === "Statement Request" ? "High" : "Medium",
+      relatedTransactionId: input.relatedTransactionId,
+      relatedTransaction: input.relatedTransaction,
+      relatedAmount: input.relatedAmount,
+      requestedDocumentType: input.requestType === "Missing Receipt" ? "Receipt" : input.requestType === "Statement Request" ? "Bank Statement" : undefined,
+      status: input.status,
+    });
+    saveRequest(request);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: input.clientId,
+      requestId: request.id,
+      kind: input.status === "Draft" ? "request-created" : "request-sent",
+      source: "demo",
+      summary: `${input.status === "Draft" ? "Saved" : "Sent"} ${input.requestType.toLowerCase()} request for ${clientName}.`,
+    });
+  };
+
+  const sendClientMessage = (request: ClientRequest, message: string) => {
+    const next = appendMessage(request, "Client", request.client, message, new Date().toISOString(), undefined, "Client Responded");
+    saveRequest(next);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Client",
+      clientId: next.clientId ?? demoClient.id,
+      requestId: next.id,
+      kind: "client-responded",
+      source: next.quickBooksId ? "quickbooks" : "demo",
+      summary: `Client responded to ${next.requestType.toLowerCase()} request.`,
+    });
+  };
+
+  const submitClientDocument = (request: ClientRequest, fixtureId: string, note: string) => {
+    const fixture = fixturesForRequest(request).find((item) => item.id === fixtureId);
+    if (!fixture) return;
+    const at = new Date().toISOString();
+    const document = createSubmittedDocument(request, fixture, at);
+    saveDocument(document);
+    const next = appendMessage(request, "Client", request.client, note || `Uploaded ${fixture.name}.`, at, [document.id], "Client Responded");
+    saveRequest({ ...next, documentIds: [...(next.documentIds ?? []), document.id] });
+    logPortal({
+      at,
+      actor: "Client",
+      clientId: request.clientId ?? demoClient.id,
+      requestId: request.id,
+      documentId: document.id,
+      kind: "document-submitted",
+      source: request.quickBooksId ? "quickbooks" : "demo",
+      summary: `Client submitted ${fixture.type.toLowerCase()} for ${request.relatedTransaction ?? request.client}.`,
+    });
+  };
+
+  const approveRequest = (request: ClientRequest, message: string) => {
+    const next = appendMessage(request, "Bookkeeper", "LedgerOps Bookkeeper", message || "Thanks — this request is complete.", new Date().toISOString(), undefined, "Completed");
+    saveRequest(next);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: request.clientId ?? demoClient.id,
+      requestId: request.id,
+      kind: "request-completed",
+      source: request.quickBooksId ? "quickbooks" : "demo",
+      summary: `Completed ${request.requestType.toLowerCase()} request.`,
+    });
+  };
+
+  const rejectRequest = (request: ClientRequest, message: string) => {
+    const next = appendMessage(request, "Bookkeeper", "LedgerOps Bookkeeper", message || "Please send a little more detail so I can finish this request.", new Date().toISOString(), undefined, "Needs Follow-Up");
+    saveRequest(next);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: request.clientId ?? demoClient.id,
+      requestId: request.id,
+      kind: "request-rejected",
+      source: request.quickBooksId ? "quickbooks" : "demo",
+      summary: `Requested follow-up for ${request.requestType.toLowerCase()} request.`,
+    });
+  };
+
+  const matchReceiptDocument = (request: ClientRequest, documentId: string, transactionId: string) => {
+    const document = documents.find((item) => item.id === documentId);
+    const transaction = transactions.find((item) => item.id === transactionId);
+    if (!document || !transaction) return;
+    const matched = applyReceiptMatch(document, transaction);
+    saveDocument(matched.document);
+    updateTransaction(matched.transaction);
+    const next = appendMessage(request, "Bookkeeper", "LedgerOps Bookkeeper", `Matched ${document.name} to ${transaction.payee} for ${transaction.amount}.`, new Date().toISOString(), [document.id], "Completed");
+    saveRequest(next);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: request.clientId ?? demoClient.id,
+      requestId: request.id,
+      documentId: document.id,
+      kind: "receipt-matched",
+      source: "demo",
+      summary: `Matched receipt to ${transaction.payee}.`,
+    });
+  };
+
+  const createClientMessageRequest = (clientId: string, subject: string, message: string) => {
+    const clientName = baseClients.find((client) => client.id === clientId)?.name ?? demoClient.name;
+    const request = draftClientMessageRequest({ client: clientName, clientId, subject, message, at: new Date().toISOString() });
+    saveRequest(request);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Client",
+      clientId,
+      requestId: request.id,
+      kind: "message-sent",
+      source: "demo",
+      summary: `Client sent a new message: ${subject}.`,
+    });
   };
 
   const savePaymentBook = (book: DemoPaymentBook) => {
@@ -645,6 +940,44 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     const next = [...paymentBooksRef.current.filter((item) => item.id !== book.id), book];
     paymentBooksRef.current = next;
     setPaymentBooks(next);
+  };
+  const saveJournalRecord = (record: DemoJournalRecord) => {
+    journalLoadGeneration.current += 1;
+    const next = [...journalsRef.current.filter((item) => item.id !== record.id), record].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+    journalsRef.current = next;
+    setJournalRecords(next);
+  };
+  const saveWorkpaperRecord = (record: DemoWorkpaperRecord) => {
+    workpaperLoadGeneration.current += 1;
+    const next = [...workpapersRef.current.filter((item) => item.id !== record.id), record].sort((left, right) => right.input.period.localeCompare(left.input.period) || left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+    workpapersRef.current = next;
+    setWorkpapers(next);
+  };
+  const createDraftJournal = async (input: DemoJournalEntryInput) => {
+    if (appDataSource !== "demo") throw new Error("Journal entries can only be created in Demo Mode.");
+    saveJournalRecord(await demoJournalService.create(activeDemoClientId, input));
+  };
+  const updateDraftJournal = async (record: DemoJournalRecord, input: DemoJournalEntryInput) => {
+    if (appDataSource !== "demo") throw new Error("Journal entries can only be edited in Demo Mode.");
+    saveJournalRecord(await demoJournalService.edit(record.id, record.version, input));
+  };
+  const postDraftJournal = async (record: DemoJournalRecord) => {
+    if (appDataSource !== "demo") throw new Error("Journal entries can only be posted in Demo Mode.");
+    saveJournalRecord(await demoJournalService.post(record.id, record.version));
+  };
+  const reverseJournal = async (record: DemoJournalRecord, reason: string) => {
+    if (appDataSource !== "demo") throw new Error("Journal entries can only be reversed in Demo Mode.");
+    const result = await demoJournalService.reverse(record.id, record.version, reason);
+    saveJournalRecord(result.record!);
+    if (result.reversal) saveJournalRecord(result.reversal);
+  };
+  const createWorkpaper = async (input: DemoWorkpaperInput) => {
+    if (appDataSource !== "demo") throw new Error("Workpapers can only be saved in Demo Mode.");
+    saveWorkpaperRecord(await demoWorkpaperService.create(activeDemoClientId, input));
+  };
+  const updateWorkpaper = async (record: DemoWorkpaperRecord, input: DemoWorkpaperInput) => {
+    if (appDataSource !== "demo") throw new Error("Workpapers can only be updated in Demo Mode.");
+    saveWorkpaperRecord(await demoWorkpaperService.update(record.id, record.version, input));
   };
   const recordDocumentPayment = async (kind: DocumentPaymentKind, documentId: string, input: DemoPaymentInput) => {
     if (appDataSource !== "demo") throw new Error("QuickBooks payments must be recorded in QuickBooks.");
@@ -758,13 +1091,29 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
 
   const source = appDataSource;
   const scopedRequests = useMemo(() => {
-    if (source !== "demo" || !activeDemoCompany) return scopeRequests(requests, source);
+    if (source !== "demo" || !activeDemoCompany) return scopeRequests(requests, source).map(normalizeRequest);
     const saved = requests.filter((request) => request.clientId === activeDemoCompany.clientId);
     const byId = new Map(saved.map((request) => [request.id, request]));
-    const scenarios = companyRequests(activeDemoCompany).map((request) => byId.get(request.id) ?? request);
+    const scenarios = companyPortalRequests(activeDemoCompany).map((request) => byId.get(request.id) ?? request);
     const scenarioIds = new Set(scenarios.map((request) => request.id));
-    return [...scenarios, ...saved.filter((request) => !scenarioIds.has(request.id))];
+    return [...scenarios, ...saved.filter((request) => !scenarioIds.has(request.id))].map(normalizeRequest);
   }, [requests, source, activeDemoCompany]);
+  const scopedDocuments = useMemo(() => {
+    if (source !== "demo") return [];
+    if (activeDemoCompany) {
+      const seeded = clientDocumentsFor(activeDemoCompany.clientId, activeDemoCompany.clientName);
+      const saved = documents.filter((document) => document.clientId === activeDemoCompany.clientId);
+      const byId = new Map(saved.map((document) => [document.id, document]));
+      const scenarios = seeded.map((document) => byId.get(document.id) ?? document);
+      const scenarioIds = new Set(scenarios.map((document) => document.id));
+      return [...scenarios, ...saved.filter((document) => !scenarioIds.has(document.id))];
+    }
+    return documents;
+  }, [activeDemoCompany, documents, source]);
+  const transactions = useMemo(
+    () => rawTransactions.map((transaction) => relevantTransactionStatus(transaction, scopedRequests)),
+    [rawTransactions, scopedRequests],
+  );
   // The client and month are chosen once here, so every workflow keeps showing the same ones.
   const monthEndClient = source === "demo" ? { id: (selectedClient ?? demoClient).id, name: (selectedClient ?? demoClient).name } : { id: QUICKBOOKS_CLIENT_ID, name: sandboxName };
   const todayIso = currentDate.toISOString().slice(0, 10);
@@ -1001,6 +1350,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onOpenCompany={openCompany}
             onViewClients={() => setView("Clients")}
             onOpenInbox={openInbox}
+            onOpenRequests={openRequests}
             onOpenTask={openTask}
             onTransactions={openTransactions}
             onReconcile={openReconcile}
@@ -1008,6 +1358,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onReceivables={openReceivables}
             onPayables={openPayables}
             onReports={openReports}
+            documents={scopedDocuments}
           />
         ) : view === "Clients" ? (
           <Clients
@@ -1110,6 +1461,23 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onOpenReconcile={openReconcile}
             homeSignal={homeSignal}
             ledger={source === "demo" ? ledger : undefined}
+            accountantTools={
+              <AccountantTools
+                source={appDataSource}
+                clientName={monthEndClient.name}
+                period={period}
+                accounts={journalAccounts(activeDemoClientId, ledger.accounts).map((account) => ({ id: account.id, name: account.name, active: true, accountType: account.klass }))}
+                journals={journalRecords}
+                workpapers={workpapers}
+                userDisplay={user.email}
+                onCreateJournal={createDraftJournal}
+                onUpdateJournal={updateDraftJournal}
+                onPostJournal={postDraftJournal}
+                onReverseJournal={reverseJournal}
+                onCreateWorkpaper={createWorkpaper}
+                onUpdateWorkpaper={updateWorkpaper}
+              />
+            }
           />
         ) : view === "Month End" ? (
           <MonthEnd
@@ -1124,12 +1492,25 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
           />
         ) : view === "Client Requests" ? (
           <ClientRequests
+            source={source}
+            clients={baseClients}
+            selectedClientId={activeClient?.id ?? demoClient.id}
             requests={scopedRequests}
+            documents={scopedDocuments}
+            auditEvents={portalAudit.filter((event) => source === "quickbooks" ? event.source === "quickbooks" : event.source === "demo")}
+            transactions={transactions}
             selectedRequest={selectedRequest}
             onSelect={setSelectedRequest}
             onBack={() => setSelectedRequest(null)}
             onUpdate={updateRequest}
             onApplyResponse={applyClientResponse}
+            onCreateRequest={createManagedRequest}
+            onCreateClientMessage={createClientMessageRequest}
+            onSendClientMessage={sendClientMessage}
+            onSubmitDocument={submitClientDocument}
+            onApproveRequest={approveRequest}
+            onRejectRequest={rejectRequest}
+            onMatchReceipt={matchReceiptDocument}
           />
         ) : (
           <Settings
@@ -1255,6 +1636,7 @@ function Dashboard({
   onOpenCompany,
   onViewClients,
   onOpenInbox,
+  onOpenRequests,
   onOpenTask,
   onTransactions,
   onReconcile,
@@ -1262,6 +1644,7 @@ function Dashboard({
   onReceivables,
   onPayables,
   onReports,
+  documents,
 }: {
   client: Client | null;
   companyOpen: boolean;
@@ -1283,6 +1666,7 @@ function Dashboard({
   onOpenCompany: () => void;
   onViewClients: () => void;
   onOpenInbox: () => void;
+  onOpenRequests: () => void;
   onOpenTask: (task: WorkTask) => void;
   onTransactions: () => void;
   onReconcile: () => void;
@@ -1290,6 +1674,7 @@ function Dashboard({
   onReceivables: () => void;
   onPayables: () => void;
   onReports: () => void;
+  documents: ClientDocument[];
 }) {
   if (client || companyOpen)
     return (
@@ -1306,6 +1691,7 @@ function Dashboard({
         onSourceChange={onSourceChange}
         onBack={onBack}
         onOpenInbox={onOpenInbox}
+        onOpenRequests={onOpenRequests}
         onOpenTask={onOpenTask}
         onTransactions={onTransactions}
         onReconcile={onReconcile}
@@ -1313,6 +1699,7 @@ function Dashboard({
         onReceivables={onReceivables}
         onPayables={onPayables}
         onReports={onReports}
+        documents={documents}
       />
     );
 
@@ -1767,48 +2154,256 @@ function SummaryCard({
 }
 
 function ClientRequests({
+  source,
+  clients,
+  selectedClientId,
   requests,
+  documents,
+  auditEvents,
+  transactions,
   selectedRequest,
   onSelect,
   onBack,
   onUpdate,
   onApplyResponse,
+  onCreateRequest,
+  onCreateClientMessage,
+  onSendClientMessage,
+  onSubmitDocument,
+  onApproveRequest,
+  onRejectRequest,
+  onMatchReceipt,
 }: {
+  source: AccountSource;
+  clients: Client[];
+  selectedClientId: string;
   requests: ClientRequest[];
+  documents: ClientDocument[];
+  auditEvents: PortalAuditEvent[];
+  transactions: Transaction[];
   selectedRequest: ClientRequest | null;
   onSelect: (request: ClientRequest) => void;
   onBack: () => void;
   onUpdate: (request: ClientRequest) => void;
   onApplyResponse: (request: ClientRequest) => Promise<void>;
+  onCreateRequest: (input: {
+    clientId: string;
+    requestType: ClientRequestType;
+    question: string;
+    dueDate?: string;
+    status: ClientRequestStatus;
+    relatedTransactionId?: string;
+    relatedTransaction?: string;
+    relatedAmount?: string;
+  }) => void;
+  onCreateClientMessage: (clientId: string, subject: string, message: string) => void;
+  onSendClientMessage: (request: ClientRequest, message: string) => void;
+  onSubmitDocument: (request: ClientRequest, fixtureId: string, note: string) => void;
+  onApproveRequest: (request: ClientRequest, message: string) => void;
+  onRejectRequest: (request: ClientRequest, message: string) => void;
+  onMatchReceipt: (request: ClientRequest, documentId: string, transactionId: string) => void;
 }) {
   const [filter, setFilter] = useState<ClientRequest["status"] | "All">("All");
+  const [mode, setMode] = useState<"bookkeeper" | "client">("bookkeeper");
+  const [portalClientId, setPortalClientId] = useState(selectedClientId);
+  const [draftClientId, setDraftClientId] = useState(selectedClientId);
+  const [draftType, setDraftType] = useState<ClientRequestType>("Custom Question");
+  const [draftQuestion, setDraftQuestion] = useState("");
+  const [draftDueDate, setDraftDueDate] = useState(addDays(normalizeDisplayDate(new Date().toISOString().slice(0, 10)), 3));
+  const [draftRelatedTransaction, setDraftRelatedTransaction] = useState("");
+  const [draftRelatedAmount, setDraftRelatedAmount] = useState("");
+  const [portalSubject, setPortalSubject] = useState("");
+  const [portalMessage, setPortalMessage] = useState("");
+
+  useEffect(() => {
+    setPortalClientId(selectedClientId);
+    setDraftClientId(selectedClientId);
+  }, [selectedClientId]);
+
+  const portalRequests = requests.filter((request) => requestMatchesClient(request, portalClientId));
+  const portalDocuments = documents.filter((document) => document.clientId === portalClientId);
+  const visibleRequests = mode === "client"
+    ? portalRequests.filter((request) => filter === "All" ? true : request.status === filter)
+    : (filter === "All" ? requests : requests.filter((request) => request.status === filter));
+  const outstanding = portalRequests.filter((request) => openRequest(request)).length;
+  const completed = portalRequests.length - outstanding;
+
   if (selectedRequest)
     return (
       <ClientRequestDetail
+        source={source}
+        role={mode}
         request={selectedRequest}
+        documents={documents.filter((document) => document.requestId === selectedRequest.id || requestDocumentIds(selectedRequest, documents).includes(document.id))}
+        transactions={transactions}
         onBack={onBack}
         onUpdate={onUpdate}
         onApplyResponse={onApplyResponse}
+        onSendClientMessage={onSendClientMessage}
+        onSubmitDocument={onSubmitDocument}
+        onApproveRequest={onApproveRequest}
+        onRejectRequest={onRejectRequest}
+        onMatchReceipt={onMatchReceipt}
       />
     );
-  const visibleRequests = filter === "All" ? requests : requests.filter((request) => request.status === filter);
   return (
     <div className="page-content">
       <section className="welcome-row">
         <div>
           <h2>Client Requests</h2>
-          <p className="muted">Questions waiting for <ClientName />'s answers.</p>
+          <p className="muted">
+            {mode === "bookkeeper"
+              ? <>Questions, follow-ups, and uploaded demo documents for {source === "demo" ? <ClientName /> : "the connected company"}.</>
+              : "Demo-only simulated client portal. This is not a secure external login."}
+          </p>
         </div>
         <span className="attention-summary">
-          <strong>{requests.filter((request) => request.status !== "Resolved").length}</strong> active requests
+          <strong>{mode === "client" ? outstanding : requests.filter((request) => openRequest(request)).length}</strong> active requests
         </span>
       </section>
-      <div className="filter-row">{(["All", "Draft", "Waiting for Client", "Client Responded", "Resolved"] as const).map((option) => <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} onClick={() => setFilter(option)}>{option}<span>{option === "All" ? requests.length : requests.filter((request) => request.status === option).length}</span></button>)}</div>
+      {source === "demo" && (
+        <div className="filter-row" aria-label="Client request modes">
+          <button className={`filter-button ${mode === "bookkeeper" ? "active" : ""}`} onClick={() => setMode("bookkeeper")}>Bookkeeper View<span>Internal</span></button>
+          <button className={`filter-button ${mode === "client" ? "active" : ""}`} onClick={() => setMode("client")}>Simulated Client View<span>Demo</span></button>
+        </div>
+      )}
+      {mode === "client" && source === "demo" && (
+        <div className="panel portal-panel">
+          <div className="portal-header">
+            <div>
+              <h2>Simulated Client Portal</h2>
+              <p className="muted">Use this demo view to reply, submit safe fixture documents, and send messages without exposing data publicly.</p>
+            </div>
+            <label>
+              Client
+              <select value={portalClientId} onChange={(event) => setPortalClientId(event.target.value)}>
+                {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="portal-stats">
+            <div className="summary-card red"><strong>{outstanding}</strong><span>Outstanding requests</span></div>
+            <div className="summary-card green"><strong>{completed}</strong><span>Completed requests</span></div>
+            <div className="summary-card blue"><strong>{portalDocuments.length}</strong><span>Demo documents</span></div>
+          </div>
+          <div className="portal-compose">
+            <label>
+              Message subject
+              <input value={portalSubject} onChange={(event) => setPortalSubject(event.target.value)} placeholder="Question about August bank statement" />
+            </label>
+            <label>
+              Message
+              <textarea value={portalMessage} onChange={(event) => setPortalMessage(event.target.value)} placeholder="Type a message to your bookkeeper." />
+            </label>
+            <div className="reset-actions">
+              <button className="primary-button" onClick={() => {
+                if (!portalSubject.trim() || !portalMessage.trim()) return;
+                onCreateClientMessage(portalClientId, portalSubject.trim(), portalMessage.trim());
+                setPortalSubject("");
+                setPortalMessage("");
+              }}>Send message to bookkeeper <span>→</span></button>
+            </div>
+          </div>
+        </div>
+      )}
+      {mode === "bookkeeper" && source === "demo" && (
+        <div className="panel portal-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Create request</h2>
+              <p className="muted">Reuse the existing request workflow for receipts, statements, invoices, and custom questions.</p>
+            </div>
+          </div>
+          <div className="queue-filters">
+            <label>
+              Client
+              <select value={draftClientId} onChange={(event) => setDraftClientId(event.target.value)}>
+                {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+              </select>
+            </label>
+            <label>
+              Request type
+              <select value={draftType} onChange={(event) => setDraftType(event.target.value as ClientRequestType)}>
+                {(["Missing Receipt", "Transaction Question", "Statement Request", "Invoice Request", "Custom Question"] as const).map((option) => <option key={option} value={option}>{option}</option>)}
+              </select>
+            </label>
+            <label>
+              Due date
+              <input type="date" value={draftDueDate} onChange={(event) => setDraftDueDate(event.target.value)} />
+            </label>
+          </div>
+          <div className="queue-filters">
+            <label>
+              Related transaction or document
+              <input value={draftRelatedTransaction} onChange={(event) => setDraftRelatedTransaction(event.target.value)} placeholder="Home Depot" />
+            </label>
+            <label>
+              Amount
+              <input value={draftRelatedAmount} onChange={(event) => setDraftRelatedAmount(event.target.value)} placeholder="$341.22" />
+            </label>
+          </div>
+          <label className="portal-compose">
+            Request
+            <textarea value={draftQuestion} onChange={(event) => setDraftQuestion(event.target.value)} placeholder="Please upload the receipt for this purchase." />
+          </label>
+          <div className="reset-actions">
+            <button className="secondary-button" onClick={() => {
+              if (!draftQuestion.trim()) return;
+              onCreateRequest({ clientId: draftClientId, requestType: draftType, question: draftQuestion.trim(), dueDate: draftDueDate || undefined, status: "Draft", relatedTransaction: draftRelatedTransaction || undefined, relatedAmount: draftRelatedAmount || undefined });
+              setDraftQuestion("");
+            }}>Save draft</button>
+            <button className="primary-button" onClick={() => {
+              if (!draftQuestion.trim()) return;
+              onCreateRequest({ clientId: draftClientId, requestType: draftType, question: draftQuestion.trim(), dueDate: draftDueDate || undefined, status: "Waiting for Client", relatedTransaction: draftRelatedTransaction || undefined, relatedAmount: draftRelatedAmount || undefined });
+              setDraftQuestion("");
+            }}>Send request <span>→</span></button>
+          </div>
+        </div>
+      )}
+      <div className="filter-row">{(["All", "Draft", "Sent", "Waiting for Client", "Client Responded", "Needs Follow-Up", "Completed"] as const).map((option) => <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} onClick={() => setFilter(option)}>{option}<span>{option === "All" ? visibleRequests.length : (mode === "client" ? portalRequests : requests).filter((request) => request.status === option).length}</span></button>)}</div>
+      <div className="request-documents-grid">
+        <section className="panel">
+          <div className="panel-heading">
+            <div>
+              <h2>{mode === "client" ? "Your demo documents" : "Recent documents"}</h2>
+              <p className="muted">Metadata only — no real documents are stored here.</p>
+            </div>
+          </div>
+          <div className="audit-log-list">
+            {(mode === "client" ? portalDocuments : documents).slice(0, 6).map((document) => (
+              <div className="audit-log-row" key={document.id}>
+                <strong>{document.name}</strong>
+                <span>{document.type} · {document.date}</span>
+                <span>{document.reviewStatus}{document.matchStatus ? ` · ${document.matchStatus}` : ""}</span>
+              </div>
+            ))}
+            {(mode === "client" ? portalDocuments : documents).length === 0 && <p className="muted">No demo documents yet.</p>}
+          </div>
+        </section>
+        <section className="panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Demo activity history</h2>
+              <p className="muted">Temporary browser-session activity only.</p>
+            </div>
+          </div>
+          <div className="audit-log-list">
+            {auditEvents.slice(0, 8).map((event) => (
+              <div className="audit-log-row" key={event.id}>
+                <strong>{event.summary}</strong>
+                <span>{event.actor} · {new Date(event.at).toLocaleString()}</span>
+                {event.detail && <span>{event.detail}</span>}
+              </div>
+            ))}
+            {auditEvents.length === 0 && <p className="muted">No demo client portal activity recorded yet.</p>}
+          </div>
+        </section>
+      </div>
       {visibleRequests.length === 0 ? (
         <div className="empty-state">
           <span>✓</span>
           <h2>You're all caught up.</h2>
-          <p className="muted">All client questions have been resolved.</p>
+          <p className="muted">{mode === "client" ? "There are no requests for this simulated client right now." : "All client questions have been resolved."}</p>
         </div>
       ) : (
         <div className="request-card-grid">
@@ -1819,22 +2414,23 @@ function ClientRequests({
               onClick={() => onSelect(request)}
             >
               <div className="request-card-top">
-                <span className="company-avatar">AB</span>
+                <span className="company-avatar">{request.client.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span>
                 <span>
                   <strong>{request.client}</strong>
-                  <small>Created {request.dateCreated}</small>
+                  <small>{request.requestType} · Created {request.dateCreated}</small>
                 </span>
                 <span
-                  className={`inbox-status ${request.status.toLowerCase().replaceAll(" ", "-")}`}
+                  className={`inbox-status ${statusLabel(request.status)}`}
                 >
                   {request.status}
                 </span>
               </div>
               <div className="request-card-related">
                 <strong>{request.relatedTransaction}</strong>
-                <span>{request.relatedAmount}</span>
+                <span>{request.relatedAmount}{request.dueDate ? ` · due ${formatDueDate(request.dueDate)}` : ""}</span>
               </div>
               <p>{request.question}</p>
+              <small className="muted">{requestHasResponse(request) ? "Client has responded." : "Waiting for a response."} {requestDocumentIds(request, documents).length > 0 ? `${requestDocumentIds(request, documents).length} document(s) attached.` : ""}</small>
               <span className="row-arrow">→</span>
             </button>
           ))}
@@ -1845,22 +2441,45 @@ function ClientRequests({
 }
 
 function ClientRequestDetail({
+  source,
+  role,
   request,
+  documents,
+  transactions,
   onBack,
   onUpdate,
   onApplyResponse,
+  onSendClientMessage,
+  onSubmitDocument,
+  onApproveRequest,
+  onRejectRequest,
+  onMatchReceipt,
 }: {
+  source: AccountSource;
+  role: "bookkeeper" | "client";
   request: ClientRequest;
+  documents: ClientDocument[];
+  transactions: Transaction[];
   onBack: () => void;
   onUpdate: (request: ClientRequest) => void;
   onApplyResponse: (request: ClientRequest) => Promise<void>;
+  onSendClientMessage: (request: ClientRequest, message: string) => void;
+  onSubmitDocument: (request: ClientRequest, fixtureId: string, note: string) => void;
+  onApproveRequest: (request: ClientRequest, message: string) => void;
+  onRejectRequest: (request: ClientRequest, message: string) => void;
+  onMatchReceipt: (request: ClientRequest, documentId: string, transactionId: string) => void;
 }) {
   const answers = ["Materials", "Equipment", "Office Supplies", "Utilities", "Meals", "Travel", "Other"];
   const [applyConfirmation, setApplyConfirmation] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
+  const [message, setMessage] = useState("");
+  const [reviewNote, setReviewNote] = useState("");
+  const [fixtureId, setFixtureId] = useState(fixturesForRequest(request)[0]?.id ?? "fixture-other");
+  const requestDocuments = documents;
   const responseCategory = request.responseCategory || request.answer;
   const suggestedAccount = responseCategory === "Materials" ? "Job Materials" : responseCategory;
+  const receiptDocuments = requestDocuments.filter(receiptReadyForMatch);
   return (
     <div className="page-content">
       <button className="back-button" onClick={onBack}>
@@ -1868,14 +2487,14 @@ function ClientRequestDetail({
       </button>
       <section className="review-header">
         <div>
-          <p className="eyebrow">CLIENT REQUEST · <ClientName upper /></p>
+          <p className="eyebrow">{role === "client" ? "SIMULATED CLIENT PORTAL" : "CLIENT REQUEST"} · <ClientName upper /></p>
           <h2>{request.relatedTransaction}</h2>
           <p className="muted">
-            Created {request.dateCreated} · {request.relatedAmount}
+            {request.requestType} · Created {request.dateCreated}{request.relatedAmount ? ` · ${request.relatedAmount}` : ""}{request.dueDate ? ` · due ${formatDueDate(request.dueDate)}` : ""}
           </p>
         </div>
         <span
-          className={`inbox-status ${request.status.toLowerCase().replaceAll(" ", "-")}`}
+          className={`inbox-status ${statusLabel(request.status)}`}
         >
           {request.status}
         </span>
@@ -1885,29 +2504,71 @@ function ClientRequestDetail({
           <h2>Question for the client</h2>
           <p className="request-question-text">{request.question}</p>
           <p className="muted">{request.client}</p>
+          <div className="message-thread">
+            {(request.messages ?? []).map((item) => (
+              <div className={`message-bubble ${item.sender === "Client" ? "client" : "bookkeeper"}`} key={item.id}>
+                <strong>{item.senderLabel}</strong>
+                <small>{new Date(item.sentAt).toLocaleString()}</small>
+                <p>{item.message}</p>
+                {item.documentIds?.length ? <span>{item.documentIds.length} attached demo document(s)</span> : null}
+              </div>
+            ))}
+          </div>
           {request.answer ? (
             <div className="answer-box">
-              <small>Client answer</small>
+              <small>Latest client answer</small>
               <strong>{request.answer}</strong>
             </div>
-          ) : (
-            <div className="answer-options">
-              <p className="muted">Simulate a client answer:</p>
-              {answers.map((answer) => (
-                <button
-                  className="category-button"
-                  key={answer}
-                  onClick={() =>
-                    onUpdate({ ...request, status: request.quickBooksId ? "Client Responded" : "Answered", answer, responseCategory: answer })
-                  }
-                >
-                  {answer}
-                  <span>→</span>
-                </button>
-              ))}
-            </div>
-          )}
+          ) : null}
           {request.quickBooksId && responseCategory && <div className="suggestion-box"><small>Suggested QuickBooks Change</small><strong>Current: {request.currentCategory || "Uncategorized Expense"}</strong><span>Change to: {suggestedAccount}</span></div>}
+          {source === "demo" && request.status !== "Completed" && (
+            <>
+              <div className="answer-options">
+                <p className="muted">Quick response suggestions:</p>
+                {answers.map((answer) => (
+                  <button
+                    className="category-button"
+                    key={answer}
+                    onClick={() => {
+                      onUpdate({ ...request, status: "Client Responded", answer, responseCategory: answer });
+                      onSendClientMessage({ ...request, responseCategory: answer }, answer);
+                    }}
+                  >
+                    {answer}
+                    <span>→</span>
+                  </button>
+                ))}
+              </div>
+              {role === "client" && (
+              <div className="portal-compose">
+                <label>
+                  Reply
+                  <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Type your answer or question." />
+                </label>
+                <div className="reset-actions">
+                  <button className="primary-button" onClick={() => { if (!message.trim()) return; onSendClientMessage(request, message.trim()); setMessage(""); }}>Send response <span>→</span></button>
+                </div>
+              </div>
+              )}
+              {role === "client" && (
+              <div className="portal-compose">
+                <label>
+                  Simulated document
+                  <select value={fixtureId} onChange={(event) => setFixtureId(event.target.value)}>
+                    {fixturesForRequest(request).map((fixture) => <option key={fixture.id} value={fixture.id}>{fixture.label}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Note to bookkeeper
+                  <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="Uploading this statement for review." />
+                </label>
+                <div className="reset-actions">
+                  <button className="secondary-button" onClick={() => { onSubmitDocument(request, fixtureId, reviewNote.trim()); setReviewNote(""); }}>Upload simulated document</button>
+                </div>
+              </div>
+              )}
+            </>
+          )}
         </div>
         <div className="panel request-details">
           <h2>Request details</h2>
@@ -1928,17 +2589,58 @@ function ClientRequestDetail({
               <small>Status</small>
               <strong>{request.status}</strong>
             </span>
+            <span>
+              <small>Documents</small>
+              <strong>{requestDocuments.length}</strong>
+            </span>
           </div>
-          {request.quickBooksId && responseCategory && request.status === "Client Responded" && <><button className="primary-button resolve-button" onClick={() => setApplyConfirmation(true)}>Approve & Apply Response <span>→</span></button>{applyError && <div className="data-state-message error">{applyError}</div>}{applyConfirmation && <div className="confirmation-box"><strong>You are about to update this transaction in QuickBooks Sandbox.</strong><span>Transaction: {request.payee}</span><span>Amount: {request.amount}</span><span>Current category: {request.currentCategory}</span><span>New category: {suggestedAccount}</span><div><button className="secondary-button" onClick={() => setApplyConfirmation(false)}>Cancel</button><button className="primary-button" disabled={applying} onClick={async () => { setApplying(true); setApplyError(null); try { await onApplyResponse({ ...request, responseCategory: suggestedAccount }); setApplyConfirmation(false); } catch (error) { setApplyError(error instanceof Error ? error.message : "Unable to apply response."); } finally { setApplying(false); } }}>{applying ? "Updating..." : "Confirm Update"}</button></div></div>}</>}
-          {request.status === "Answered" && !request.quickBooksId && (
+          {requestDocuments.length > 0 && (
+            <div className="audit-log-list">
+              {requestDocuments.map((document) => (
+                <div className="audit-log-row" key={document.id}>
+                  <strong>{document.name}</strong>
+                  <span>{document.type} · {document.reviewStatus}{document.matchStatus ? ` · ${document.matchStatus}` : ""}</span>
+                  <span>{document.notes || "Demo fixture metadata only."}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {receiptDocuments.map((document) => {
+            const candidates = receiptMatchCandidates(document, transactions).slice(0, 3);
+            return (
+              <div className="confirmation-box" key={document.id}>
+                <strong>Receipt matching</strong>
+                <span>{document.name} · {document.amount || "No amount"} · {document.date}</span>
+                {candidates.length === 0 ? <span>No likely matches found yet.</span> : candidates.map((candidate) => (
+                  <button className="text-button" key={candidate.transactionId} onClick={() => onMatchReceipt(request, document.id, candidate.transactionId)}>
+                    Match to {candidate.payee} · {candidate.amount} · {candidate.date}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+          {role === "bookkeeper" && request.quickBooksId && responseCategory && request.status === "Client Responded" && <><button className="primary-button resolve-button" onClick={() => setApplyConfirmation(true)}>Approve & Apply Response <span>→</span></button>{applyError && <div className="data-state-message error">{applyError}</div>}{applyConfirmation && <div className="confirmation-box"><strong>You are about to update this transaction in QuickBooks Sandbox.</strong><span>Transaction: {request.payee}</span><span>Amount: {request.amount}</span><span>Current category: {request.currentCategory}</span><span>New category: {suggestedAccount}</span><div><button className="secondary-button" onClick={() => setApplyConfirmation(false)}>Cancel</button><button className="primary-button" disabled={applying} onClick={async () => { setApplying(true); setApplyError(null); try { await onApplyResponse({ ...request, responseCategory: suggestedAccount }); setApplyConfirmation(false); } catch (error) { setApplyError(error instanceof Error ? error.message : "Unable to apply response."); } finally { setApplying(false); } }}>{applying ? "Updating..." : "Confirm Update"}</button></div></div>}</>}
+          {role === "bookkeeper" && !request.quickBooksId && request.answer && request.status !== "Completed" && (
             <button
               className="primary-button resolve-button"
-              onClick={() => onUpdate({ ...request, status: "Resolved" })}
+              onClick={() => onApproveRequest(request, reviewNote.trim() || "Thanks — this request is complete.")}
             >
               Mark Resolved <span>✓</span>
             </button>
           )}
-          {request.status === "Resolved" && (
+          {role === "bookkeeper" && source === "demo" && request.status !== "Completed" && (
+            <div className="portal-compose">
+              <label>
+                Review note
+                <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="Approved — thanks." />
+              </label>
+              <div className="reset-actions">
+                <button className="secondary-button" onClick={() => onRejectRequest(request, reviewNote.trim())}>Needs follow-up</button>
+                <button className="primary-button" onClick={() => onApproveRequest(request, reviewNote.trim())}>Approve & complete <span>✓</span></button>
+              </div>
+            </div>
+          )}
+          {request.status === "Completed" && (
             <div className="resolved-note">✓ This request is resolved.</div>
           )}
         </div>
@@ -3502,6 +4204,7 @@ function ClientDashboard({
   onSourceChange,
   onBack,
   onOpenInbox,
+  onOpenRequests,
   onOpenTask,
   onTransactions,
   onReconcile,
@@ -3509,6 +4212,7 @@ function ClientDashboard({
   onReceivables,
   onPayables,
   onReports,
+  documents,
 }: {
   client: Client | null;
   companyName: string;
@@ -3522,6 +4226,7 @@ function ClientDashboard({
   onSourceChange: (source: AccountSource) => void;
   onBack: () => void;
   onOpenInbox: () => void;
+  onOpenRequests: () => void;
   onOpenTask: (task: WorkTask) => void;
   onTransactions: () => void;
   onReconcile: () => void;
@@ -3529,6 +4234,7 @@ function ClientDashboard({
   onReceivables: () => void;
   onPayables: () => void;
   onReports: () => void;
+  documents: ClientDocument[];
 }) {
   const isDemo = source === "demo";
   // Demo clients other than the one with full records only have summary counts.
@@ -3669,6 +4375,19 @@ function ClientDashboard({
             <button onClick={onReports}>
               Reports <span>→</span>
             </button>
+          </div>
+        </div>
+        <div className="panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Documents</h2>
+              <p className="muted">Recent client portal documents and review status.</p>
+            </div>
+            <span className="count-pill">{documents.length} docs</span>
+          </div>
+          {documents.length === 0 ? <p className="muted">No demo documents are recorded for this client yet.</p> : <div className="audit-log-list">{documents.slice(0, 4).map((document) => <div className="audit-log-row" key={document.id}><strong>{document.name}</strong><span>{document.type} · {document.reviewStatus}</span><span>{document.matchStatus ? `Receipt match: ${document.matchStatus}` : document.notes || "Demo fixture metadata only."}</span></div>)}</div>}
+          <div className="reset-actions">
+            <button className="secondary-button" onClick={onOpenRequests}>Open requests and documents <span>→</span></button>
           </div>
         </div>
       </section>

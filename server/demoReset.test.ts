@@ -3,15 +3,19 @@ import request from 'supertest'
 import { describe, expect, it, vi } from 'vitest'
 import { DEMO_CLIENT_ID } from '../shared/demoBooks.js'
 import { createRecord } from '../shared/demoEntries.js'
+import { createDraftJournalRecord } from '../shared/demoJournalEntries.js'
 import { buildAdditionalDemoMonthEndRecords, buildDemoMonthEndRecords } from '../shared/demoMonthEnd.js'
 import { DEMO_RESET_CLIENTS } from '../shared/demoReset.js'
+import { createWorkpaperRecord } from '../shared/demoWorkpapers.js'
 import type { DemoPaymentBook } from '../shared/demoPayments.js'
 import { createApp, type QuickBooksGateway } from './app.js'
 import type { AuthProvider } from './authProvider.js'
 import type { AppConfig } from './config.js'
 import { MemoryDemoEntryStore } from './demoEntryStore.js'
+import { MemoryDemoJournalStore } from './demoJournalStore.js'
 import { MemoryDemoPaymentStore } from './demoPaymentStore.js'
 import { MemoryDemoResetRepository } from './demoReset.js'
+import { MemoryDemoWorkpaperStore } from './demoWorkpaperStore.js'
 import { seedDemoRecords } from './demoSeed.js'
 import { MemoryMonthEndStore } from './monthEndStore.js'
 import { MemoryReconciliationStore } from './reconciliationStore.js'
@@ -23,7 +27,9 @@ const GREEN_ID = DEMO_RESET_CLIENTS[1].id
 function fixture() {
   const stores = {
     entries: new MemoryDemoEntryStore(),
+    journals: new MemoryDemoJournalStore(),
     payments: new MemoryDemoPaymentStore(),
+    workpapers: new MemoryDemoWorkpaperStore(),
     reconciliations: new MemoryReconciliationStore(),
     monthEnd: new MemoryMonthEndStore(),
   }
@@ -34,8 +40,12 @@ async function addMutationData(stores: ReturnType<typeof fixture>) {
   await seedDemoRecords(stores.reconciliations, stores.monthEnd)
   const entry = createRecord('manual-abc', DEMO_CLIENT_ID, { accountId: 'chase-card', type: 'charge', date: '2026-08-08', payee: 'Shop', amountCents: 1200, categoryId: 'materials', memo: '' }, 'test', '2026-10-01T00:00:00.000Z')
   await stores.entries.put(entry, 0)
+  const journal = createDraftJournalRecord('journal-abc', DEMO_CLIENT_ID, { date: '2026-08-31', description: 'Depreciation', referenceNumber: 'ADJ-1', adjustmentType: 'Depreciation', explanation: 'Fixture', lines: [{ accountId: 'depreciation-expense', debitCents: 2500, creditCents: 0, memo: '' }, { accountId: 'accumulated-depreciation', debitCents: 0, creditCents: 2500, memo: '' }] }, 'test', '2026-10-01T00:00:00.000Z')
+  await stores.journals.put(journal, 0)
   const payment: DemoPaymentBook = { id: 'abc:invoice:fixture', clientId: DEMO_CLIENT_ID, kind: 'invoice', documentId: 'fixture', version: 1, payments: [] }
   await stores.payments.put(payment, 0)
+  const workpaper = createWorkpaperRecord('workpaper-abc', DEMO_CLIENT_ID, { title: 'Fixture', period: '2026-08', accountId: 'utilities', note: 'Fixture note', supportingDocumentRefs: [], reconciliationLinks: [], adjustingEntryIds: [], reviewStatus: 'Prepared', preparedBy: 'Pat', workDate: '2026-08-31' }, 'test', '2026-10-01T00:00:00.000Z')
+  await stores.workpapers.put(workpaper, 0)
   const smithPayment: DemoPaymentBook = { ...payment, id: 'smith:invoice:fixture', clientId: SMITH_ID }
   await stores.payments.put(smithPayment, 0)
   const original = buildDemoMonthEndRecords()[0]
@@ -48,7 +58,9 @@ describe('demo reset repository', () => {
     await addMutationData(stores)
     await new MemoryDemoResetRepository(stores).reset([DEMO_CLIENT_ID])
     expect(await stores.entries.list(DEMO_CLIENT_ID)).toEqual([])
+    expect(await stores.journals.list(DEMO_CLIENT_ID)).toEqual([])
     expect(await stores.payments.list(DEMO_CLIENT_ID)).toEqual([])
+    expect(await stores.workpapers.list(DEMO_CLIENT_ID)).toEqual([])
     expect(await stores.payments.list(SMITH_ID)).toHaveLength(1)
     expect(await stores.monthEnd.list({ source: 'demo', clientId: DEMO_CLIENT_ID })).toEqual(buildDemoMonthEndRecords())
     expect(await stores.monthEnd.list({ source: 'demo', clientId: SMITH_ID })).toEqual(buildAdditionalDemoMonthEndRecords().filter((record) => record.clientId === SMITH_ID))
@@ -60,7 +72,9 @@ describe('demo reset repository', () => {
     await new MemoryDemoResetRepository(stores).reset(DEMO_RESET_CLIENTS.map((client) => client.id))
     for (const { id } of DEMO_RESET_CLIENTS) {
       expect(await stores.entries.list(id)).toEqual([])
+      expect(await stores.journals.list(id)).toEqual([])
       expect(await stores.payments.list(id)).toEqual([])
+      expect(await stores.workpapers.list(id)).toEqual([])
     }
     expect((await stores.monthEnd.list({ source: 'demo', clientId: DEMO_CLIENT_ID })).map((record) => record.id)).toEqual(buildDemoMonthEndRecords().map((record) => record.id))
     expect((await stores.monthEnd.list({ source: 'demo', clientId: GREEN_ID })).map((record) => record.id)).toEqual(buildAdditionalDemoMonthEndRecords().filter((record) => record.clientId === GREEN_ID).map((record) => record.id))
@@ -71,14 +85,18 @@ describe('demo reset repository', () => {
     await addMutationData(stores)
     const before = {
       entries: await stores.entries.list(DEMO_CLIENT_ID),
+      journals: await stores.journals.list(DEMO_CLIENT_ID),
       payments: await stores.payments.list(DEMO_CLIENT_ID),
+      workpapers: await stores.workpapers.list(DEMO_CLIENT_ID),
       reconciliations: await stores.reconciliations.list({ source: 'demo', clientId: DEMO_CLIENT_ID }),
       monthEnd: await stores.monthEnd.list({ source: 'demo', clientId: DEMO_CLIENT_ID }),
     }
     const repository = new MemoryDemoResetRepository(stores, () => { throw new Error('injected failure') })
     await expect(repository.reset([DEMO_CLIENT_ID])).rejects.toThrow('injected failure')
     expect(await stores.entries.list(DEMO_CLIENT_ID)).toEqual(before.entries)
+    expect(await stores.journals.list(DEMO_CLIENT_ID)).toEqual(before.journals)
     expect(await stores.payments.list(DEMO_CLIENT_ID)).toEqual(before.payments)
+    expect(await stores.workpapers.list(DEMO_CLIENT_ID)).toEqual(before.workpapers)
     expect(await stores.reconciliations.list({ source: 'demo', clientId: DEMO_CLIENT_ID })).toEqual(before.reconciliations)
     expect(await stores.monthEnd.list({ source: 'demo', clientId: DEMO_CLIENT_ID })).toEqual(before.monthEnd)
   })
@@ -92,7 +110,7 @@ function appHarness() {
   }
   const quickbooks = new Proxy({}, { get: (_target, name) => vi.fn(() => { throw new Error(`QuickBooks must not be called: ${String(name)}`) }) }) as unknown as QuickBooksGateway
   const config: AppConfig = { production: false, appOrigin: ORIGIN, corsOrigins: new Set([ORIGIN]), allowedEmails: new Set(['bookkeeper@example.com']), sessionSecret: 'x'.repeat(48), webRoot: '/nonexistent' }
-  const app = createApp({ config, quickbooks, authProvider: provider, sessionStore: new session.MemoryStore(), demoEntryStore: stores.entries, demoPaymentStore: stores.payments, reconciliationStore: stores.reconciliations, monthEndStore: stores.monthEnd, demoResetRepository: new MemoryDemoResetRepository(stores) })
+  const app = createApp({ config, quickbooks, authProvider: provider, sessionStore: new session.MemoryStore(), demoEntryStore: stores.entries, demoJournalStore: stores.journals, demoPaymentStore: stores.payments, demoWorkpaperStore: stores.workpapers, reconciliationStore: stores.reconciliations, monthEndStore: stores.monthEnd, demoResetRepository: new MemoryDemoResetRepository(stores) })
   return { app, stores }
 }
 

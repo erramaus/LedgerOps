@@ -6,7 +6,7 @@ import { buildChecklist } from '../../shared/monthEnd'
 import { parseQbReport } from '../../shared/qbReports'
 
 const txn = (id: string, date: string, payee: string, amount: string, over: Partial<Transaction> = {}): Transaction => ({ id, date, payee, description: '', amount, category: 'Materials', status: 'Categorized', ...over })
-const request = (over: Partial<ClientRequest>): ClientRequest => ({ id: 'r', client: 'c', dateCreated: 'August 18, 2026', question: '?', status: 'Waiting for Client', ...over })
+const request = (over: Partial<ClientRequest>): ClientRequest => ({ id: 'r', client: 'c', requestType: 'Transaction Question', dateCreated: 'August 18, 2026', question: '?', status: 'Waiting for Client', ...over })
 const july = { year: 2026, month: 7 }
 const august = { year: 2026, month: 8 }
 
@@ -31,8 +31,8 @@ describe('transactionFacts', () => {
     expect(transactionFacts(july, list, [request({ transactionDate: '2026-07-04' })]).facts.openClientRequests).toBe(1)
   })
 
-  it('resolved requests never count', () => {
-    expect(transactionFacts(august, list, [request({ status: 'Resolved' })]).facts.openClientRequests).toBe(0)
+  it('completed requests never count', () => {
+    expect(transactionFacts(august, list, [request({ status: 'Completed' })]).facts.openClientRequests).toBe(0)
   })
 
   it('works on the real demo data without crashing', () => {

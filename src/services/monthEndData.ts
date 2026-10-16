@@ -40,7 +40,7 @@ export function transactionFacts(period: Period, transactions: Transaction[], re
       possibleDuplicates: count('possible-duplicate'),
       missingReceipts: count('needs-receipt'),
       missingPayees: count('missing-payee'),
-      openClientRequests: requests.filter((request) => request.status !== 'Resolved' && requestIsInPeriod(request, inPeriod, period)).length,
+      openClientRequests: requests.filter((request) => request.status !== 'Completed' && requestIsInPeriod(request, inPeriod, period)).length,
     },
   }
 }

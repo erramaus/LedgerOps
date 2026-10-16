@@ -78,6 +78,7 @@ export function Reports({
   onOpenReconcile,
   homeSignal,
   ledger,
+  accountantTools,
 }: {
   source: Source;
   clientId: string;
@@ -92,6 +93,7 @@ export function Reports({
   homeSignal?: number;
   /** Demo data only: the base demo books plus manually entered transactions. */
   ledger?: DemoLedger;
+  accountantTools?: ReactNode;
 }) {
   const [selected, setSelected] = useState<ReportId | null>(null);
   useEffect(() => {
@@ -179,6 +181,7 @@ export function Reports({
             </button>
           ))}
         </div>
+        {accountantTools}
       </div>
     );
   }

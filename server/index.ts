@@ -9,7 +9,9 @@ import { createPostgresSessionStore } from './sessionStore.js'
 import { MemoryReconciliationStore, PostgresReconciliationStore } from './reconciliationStore.js'
 import { MemoryMonthEndStore, PostgresMonthEndStore } from './monthEndStore.js'
 import { MemoryDemoEntryStore, PostgresDemoEntryStore } from './demoEntryStore.js'
+import { MemoryDemoJournalStore, PostgresDemoJournalStore } from './demoJournalStore.js'
 import { MemoryDemoPaymentStore, PostgresDemoPaymentStore } from './demoPaymentStore.js'
+import { MemoryDemoWorkpaperStore, PostgresDemoWorkpaperStore } from './demoWorkpaperStore.js'
 import { MemoryDemoResetRepository, PostgresDemoResetRepository } from './demoReset.js'
 import { seedDemoRecords } from './demoSeed.js'
 
@@ -42,12 +44,16 @@ seedDemoRecords(reconciliationStore, monthEndStore).catch((error) => console.war
 
 const demoEntryStore = loaded.databaseUrl ? new PostgresDemoEntryStore(loaded.databaseUrl) : new MemoryDemoEntryStore()
 if (!demoEntryStore.durable) console.warn('DATABASE_URL is not set: manually entered demo transactions are temporary development records and will be lost on restart.')
+const demoJournalStore = loaded.databaseUrl ? new PostgresDemoJournalStore(loaded.databaseUrl) : new MemoryDemoJournalStore()
+if (!demoJournalStore.durable) console.warn('DATABASE_URL is not set: demo journal entries are temporary development records and will be lost on restart.')
 const demoPaymentStore = loaded.databaseUrl ? new PostgresDemoPaymentStore(loaded.databaseUrl) : new MemoryDemoPaymentStore()
 if (!demoPaymentStore.durable) console.warn('DATABASE_URL is not set: manually entered demo payments are temporary development records and will be lost on restart.')
+const demoWorkpaperStore = loaded.databaseUrl ? new PostgresDemoWorkpaperStore(loaded.databaseUrl) : new MemoryDemoWorkpaperStore()
+if (!demoWorkpaperStore.durable) console.warn('DATABASE_URL is not set: demo workpapers are temporary development records and will be lost on restart.')
 const demoResetRepository = loaded.databaseUrl
   ? new PostgresDemoResetRepository(loaded.databaseUrl)
-  : new MemoryDemoResetRepository({ entries: demoEntryStore, payments: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
-const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore, demoEntryStore, demoPaymentStore, demoResetRepository })
+  : new MemoryDemoResetRepository({ entries: demoEntryStore, journals: demoJournalStore, payments: demoPaymentStore, workpapers: demoWorkpaperStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
+const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore, demoEntryStore, demoJournalStore, demoPaymentStore, demoWorkpaperStore, demoResetRepository })
 
 app.listen(port, () => {
   console.log(`LedgerOps backend listening on port ${port}`)

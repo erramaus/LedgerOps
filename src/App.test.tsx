@@ -2,19 +2,28 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import App from './App'
 import { demoDataService } from './services/demoDataService'
+import { companyRequests } from './services/demoCompanyData'
 import { buildWorkTasks, summarizeTasks, type ClientRecords } from './services/workQueue'
 import { buildAutomationTasks } from './services/automationReminders'
 import { demoRecurringHistory } from './services/automationDemoData'
 import { historyFromTransactions, recurringFromHistory } from './services/recurringTransactions'
+import { ADDITIONAL_DEMO_CLIENT_IDS, getAdditionalDemoCompany } from '../shared/demoCompanyBooks'
 
 const { clients, demoClient, transactions, invoices, bills, reconciliationAccounts, clientRequests, monthEndItems } = demoDataService
+const allDemoRequests = [
+  ...clientRequests.filter((request) => !request.quickBooksId),
+  ...ADDITIONAL_DEMO_CLIENT_IDS.flatMap((clientId) => {
+    const company = getAdditionalDemoCompany(clientId)
+    return company ? companyRequests(company) : []
+  }),
+]
 
 const html = renderToStaticMarkup(<App user={{ sub: 'u1', email: 'pat@example.com', name: 'Pat Bookkeeper' }} onSignOut={() => undefined} />)
 
 const records: ClientRecords = {
   client: { id: demoClient.id, name: demoClient.name },
   transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts,
-  requests: clientRequests.filter((request) => !request.quickBooksId),
+  requests: allDemoRequests,
   monthEnd: monthEndItems,
 }
 const visibleRecurringHistory = historyFromTransactions(demoClient.id, 'demo', transactions)

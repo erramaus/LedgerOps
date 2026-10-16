@@ -20,8 +20,12 @@ import { createMonthEndRouter } from './monthEnd.js'
 import { MemoryMonthEndStore, type MonthEndStore } from './monthEndStore.js'
 import { createDemoEntryRouter } from './demoEntries.js'
 import { MemoryDemoEntryStore, type DemoEntryStore } from './demoEntryStore.js'
+import { createDemoJournalRouter } from './demoJournals.js'
+import { MemoryDemoJournalStore, type DemoJournalStore } from './demoJournalStore.js'
 import { createDemoPaymentRouter } from './demoPayments.js'
 import { MemoryDemoPaymentStore, type DemoPaymentStore } from './demoPaymentStore.js'
+import { createDemoWorkpaperRouter } from './demoWorkpapers.js'
+import { MemoryDemoWorkpaperStore, type DemoWorkpaperStore } from './demoWorkpaperStore.js'
 import { createDemoResetRouter, MemoryDemoResetRepository, type DemoResetRepository } from './demoReset.js'
 import type { QuickBooksReportKey } from './quickbooks.js'
 import { isValidIsoDate } from '../shared/period.js'
@@ -49,7 +53,9 @@ export type AppDependencies = {
   reconciliationStore?: ReconciliationStore
   monthEndStore?: MonthEndStore
   demoEntryStore?: DemoEntryStore
+  demoJournalStore?: DemoJournalStore
   demoPaymentStore?: DemoPaymentStore
+  demoWorkpaperStore?: DemoWorkpaperStore
   demoResetRepository?: DemoResetRepository
   now?: () => number
 }
@@ -212,10 +218,14 @@ export function createApp(dependencies: AppDependencies) {
   const monthEndStore = dependencies.monthEndStore ?? new MemoryMonthEndStore()
   app.use('/api/month-end', requireAuth, requireCsrf, createMonthEndRouter({ store: monthEndStore, reconciliations: reconciliationStore, quickbooks, now }))
   const demoEntryStore = dependencies.demoEntryStore ?? new MemoryDemoEntryStore()
+  const demoJournalStore = dependencies.demoJournalStore ?? new MemoryDemoJournalStore()
   const demoPaymentStore = dependencies.demoPaymentStore ?? new MemoryDemoPaymentStore()
+  const demoWorkpaperStore = dependencies.demoWorkpaperStore ?? new MemoryDemoWorkpaperStore()
   app.use('/api/demo-entries', requireAuth, requireCsrf, createDemoEntryRouter({ store: demoEntryStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
+  app.use('/api/demo-journals', requireAuth, requireCsrf, createDemoJournalRouter({ store: demoJournalStore, monthEnd: monthEndStore, now }))
   app.use('/api/demo-payments', requireAuth, requireCsrf, createDemoPaymentRouter({ store: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
-  const demoResetRepository = dependencies.demoResetRepository ?? new MemoryDemoResetRepository({ entries: demoEntryStore, payments: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
+  app.use('/api/demo-workpapers', requireAuth, requireCsrf, createDemoWorkpaperRouter({ store: demoWorkpaperStore, now }))
+  const demoResetRepository = dependencies.demoResetRepository ?? new MemoryDemoResetRepository({ entries: demoEntryStore, journals: demoJournalStore, payments: demoPaymentStore, workpapers: demoWorkpaperStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
   app.use('/api/demo-reset', requireAuth, requireCsrf, createDemoResetRouter(demoResetRepository))
 
   const fail = (response: Response, error: unknown, fallback: string) =>

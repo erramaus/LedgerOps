@@ -6,9 +6,13 @@ import type { QbReportJson } from '../shared/qbReports'
 import { createMonthEndRouter } from '../server/monthEnd'
 import { createDemoEntryRouter } from '../server/demoEntries'
 import { MemoryDemoEntryStore } from '../server/demoEntryStore'
+import { createDemoJournalRouter } from '../server/demoJournals'
+import { MemoryDemoJournalStore } from '../server/demoJournalStore'
 import { createDemoResetRouter, MemoryDemoResetRepository } from '../server/demoReset'
 import { createDemoPaymentRouter } from '../server/demoPayments'
 import { MemoryDemoPaymentStore } from '../server/demoPaymentStore'
+import { createDemoWorkpaperRouter } from '../server/demoWorkpapers'
+import { MemoryDemoWorkpaperStore } from '../server/demoWorkpaperStore'
 import { MemoryMonthEndStore } from '../server/monthEndStore'
 import type { ReconciliationStore } from '../server/reconciliationStore'
 import { previousFrom, summarizeResult, validateCompletion, type Completeness, type ReconTxn } from '../shared/reconciliation'
@@ -183,7 +187,7 @@ export class FakeDemoReset {
   private app: express.Express
 
   constructor(
-    stores: { demoEntries: FakeDemoEntries; demoPayments: FakeDemoPayments; reconciliations: FakeReconciliations; monthEnd: FakeMonthEnd },
+    stores: { demoEntries: FakeDemoEntries; demoJournals: FakeDemoJournals; demoPayments: FakeDemoPayments; demoWorkpapers: FakeDemoWorkpapers; reconciliations: FakeReconciliations; monthEnd: FakeMonthEnd },
     beforeSeed?: () => void,
   ) {
     this.app = express()
@@ -194,7 +198,9 @@ export class FakeDemoReset {
     })
     this.app.use('/api/demo-reset', createDemoResetRouter(new MemoryDemoResetRepository({
       entries: stores.demoEntries.store,
+      journals: stores.demoJournals.store,
       payments: stores.demoPayments.store,
+      workpapers: stores.demoWorkpapers.store,
       reconciliations: stores.reconciliations.asStore(),
       monthEnd: stores.monthEnd.store,
     }, beforeSeed)))
@@ -214,14 +220,16 @@ export class FakeDemoReset {
   }
 }
 
-export async function mockApp(page: Page, options: { authenticated?: boolean; quickBooks?: FakeQuickBooks; reconciliations?: FakeReconciliations; monthEnd?: FakeMonthEnd; demoEntries?: FakeDemoEntries; demoPayments?: FakeDemoPayments; demoReset?: FakeDemoReset; beforeDemoResetSeed?: () => void } = {}) {
+export async function mockApp(page: Page, options: { authenticated?: boolean; quickBooks?: FakeQuickBooks; reconciliations?: FakeReconciliations; monthEnd?: FakeMonthEnd; demoEntries?: FakeDemoEntries; demoJournals?: FakeDemoJournals; demoPayments?: FakeDemoPayments; demoWorkpapers?: FakeDemoWorkpapers; demoReset?: FakeDemoReset; beforeDemoResetSeed?: () => void } = {}) {
   const quickBooks = options.quickBooks ?? new FakeQuickBooks()
   const reconciliations = options.reconciliations ?? new FakeReconciliations()
   reconciliations.register = () => quickBooks.register
   const monthEnd = options.monthEnd ?? new FakeMonthEnd(reconciliations)
   const demoEntries = options.demoEntries ?? new FakeDemoEntries(reconciliations, monthEnd)
+  const demoJournals = options.demoJournals ?? new FakeDemoJournals(monthEnd)
   const demoPayments = options.demoPayments ?? new FakeDemoPayments(reconciliations, monthEnd)
-  const demoReset = options.demoReset ?? new FakeDemoReset({ demoEntries, demoPayments, reconciliations, monthEnd }, options.beforeDemoResetSeed)
+  const demoWorkpapers = options.demoWorkpapers ?? new FakeDemoWorkpapers()
+  const demoReset = options.demoReset ?? new FakeDemoReset({ demoEntries, demoJournals, demoPayments, demoWorkpapers, reconciliations, monthEnd }, options.beforeDemoResetSeed)
   const unexpected: string[] = []
   const json = (route: Route, body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   await page.clock.setFixedTime(new Date(`${TODAY}T12:00:00Z`))
@@ -278,9 +286,19 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; qu
     const result = await demoEntries.handle(incoming.method(), new URL(incoming.url()), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
     return json(route, result.json, result.status)
   })
+  await page.route(/\/api\/demo-journals/, async (route) => {
+    const incoming = route.request()
+    const result = await demoJournals.handle(incoming.method(), new URL(incoming.url()), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
   await page.route(/\/api\/demo-payments/, async (route) => {
     const incoming = route.request()
     const result = await demoPayments.handle(incoming.method(), new URL(incoming.url()), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
+  await page.route(/\/api\/demo-workpapers/, async (route) => {
+    const incoming = route.request()
+    const result = await demoWorkpapers.handle(incoming.method(), new URL(incoming.url()), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
     return json(route, result.json, result.status)
   })
   await page.route('**/api/demo-reset', async (route) => {
@@ -288,7 +306,7 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; qu
     const result = await demoReset.handle(incoming.method(), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
     return json(route, result.json, result.status)
   })
-  return { quickBooks, reconciliations, monthEnd, demoEntries, demoPayments, demoReset, unexpected }
+  return { quickBooks, reconciliations, monthEnd, demoEntries, demoJournals, demoPayments, demoWorkpapers, demoReset, unexpected }
 }
 
 /** The real demo-entries router, run in-process on memory stores, so browser tests exercise the actual validation and period rules. */
@@ -337,6 +355,64 @@ export class FakeDemoPayments {
       next()
     })
     this.app.use('/api/demo-payments', createDemoPaymentRouter({ store: this.store, reconciliations: reconciliations.asStore(), monthEnd: monthEnd.store, now: () => Date.parse(`${TODAY}T12:00:00Z`) }))
+  }
+
+  async handle(method: string, url: URL, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {
+    if (method !== 'GET' && csrf !== CSRF_TOKEN) {
+      this.badCsrf += 1
+      return { status: 403, json: { error: 'Invalid CSRF token.' } }
+    }
+    if (method !== 'GET') this.mutations += 1
+    const target = `${url.pathname}${url.search}`
+    const agent = request(this.app)
+    const response = method === 'GET' ? await agent.get(target) : await agent.post(target).send((body ?? {}) as object)
+    return { status: response.status, json: response.body }
+  }
+}
+
+export class FakeDemoJournals {
+  readonly store = new MemoryDemoJournalStore()
+  badCsrf = 0
+  mutations = 0
+  private app: express.Express
+
+  constructor(monthEnd: FakeMonthEnd) {
+    this.app = express()
+    this.app.use(express.json())
+    this.app.use((incoming, _response, next) => {
+      ;(incoming as unknown as { session: unknown }).session = { user: { email: 'e2e@example.com' } }
+      next()
+    })
+    this.app.use('/api/demo-journals', createDemoJournalRouter({ store: this.store, monthEnd: monthEnd.store, now: () => Date.parse(`${TODAY}T12:00:00Z`) }))
+  }
+
+  async handle(method: string, url: URL, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {
+    if (method !== 'GET' && csrf !== CSRF_TOKEN) {
+      this.badCsrf += 1
+      return { status: 403, json: { error: 'Invalid CSRF token.' } }
+    }
+    if (method !== 'GET') this.mutations += 1
+    const target = `${url.pathname}${url.search}`
+    const agent = request(this.app)
+    const response = method === 'GET' ? await agent.get(target) : await agent.post(target).send((body ?? {}) as object)
+    return { status: response.status, json: response.body }
+  }
+}
+
+export class FakeDemoWorkpapers {
+  readonly store = new MemoryDemoWorkpaperStore()
+  badCsrf = 0
+  mutations = 0
+  private app: express.Express
+
+  constructor() {
+    this.app = express()
+    this.app.use(express.json())
+    this.app.use((incoming, _response, next) => {
+      ;(incoming as unknown as { session: unknown }).session = { user: { email: 'e2e@example.com' } }
+      next()
+    })
+    this.app.use('/api/demo-workpapers', createDemoWorkpaperRouter({ store: this.store, now: () => Date.parse(`${TODAY}T12:00:00Z`) }))
   }
 
   async handle(method: string, url: URL, body: unknown, csrf?: string): Promise<{ status: number; json: unknown }> {

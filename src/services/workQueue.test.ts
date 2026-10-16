@@ -205,7 +205,7 @@ describe('client selection', () => {
       sandboxRecords({
         transactions: [qbTransaction({ id: 'quickbooks-Purchase-7', category: 'Uncategorized' })],
         accounts: [{ quickBooksId: '5', name: 'Checking', accountType: 'Bank', currentBalance: -20, active: true } satisfies LedgerAccount],
-        requests: scopeRequests([...clientRequests, { id: 'qb-request', client: 'Sandbox Company', dateCreated: 'x', question: 'Q?', status: 'Waiting for Client', quickBooksId: '7' } satisfies ClientRequest], 'quickbooks'),
+        requests: scopeRequests([...clientRequests, { id: 'qb-request', client: 'Sandbox Company', requestType: 'Transaction Question', dateCreated: 'x', question: 'Q?', status: 'Waiting for Client', quickBooksId: '7' } satisfies ClientRequest], 'quickbooks'),
       }),
     )
     expect(quickBooksTasks.length).toBeGreaterThan(0)
@@ -216,7 +216,7 @@ describe('client selection', () => {
   })
 
   it('separates demo and QuickBooks client requests by source', () => {
-    const qbRequest = { id: 'qb', client: 'Sandbox', dateCreated: 'x', question: 'Q', status: 'Waiting for Client', quickBooksId: '1' } satisfies ClientRequest
+    const qbRequest = { id: 'qb', client: 'Sandbox', requestType: 'Transaction Question', dateCreated: 'x', question: 'Q', status: 'Waiting for Client', quickBooksId: '1' } satisfies ClientRequest
     const all = [...clientRequests, qbRequest]
     expect(scopeRequests(all, 'demo').map((request) => request.id)).not.toContain('qb')
     expect(scopeRequests(all, 'quickbooks').map((request) => request.id)).toEqual(['qb'])

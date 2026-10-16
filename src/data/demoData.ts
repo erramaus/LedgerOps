@@ -100,13 +100,54 @@ export type InboxItem = {
   requestId?: string
 }
 
-export type ClientRequestStatus = 'Draft' | 'Waiting for Client' | 'Answered' | 'Client Responded' | 'Resolved'
+export type ClientRequestStatus = 'Draft' | 'Sent' | 'Waiting for Client' | 'Client Responded' | 'Completed' | 'Needs Follow-Up'
+export type ClientRequestType = 'Missing Receipt' | 'Transaction Question' | 'Statement Request' | 'Invoice Request' | 'Custom Question'
+export type ClientRequestPriority = 'High' | 'Medium' | 'Low'
+export type RequestSender = 'Bookkeeper' | 'Client'
+export type ClientDocumentType = 'Receipt' | 'Bank Statement' | 'Credit Card Statement' | 'Vendor Invoice' | 'Customer Invoice' | 'Tax Document' | 'Other Supporting Document'
+export type ClientDocumentReviewStatus = 'Pending Review' | 'Approved' | 'Rejected'
+export type ReceiptMatchStatus = 'Unmatched' | 'Suggested' | 'Matched'
+
+export type ClientRequestMessage = {
+  id: string
+  sender: RequestSender
+  senderLabel: string
+  sentAt: string
+  message: string
+  documentIds?: string[]
+}
+
+export type ClientDocument = {
+  id: string
+  client: string
+  clientId: string
+  name: string
+  type: ClientDocumentType
+  date: string
+  uploadedAt: string
+  uploadedBy: RequestSender
+  fixtureId: string
+  relatedTransactionId?: string
+  relatedTransaction?: string
+  relatedAmount?: string
+  vendor?: string
+  amount?: string
+  reviewStatus: ClientDocumentReviewStatus
+  matchStatus?: ReceiptMatchStatus
+  matchedTransactionId?: string
+  requestId?: string
+  notes?: string
+}
 
 export type ClientRequest = {
   id: string
   client: string
   clientId?: string
+  requestType: ClientRequestType
   dateCreated: string
+  dueDate?: string
+  priority?: ClientRequestPriority
+  relatedTransactionId?: string
   relatedTransaction?: string
   relatedAmount?: string
   question: string
@@ -119,6 +160,10 @@ export type ClientRequest = {
   amount?: string
   currentCategory?: string
   responseCategory?: string
+  requestedDocumentType?: ClientDocumentType
+  documentIds?: string[]
+  messages?: ClientRequestMessage[]
+  reviewNotes?: string
 }
 
 export type InvoiceStatus = 'Open' | 'Overdue' | 'Partially Paid' | 'Paid'
@@ -294,9 +339,60 @@ export const inboxItems: InboxItem[] = [
 ]
 
 export const clientRequests: ClientRequest[] = [
-  { id: 'request-home-depot', client: 'ABC Plumbing', clientId: DEMO_CLIENT_ID, dateCreated: 'August 18, 2026', relatedTransaction: 'Home Depot', relatedAmount: '$1,284.00', question: 'What was this purchase for?', status: 'Waiting for Client' },
-  { id: 'request-deposit', client: 'ABC Plumbing', clientId: DEMO_CLIENT_ID, dateCreated: 'August 16, 2026', relatedTransaction: 'Bank deposit', relatedAmount: '$2,450.00', question: 'Who sent this deposit?', status: 'Answered', answer: 'Payment from Westview Apartments for the July service call.' },
-  { id: 'request-vendor', client: 'ABC Plumbing', clientId: DEMO_CLIENT_ID, dateCreated: 'August 12, 2026', relatedTransaction: 'PlumbPro Supply', relatedAmount: '$680.00', question: 'Is this a business purchase or a personal expense?', status: 'Resolved', answer: 'Business purchase for the Oak Street job.' },
+  {
+    id: 'request-home-depot',
+    client: 'ABC Plumbing',
+    clientId: DEMO_CLIENT_ID,
+    requestType: 'Missing Receipt',
+    dateCreated: 'August 18, 2026',
+    dueDate: '2026-08-22',
+    priority: 'High',
+    relatedTransaction: 'Home Depot',
+    relatedAmount: '$1,284.00',
+    question: 'Please send the receipt for this Home Depot purchase.',
+    status: 'Waiting for Client',
+    requestedDocumentType: 'Receipt',
+    messages: [
+      { id: 'request-home-depot-msg-1', sender: 'Bookkeeper', senderLabel: 'LedgerOps Bookkeeper', sentAt: '2026-08-18T09:00:00.000Z', message: 'Please send the receipt for this Home Depot purchase so I can finish the review.' },
+    ],
+  },
+  {
+    id: 'request-deposit',
+    client: 'ABC Plumbing',
+    clientId: DEMO_CLIENT_ID,
+    requestType: 'Transaction Question',
+    dateCreated: 'August 16, 2026',
+    dueDate: '2026-08-19',
+    priority: 'Medium',
+    relatedTransaction: 'Bank deposit',
+    relatedAmount: '$2,450.00',
+    question: 'Who sent this deposit?',
+    status: 'Client Responded',
+    answer: 'Payment from Westview Apartments for the July service call.',
+    messages: [
+      { id: 'request-deposit-msg-1', sender: 'Bookkeeper', senderLabel: 'LedgerOps Bookkeeper', sentAt: '2026-08-16T10:30:00.000Z', message: 'Who sent this deposit?' },
+      { id: 'request-deposit-msg-2', sender: 'Client', senderLabel: 'ABC Plumbing', sentAt: '2026-08-16T13:45:00.000Z', message: 'Payment from Westview Apartments for the July service call.' },
+    ],
+  },
+  {
+    id: 'request-vendor',
+    client: 'ABC Plumbing',
+    clientId: DEMO_CLIENT_ID,
+    requestType: 'Transaction Question',
+    dateCreated: 'August 12, 2026',
+    dueDate: '2026-08-15',
+    priority: 'Medium',
+    relatedTransaction: 'PlumbPro Supply',
+    relatedAmount: '$680.00',
+    question: 'Is this a business purchase or a personal expense?',
+    status: 'Completed',
+    answer: 'Business purchase for the Oak Street job.',
+    messages: [
+      { id: 'request-vendor-msg-1', sender: 'Bookkeeper', senderLabel: 'LedgerOps Bookkeeper', sentAt: '2026-08-12T08:15:00.000Z', message: 'Is this a business purchase or a personal expense?' },
+      { id: 'request-vendor-msg-2', sender: 'Client', senderLabel: 'ABC Plumbing', sentAt: '2026-08-12T11:00:00.000Z', message: 'Business purchase for the Oak Street job.' },
+      { id: 'request-vendor-msg-3', sender: 'Bookkeeper', senderLabel: 'LedgerOps Bookkeeper', sentAt: '2026-08-12T14:10:00.000Z', message: 'Thanks — I recorded that explanation and completed the request.' },
+    ],
+  },
 ]
 
 export const demoInvoices: Invoice[] = [

@@ -3,7 +3,9 @@ import pg from 'pg'
 import { DEMO_RESET_CLIENTS } from '../shared/demoReset.js'
 import { buildAdditionalDemoMonthEndRecords, buildAdditionalDemoReconciliations, buildDemoMonthEndRecords, buildDemoReconciliations } from '../shared/demoMonthEnd.js'
 import type { DemoEntryStore } from './demoEntryStore.js'
+import type { DemoJournalStore } from './demoJournalStore.js'
 import type { DemoPaymentStore } from './demoPaymentStore.js'
+import type { DemoWorkpaperStore } from './demoWorkpaperStore.js'
 import type { MonthEndStore } from './monthEndStore.js'
 import type { ReconciliationStore } from './reconciliationStore.js'
 
@@ -13,7 +15,9 @@ const monthEndSeeds = [...buildDemoMonthEndRecords(), ...buildAdditionalDemoMont
 
 type ResetStores = {
   entries: DemoEntryStore
+  journals: DemoJournalStore
   payments: DemoPaymentStore
+  workpapers: DemoWorkpaperStore
   reconciliations: ReconciliationStore
   monthEnd: MonthEndStore
 }
@@ -29,7 +33,9 @@ export class MemoryDemoResetRepository implements DemoResetRepository {
     const snapshots = await Promise.all(clientIds.map(async (clientId) => ({
       clientId,
       entries: await this.stores.entries.list(clientId),
+      journals: await this.stores.journals.list(clientId),
       payments: await this.stores.payments.list(clientId),
+      workpapers: await this.stores.workpapers.list(clientId),
       reconciliations: await this.stores.reconciliations.list({ source: 'demo', clientId }),
       monthEnd: await this.stores.monthEnd.list({ source: 'demo', clientId }),
     })))
@@ -46,7 +52,9 @@ export class MemoryDemoResetRepository implements DemoResetRepository {
       await this.deleteClients(clientIds)
       for (const snapshot of snapshots) {
         for (const record of snapshot.entries) await this.stores.entries.put(record, 0)
+        for (const record of snapshot.journals) await this.stores.journals.put(record, 0)
         for (const book of snapshot.payments) await this.stores.payments.put(book, 0)
+        for (const record of snapshot.workpapers) await this.stores.workpapers.put(record, 0)
         for (const record of snapshot.reconciliations) await this.stores.reconciliations.put(record, 0)
         for (const record of snapshot.monthEnd) await this.stores.monthEnd.put(record, 0)
       }
@@ -57,7 +65,9 @@ export class MemoryDemoResetRepository implements DemoResetRepository {
   private async deleteClients(clientIds: string[]) {
     await Promise.all([
       this.stores.entries.deleteClients(clientIds),
+      this.stores.journals.deleteClients(clientIds),
       this.stores.payments.deleteClients(clientIds),
+      this.stores.workpapers.deleteClients(clientIds),
       this.stores.reconciliations.deleteDemoClients(clientIds),
       this.stores.monthEnd.deleteDemoClients(clientIds),
     ])
@@ -79,9 +89,15 @@ export class PostgresDemoResetRepository implements DemoResetRepository {
       await client.query(`CREATE TABLE IF NOT EXISTS demo_entries (
         id text PRIMARY KEY, client_id text NOT NULL, status text NOT NULL, version integer NOT NULL,
         created_at timestamptz NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
+      await client.query(`CREATE TABLE IF NOT EXISTS demo_journals (
+        id text PRIMARY KEY, client_id text NOT NULL, status text NOT NULL, version integer NOT NULL,
+        created_at timestamptz NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
       await client.query(`CREATE TABLE IF NOT EXISTS demo_payment_books (
         id text PRIMARY KEY, client_id text NOT NULL, version integer NOT NULL,
         data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
+      await client.query(`CREATE TABLE IF NOT EXISTS demo_workpapers (
+        id text PRIMARY KEY, client_id text NOT NULL, period text NOT NULL, version integer NOT NULL,
+        created_at timestamptz NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
       await client.query(`CREATE TABLE IF NOT EXISTS reconciliation_records (
         id text PRIMARY KEY, source text NOT NULL, client_id text NOT NULL, account_id text NOT NULL,
         period_end date NOT NULL, status text NOT NULL, version integer NOT NULL, data jsonb NOT NULL,
@@ -90,7 +106,9 @@ export class PostgresDemoResetRepository implements DemoResetRepository {
         id text PRIMARY KEY, source text NOT NULL, client_id text NOT NULL, period text NOT NULL,
         status text NOT NULL, version integer NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
       await client.query('DELETE FROM demo_entries WHERE client_id = ANY($1::text[])', [clientIds])
+      await client.query('DELETE FROM demo_journals WHERE client_id = ANY($1::text[])', [clientIds])
       await client.query('DELETE FROM demo_payment_books WHERE client_id = ANY($1::text[])', [clientIds])
+      await client.query('DELETE FROM demo_workpapers WHERE client_id = ANY($1::text[])', [clientIds])
       await client.query("DELETE FROM reconciliation_records WHERE source = 'demo' AND client_id = ANY($1::text[])", [clientIds])
       await client.query("DELETE FROM month_end_records WHERE source = 'demo' AND client_id = ANY($1::text[])", [clientIds])
       for (const record of reconciliationSeeds.filter((item) => clientIds.includes(item.clientId))) {

@@ -8,6 +8,7 @@ import type {
   ReconciliationAccount,
   Transaction,
 } from './bookkeepingTypes'
+import { openRequest, requestTaskPriority, requestTaskStatus, summarizeRequest } from './clientPortal'
 import { getLines, needsCategory, uncategorizedLineCount } from './transactionReview'
 
 export type DataSource = 'demo' | 'quickbooks'
@@ -210,11 +211,22 @@ function buildRequestTasks(records: ClientRecords): WorkTask[] {
   const tasks: WorkTask[] = []
   const add = taskFactory(records.client, tasks)
   records.requests
-    .filter((request) => request.status !== 'Resolved')
+    .filter((request) => openRequest(request))
     .forEach((request) => {
-      const answered = request.status === 'Answered' || request.status === 'Client Responded'
       const related = request.relatedTransaction ? ` (${[request.relatedTransaction, request.relatedAmount].filter(Boolean).join(', ')})` : ''
-      add({ id: `${request.id}-question`, type: 'Client Requests', kind: 'client-question', issue: 'Client question', description: `${request.question}${related}`, priority: answered ? 'High' : 'Medium', status: answered ? 'Ready to review' : request.status === 'Draft' ? 'Open' : 'Waiting on client', destination: 'Client Requests', action: answered ? 'Review the answer' : 'Open request', requestId: request.id })
+      add({
+        id: `${request.id}-question`,
+        type: 'Client Requests',
+        kind: 'client-question',
+        issue: request.requestType,
+        description: `${request.question}${related} · ${summarizeRequest(request)}`,
+        priority: requestTaskPriority(request),
+        status: requestTaskStatus(request),
+        dueDate: request.dueDate,
+        destination: 'Client Requests',
+        action: request.status === 'Client Responded' || request.status === 'Needs Follow-Up' ? 'Review response' : request.status === 'Draft' ? 'Finish draft' : 'Open request',
+        requestId: request.id,
+      })
     })
   return tasks
 }

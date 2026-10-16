@@ -76,7 +76,13 @@ export function companyBills(company: DemoCompanyBooks, books: DemoPaymentBook[]
 }
 
 export function companyRequests(company: DemoCompanyBooks): ClientRequest[] {
-  return company.requests.map((request) => ({ ...request, clientId: company.clientId }))
+  return company.requests.map((request) => ({
+    ...request,
+    clientId: company.clientId,
+    requestType: request.question.toLowerCase().includes('statement') ? 'Statement Request' : 'Transaction Question',
+    dueDate: '2026-08-22',
+    priority: request.question.toLowerCase().includes('statement') ? 'High' : 'Medium',
+  }))
 }
 
 export function companyReconciliationAccounts(company: DemoCompanyBooks): ReconciliationAccount[] {
