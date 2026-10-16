@@ -90,15 +90,15 @@ test.describe('a bookkeeper works through the whole month in Demo Data', () => {
       expect(await clicks(page)).toBe(1)
     })
 
-    await test.step('4. Categorizing takes two clicks, saves immediately and clears the task everywhere', async () => {
+    await test.step('4. Categorizing uses the suggested rule, saves immediately and clears the task everywhere', async () => {
       await resetClicks(page)
-      // Amazon has no earlier lines, so (correctly) no suggestion is offered and the bookkeeper chooses the category.
-      await expect(page.locator('.suggestion-box')).toHaveCount(0)
-      await page.getByLabel(/Category for Office supplies and shipping materials/).selectOption('Office Supplies')
+      const suggestion = page.getByTestId('rule-suggestion')
+      await expect(suggestion).toContainText('Amazon office supplies')
+      await suggestion.getByRole('button', { name: 'Use rule suggestion' }).click()
       await page.getByRole('button', { name: /Review 1 change/ }).click()
       await page.locator('.confirmation-box').getByRole('button', { name: 'Confirm (demo)' }).click()
       await expect(page.getByRole('status').filter({ hasText: 'Saved (demo data only)' })).toBeVisible()
-      expect(await clicks(page)).toBe(2)
+      expect(await clicks(page)).toBe(3)
       await nav(page, /Inbox/).click()
       await expect(page.locator('.inbox-row').filter({ hasText: 'Amazon has no category or account.' })).toHaveCount(0)
       expect(await number(inboxCard(page, 'Transactions to review'))).toBeLessThan(uncategorizedBefore)

@@ -19,6 +19,8 @@ export type TaskDestination = 'Transactions' | 'Receivables' | 'Payables' | 'Rec
 
 export type TaskKind =
   | 'uncategorized'
+  | 'rule-suggestion'
+  | 'missing-recurring'
   | 'missing-payee'
   | 'large-transaction'
   | 'needs-receipt'
@@ -58,6 +60,7 @@ export type WorkTask = {
   destination: TaskDestination
   action: string
   requestId?: string
+  automationId?: string
   /** The single transaction, invoice or bill this task is about, when it is about exactly one. */
   recordId?: string
 }

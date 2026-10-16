@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { demoDataService } from "./services/demoDataService";
 import type {
   Bill,
@@ -27,6 +27,7 @@ import {
   filterTasks,
   isReviewTask,
   scopeRequests,
+  sortTasks,
   summarizeTasks,
   taskPriorities,
   taskStatuses,
@@ -54,6 +55,11 @@ import {
   type ReviewFilter,
 } from "./services/transactionReview";
 import { suggestCategories } from "./services/categorySuggestions";
+import { bestRuleMatch, previewRule, seededRulesFor, validateRuleInput, type AutomationRule } from "./services/automationRules";
+import { appendUniqueEvent, readEvents, readRecurringDecisions, readRules, writeEvents, writeRecurringDecisions, writeRules, type AutomationAuditEvent, type RecurringDecision } from "./services/automationStore";
+import { buildAutomationTasks } from "./services/automationReminders";
+import { demoRecurringHistory } from "./services/automationDemoData";
+import { historyFromTransactions, recurringFromHistory, type RecurringPattern } from "./services/recurringTransactions";
 import { ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
 import { demoReconSources } from "./data/demoReconciliation";
 import { DEMO_RECONCILIATION_ACCOUNTS, demoEarlierRegister } from "../shared/demoBooks";
@@ -203,6 +209,10 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [appDataSource, setAppDataSource] = useState<AccountSource>("demo");
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
+  const [automationRules, setAutomationRules] = useState<AutomationRule[]>(() => readRules());
+  const [automationEvents, setAutomationEvents] = useState<AutomationAuditEvent[]>(() => readEvents());
+  const [recurringDecisions, setRecurringDecisions] = useState<RecurringDecision[]>(() => readRecurringDecisions());
+  const [selectedRecurring, setSelectedRecurring] = useState<RecurringPattern | null>(null);
   const [demoResetRevision, setDemoResetRevision] = useState(0);
   const resetDemoState = (clientIds: string[]) => {
     const targets = new Set(clientIds);
@@ -239,6 +249,18 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   useEffect(() => {
     quickBooksService.getStatus().then(setQuickBooksStatus).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    writeRules(automationRules);
+  }, [automationRules]);
+
+  useEffect(() => {
+    writeEvents(automationEvents);
+  }, [automationEvents]);
+
+  useEffect(() => {
+    writeRecurringDecisions(recurringDecisions);
+  }, [recurringDecisions]);
 
   // Transactions entered by hand in Demo Mode. The ref always holds the latest list so a reload right after a save sees it.
   const [demoEntries, setDemoEntries] = useState<DemoEntryRecord[]>([]);
@@ -315,6 +337,83 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
 
   const sandboxName = quickBooksCompany?.CompanyName || "QuickBooks Sandbox company";
   const todayLabel = () => new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+  const automationSource = appDataSource === "quickbooks" ? "quickbooks" : "demo";
+  const automationClientId = automationSource === "demo" ? activeDemoClientId : QUICKBOOKS_CLIENT_ID;
+  const automationClientName = automationSource === "demo" ? (activeDemoClient?.name ?? demoClient.name) : sandboxName;
+  const scopedRules = automationRules.filter((rule) => rule.source === automationSource && rule.clientId === automationClientId);
+  const scopedAutomationEvents = automationEvents.filter((event) => event.source === automationSource && event.clientId === automationClientId);
+  const scopedRecurringDecisions = recurringDecisions.filter((decision) => decision.source === automationSource && decision.clientId === automationClientId);
+
+  useEffect(() => {
+    if (scopedRules.length > 0) return;
+    const seeded = seededRulesFor(automationSource, automationClientId);
+    if (seeded.length === 0) return;
+    setAutomationRules((current) => current.some((rule) => rule.source === automationSource && rule.clientId === automationClientId) ? current : [...current, ...seeded]);
+  }, [automationClientId, automationSource, scopedRules.length]);
+
+  const logAutomation = useCallback((event: Omit<AutomationAuditEvent, "id" | "at" | "source" | "clientId">) => {
+    const saved = appendUniqueEvent({
+      ...event,
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      at: new Date().toISOString(),
+      source: automationSource,
+      clientId: automationClientId,
+    });
+    setAutomationEvents(saved);
+  }, [automationClientId, automationSource]);
+
+  const saveRule = (draft: Omit<AutomationRule, "id" | "createdAt" | "updatedAt" | "source" | "clientId"> & { id?: string }) => {
+    const now = new Date().toISOString();
+    setAutomationRules((current) => {
+      const nextRule: AutomationRule = {
+        source: automationSource,
+        clientId: automationClientId,
+        id: draft.id ?? `rule-${Date.now()}`,
+        createdAt: draft.id ? current.find((rule) => rule.id === draft.id)?.createdAt ?? now : now,
+        updatedAt: now,
+        ...draft,
+      };
+      const next = draft.id
+        ? current.map((rule) => (rule.id === draft.id ? nextRule : rule))
+        : [...current, nextRule];
+      return next;
+    });
+    logAutomation({
+      kind: draft.id ? "rule-updated" : "rule-created",
+      summary: `${draft.id ? "Updated" : "Created"} rule "${draft.name}".`,
+      referenceId: draft.id ?? draft.name,
+    });
+  };
+
+  const toggleRule = (ruleId: string, enabled: boolean) => {
+    setAutomationRules((current) => current.map((rule) => (rule.id === ruleId ? { ...rule, enabled, updatedAt: new Date().toISOString() } : rule)));
+    const changed = automationRules.find((rule) => rule.id === ruleId);
+    if (changed) {
+      logAutomation({
+        kind: enabled ? "rule-enabled" : "rule-disabled",
+        summary: `${enabled ? "Enabled" : "Disabled"} rule "${changed.name}".`,
+        referenceId: ruleId,
+      });
+    }
+  };
+
+  const deleteRule = (ruleId: string) => {
+    const doomed = automationRules.find((rule) => rule.id === ruleId);
+    setAutomationRules((current) => current.filter((rule) => rule.id !== ruleId));
+    if (doomed) logAutomation({ kind: "rule-deleted", summary: `Deleted rule "${doomed.name}".`, referenceId: ruleId });
+  };
+
+  const resolveRecurringReminder = (pattern: RecurringPattern, status: "confirmed" | "dismissed") => {
+    const decision: RecurringDecision = { reminderId: pattern.id, clientId: pattern.clientId, source: pattern.source, status, at: new Date().toISOString() };
+    setRecurringDecisions((current) => [decision, ...current.filter((item) => item.reminderId !== pattern.id)]);
+    setSelectedRecurring(null);
+    logAutomation({
+      kind: status === "confirmed" ? "recurring-confirmed" : "recurring-dismissed",
+      summary: `${status === "confirmed" ? "Confirmed" : "Dismissed"} recurring reminder for ${pattern.vendor}.`,
+      detail: `${pattern.frequency} · due ${pattern.expectedNextDate}`,
+      referenceId: pattern.id,
+    });
+  };
 
   // Anything opened for one client must not stay open for another.
   const selectClient = (client: Client | null) => {
@@ -324,6 +423,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setSelectedInvoice(null);
     setSelectedBill(null);
     setSelectedRequest(null);
+    setSelectedRecurring(null);
   };
 
   const openClient = (client: Client) => {
@@ -339,32 +439,38 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
 
   const openTransactions = () => {
     setSelectedTransaction(null);
+    setSelectedRecurring(null);
     setView("Transactions");
   };
 
   const openReconcile = () => {
+    setSelectedRecurring(null);
     if (view === "Reconcile") setHomeSignal((count) => count + 1);
     setView("Reconcile");
   };
 
-  const openMonthEnd = () => setView("Month End");
+  const openMonthEnd = () => { setSelectedRecurring(null); setView("Month End"); };
 
   const openInbox = () => {
     setSelectedRequest(null);
+    setSelectedRecurring(null);
     setView("Inbox");
   };
 
-  const openRequests = () => setView("Client Requests");
+  const openRequests = () => { setSelectedRecurring(null); setView("Client Requests"); };
 
   const openReceivables = () => {
     setSelectedInvoice(null);
+    setSelectedRecurring(null);
     setView("Receivables");
   };
   const openPayables = () => {
     setSelectedBill(null);
+    setSelectedRecurring(null);
     setView("Payables");
   };
   const openReports = () => {
+    setSelectedRecurring(null);
     if (view === "Reports") setHomeSignal((count) => count + 1);
     setView("Reports");
   };
@@ -376,7 +482,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       : destination === "Payables" ? openPayables()
       : destination === "Reports" ? openReports()
       : openRequests();
-  const openSettings = () => setView("Settings");
+  const openSettings = () => { setSelectedRecurring(null); setView("Settings"); };
 
   const changeAppDataSource = async (source: AccountSource) => {
     selectClient(null);
@@ -682,7 +788,25 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     source === "demo"
       ? { client: { id: dataClient.id, name: dataClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccountsNow, requests: scopedRequests, monthEnd: monthEndItemsNow }
       : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: monthEndItemsNow };
-  const allTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== records.client.id) : []) : [];
+  const recurringHistory = useMemo(() => {
+    const visible = historyFromTransactions(records.client.id, automationSource, records.transactions);
+    if (automationSource !== "demo") return visible;
+    const seeded = demoRecurringHistory.filter((entry) => entry.clientId === records.client.id);
+    const known = new Set(visible.map((entry) => `${entry.payee}|${entry.date}|${entry.amountCents}`));
+    return [...seeded.filter((entry) => !known.has(`${entry.payee}|${entry.date}|${entry.amountCents}`)), ...visible];
+  }, [automationSource, records.client.id, records.transactions]);
+  const recurringPatterns = useMemo(
+    () => recurringFromHistory(recurringHistory, todayIso).filter((pattern) => !scopedRecurringDecisions.some((decision) => decision.reminderId === pattern.id)),
+    [recurringHistory, scopedRecurringDecisions, todayIso],
+  );
+  const ruleSuggestionMap = useMemo(() => new Map(records.transactions.map((transaction) => [transaction.id, bestRuleMatch(scopedRules, transaction)]).filter((entry): entry is [string, NonNullable<ReturnType<typeof bestRuleMatch>>] => Boolean(entry[1]))), [records.transactions, scopedRules]);
+  const baseTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== records.client.id) : []).map((task) => {
+    if (task.kind !== "uncategorized" || !task.recordId) return task;
+    const match = ruleSuggestionMap.get(task.recordId);
+    return match ? { ...task, priority: match.rule.reviewPriority, issue: "Uncategorized transaction with rule suggestion", description: `${task.description} Rule "${match.rule.name}" suggests ${match.rule.category}.`, automationId: match.rule.id, status: "Ready to review" as const } : task;
+  }) : [];
+  const automationTasks = queueAvailable ? buildAutomationTasks(records.client, ruleSuggestionMap, recurringPatterns) : [];
+  const allTasks = sortTasks([...baseTasks, ...automationTasks]);
   const activeClient = source === "demo" && selectedClient ? clients.find((client) => client.id === selectedClient.id) ?? selectedClient : null;
   const visibleTasks = filterTasks(allTasks, { clientId: activeClient?.id });
   const hasDetail = !activeClient || activeClient.id === demoClient.id || ADDITIONAL_DEMO_CLIENT_IDS.includes(activeClient.id);
@@ -713,9 +837,16 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     : undefined;
 
   const openTask = (task: WorkTask) => {
+    setSelectedRecurring(null);
     if (source === "demo") {
       const owner = clients.find((client) => client.id === task.clientId);
       if (owner && owner.id !== selectedClient?.id) selectClient(owner);
+    }
+    if (task.kind === "missing-recurring" && task.automationId) {
+      const reminder = recurringPatterns.find((pattern) => pattern.id === task.automationId) ?? null;
+      setSelectedRecurring(reminder);
+      setView("Bookkeeping Review");
+      return;
     }
     if (task.requestId) {
       setSelectedRequest(scopedRequests.find((item) => item.id === task.requestId) ?? null);
@@ -891,7 +1022,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onOpenCompany={openCompany}
           />
         ) : view === "Bookkeeping Review" ? (
-          <BookkeepingReview source={source} tasks={visibleTasks.filter(isReviewTask)} available={queueAvailable} loading={reviewLoading} error={reviewError} onSourceChange={changeAppDataSource} onOpenTask={openTask} />
+          <BookkeepingReview source={source} tasks={visibleTasks.filter(isReviewTask)} available={queueAvailable} loading={reviewLoading} error={reviewError} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onOpenTask={openTask} />
         ) : view === "Inbox" ? (
           <Inbox tasks={visibleTasks} source={source} available={queueAvailable} loading={reviewLoading} error={reviewError} scopeLabel={activeClient?.name ?? (source === "demo" ? "All clients" : sandboxName)} onOpenTask={openTask} />
         ) : view === "Transactions" ? (
@@ -903,6 +1034,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             categoryOptions={appDataSource === "demo" ? demoCategoryOptions : quickBooksCategoryOptions}
             isLoading={quickBooksTransactionsLoading}
             error={quickBooksTransactionsError}
+            rules={scopedRules}
             onSourceChange={changeAppDataSource}
             selectedTransaction={selectedTransaction}
             onSelect={setSelectedTransaction}
@@ -911,6 +1043,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onReload={reloadQuickBooksTransactions}
             onRequestInformation={createRequest}
             onCreateQuickBooksRequest={createQuickBooksRequest}
+            onLogSuggestion={logAutomation}
           />
         ) : view === "Reconcile" ? (
           <Reconcile
@@ -1005,7 +1138,17 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onStatusChange={setQuickBooksStatus}
             onCompanyChange={setQuickBooksCompany}
             auditLog={auditLog}
-            selectedClientId={selectedClient?.id ?? null}
+            selectedClientId={automationClientId}
+            selectedClientName={automationClientName}
+            source={automationSource}
+            rules={scopedRules}
+            rulePreviewTransactions={records.transactions}
+            automationEvents={scopedAutomationEvents}
+            recurringPatterns={recurringPatterns}
+            categoryOptions={appDataSource === "demo" ? demoCategoryOptions : quickBooksCategoryOptions}
+            onSaveRule={saveRule}
+            onToggleRule={toggleRule}
+            onDeleteRule={deleteRule}
             onReset={(clientIds) => {
               resetDemoState(clientIds);
               localStorage.setItem("ledgerops-demo-reset", JSON.stringify(clientIds));
@@ -1390,6 +1533,9 @@ function BookkeepingReview({
   available,
   loading,
   error,
+  selectedRecurring,
+  onBackRecurring,
+  onResolveRecurring,
   onSourceChange,
   onOpenTask,
 }: {
@@ -1398,10 +1544,47 @@ function BookkeepingReview({
   available: boolean;
   loading: boolean;
   error: string | null;
+  selectedRecurring: RecurringPattern | null;
+  onBackRecurring: () => void;
+  onResolveRecurring: (pattern: RecurringPattern, status: "confirmed" | "dismissed") => void;
   onSourceChange: (source: ReviewSource) => void;
   onOpenTask: (task: WorkTask) => void;
 }) {
   const [filter, setFilter] = useState<"All" | TaskType>("All");
+  if (selectedRecurring) {
+    return (
+      <div className="page-content">
+        <button className="back-button" onClick={onBackRecurring}>← All review items</button>
+        <section className="review-header">
+          <div>
+            <p className="eyebrow">RECURRING REMINDER</p>
+            <h2>{selectedRecurring.vendor}</h2>
+            <p className="muted">Expected {selectedRecurring.frequency.toLowerCase()} · next due {formatDueDate(selectedRecurring.expectedNextDate)}</p>
+          </div>
+          <span className={`inbox-status ${selectedRecurring.missing ? "open" : "resolved"}`}>{selectedRecurring.confidence} confidence</span>
+        </section>
+        <section className="request-detail-layout">
+          <div className="panel request-question">
+            <h2>Why LedgerOps flagged this</h2>
+            <div className="detail-list">
+              <span><small>Typical amount</small><strong>{formatMoney(selectedRecurring.typicalAmountCents / 100)}</strong></span>
+              <span><small>Frequency</small><strong>{selectedRecurring.frequency}</strong></span>
+              <span><small>Expected next date</small><strong>{formatDueDate(selectedRecurring.expectedNextDate)}</strong></span>
+            </div>
+            <ul className="reason-list">{selectedRecurring.evidence.map((item) => <li key={item}>{item}</li>)}</ul>
+          </div>
+          <div className="panel request-details">
+            <h2>Review action</h2>
+            <p className="muted">This is a reminder only. No transaction will be created or posted automatically.</p>
+            <div className="reset-actions">
+              <button className="secondary-button" onClick={() => onResolveRecurring(selectedRecurring, "dismissed")}>Dismiss reminder</button>
+              <button className="primary-button" onClick={() => onResolveRecurring(selectedRecurring, "confirmed")}>Confirm pattern</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    );
+  }
   const visibleTasks = filterTasks(tasks, { type: filter });
   const total = (list: WorkTask[]) => list.reduce((sum, task) => sum + task.count, 0);
   const count = (priority: TaskPriority) => total(tasks.filter((task) => task.priority === priority));
@@ -2296,6 +2479,7 @@ function Transactions({
   categoryOptions,
   isLoading,
   error,
+  rules,
   onSourceChange,
   selectedTransaction,
   onSelect,
@@ -2304,6 +2488,7 @@ function Transactions({
   onReload,
   onRequestInformation,
   onCreateQuickBooksRequest,
+  onLogSuggestion,
 }: {
   transactions: Transaction[];
   quickBooksTransactions: LedgerTransaction[];
@@ -2312,6 +2497,7 @@ function Transactions({
   categoryOptions: CategoryOption[];
   isLoading: boolean;
   error: string | null;
+  rules: AutomationRule[];
   onSourceChange: (source: TransactionSource) => void;
   selectedTransaction: Transaction | null;
   onSelect: (transaction: Transaction) => void;
@@ -2320,6 +2506,7 @@ function Transactions({
   onReload: (transaction: Transaction) => Promise<void>;
   onRequestInformation: (transaction: Transaction) => void;
   onCreateQuickBooksRequest: (transaction: LedgerTransaction, question: string) => void;
+  onLogSuggestion: (event: Omit<AutomationAuditEvent, "id" | "at" | "source" | "clientId">) => void;
 }) {
   const [filter, setFilter] =
     useState<(typeof transactionFilters)[number]>("All");
@@ -2339,6 +2526,7 @@ function Transactions({
         key={current.id}
         transaction={current}
         source={source}
+        rules={rules}
         categoryOptions={categoryOptions}
         history={everything}
         ordered={scoped}
@@ -2349,6 +2537,7 @@ function Transactions({
         onReload={onReload}
         onRequestInformation={onRequestInformation}
         onCreateQuickBooksRequest={onCreateQuickBooksRequest}
+        onLogSuggestion={onLogSuggestion}
       />
     );
   }
@@ -2468,6 +2657,7 @@ function Transactions({
 function TransactionReview({
   transaction,
   source,
+  rules,
   categoryOptions,
   history,
   ordered,
@@ -2478,9 +2668,11 @@ function TransactionReview({
   onReload,
   onRequestInformation,
   onCreateQuickBooksRequest,
+  onLogSuggestion,
 }: {
   transaction: LedgerTransaction;
   source: TransactionSource;
+  rules: AutomationRule[];
   categoryOptions: CategoryOption[];
   history: Transaction[];
   ordered: Transaction[];
@@ -2491,11 +2683,13 @@ function TransactionReview({
   onReload: (transaction: Transaction) => Promise<void>;
   onRequestInformation: (transaction: Transaction) => void;
   onCreateQuickBooksRequest: (transaction: LedgerTransaction, question: string) => void;
+  onLogSuggestion: (event: Omit<AutomationAuditEvent, "id" | "at" | "source" | "clientId">) => void;
 }) {
   const isQuickBooks = source === "quickbooks";
   const lines = getLines(transaction);
   const readOnlyReason = transaction.readOnlyReason;
   const suggestions = suggestCategories(transaction, history);
+  const ruleMatch = lines.length === 1 ? bestRuleMatch(rules, transaction) : null;
   const [staged, setStaged] = useState<Record<string, string>>({});
   const [question, setQuestion] = useState("What was this purchase for?");
   const [showRequestComposer, setShowRequestComposer] = useState(false);
@@ -2503,6 +2697,8 @@ function TransactionReview({
   const [updating, setUpdating] = useState(false);
   const [updateError, setUpdateError] = useState<{ message: string; code?: string } | null>(null);
   const [savedCount, setSavedCount] = useState(0);
+  const [dismissedRule, setDismissedRule] = useState(false);
+  const loggedSuggestionRef = useRef<string | null>(null);
 
   const optionFor = (name: string) => categoryOptions.find((option) => option.name === name);
   const changes: LineChange[] = lines.flatMap((line) => {
@@ -2514,6 +2710,23 @@ function TransactionReview({
   const previous = adjacentInQueue(ordered, queue, transaction.id, "previous");
   const completedCount = Math.max(0, ordered.length - queue.length);
   const usable = lines.filter((line) => suggestions[line.id] && !staged[line.id] && optionFor(suggestions[line.id].category));
+  const ruleSuggestionId = ruleMatch ? `${transaction.id}:${ruleMatch.rule.id}` : null;
+  const ruleSuggestionName = ruleMatch?.rule.name;
+  const ruleSuggestionCategory = ruleMatch?.rule.category;
+  const ruleSuggestionMemo = ruleMatch?.rule.memo;
+  useEffect(() => {
+    setDismissedRule(false);
+    if (ruleSuggestionId && ruleSuggestionName && ruleSuggestionCategory) {
+      if (loggedSuggestionRef.current === ruleSuggestionId) return;
+      loggedSuggestionRef.current = ruleSuggestionId;
+      onLogSuggestion({
+        kind: "suggestion-generated",
+        summary: `Generated rule suggestion "${ruleSuggestionName}" for ${transaction.payee}.`,
+        detail: `Suggested ${ruleSuggestionCategory}${ruleSuggestionMemo ? ` with memo "${ruleSuggestionMemo}"` : ""}.`,
+        referenceId: ruleSuggestionId,
+      });
+    }
+  }, [onLogSuggestion, ruleSuggestionCategory, ruleSuggestionId, ruleSuggestionMemo, ruleSuggestionName, transaction.payee]);
   const stage = (lineId: string, name: string) => {
     setStaged((current) => {
       const rest = { ...current };
@@ -2531,6 +2744,14 @@ function TransactionReview({
     setUpdateError(null);
     try {
       await onApplyChanges(transaction, changes);
+      if (ruleMatch && changes.some((change) => change.category === ruleMatch.rule.category)) {
+        onLogSuggestion({
+          kind: "suggestion-accepted",
+          summary: `Accepted rule suggestion "${ruleMatch.rule.name}".`,
+          detail: `Suggested ${ruleMatch.rule.category} for ${transaction.payee}.`,
+          referenceId: `${transaction.id}:${ruleMatch.rule.id}:accepted`,
+        });
+      }
       setStaged({});
       setShowConfirmation(false);
       setSavedCount(changes.length);
@@ -2541,6 +2762,16 @@ function TransactionReview({
     }
   };
   const needsReload = isQuickBooks && updateError && ["STALE", "VERIFY_FAILED", "UNAVAILABLE"].includes(updateError.code ?? "");
+  const dismissRuleSuggestion = () => {
+    if (!ruleMatch) return;
+    setDismissedRule(true);
+    onLogSuggestion({
+      kind: "suggestion-rejected",
+      summary: `Rejected rule suggestion "${ruleMatch.rule.name}".`,
+      detail: `Kept reviewing ${transaction.payee} manually.`,
+      referenceId: `${transaction.id}:${ruleMatch.rule.id}:rejected`,
+    });
+  };
 
   return (
     <div className="page-content">
@@ -2624,6 +2855,22 @@ function TransactionReview({
                     <span><small>Confirmed category</small><strong>{isUncategorized(line.category) ? "Needs a category" : line.category}</strong></span>
                     {stagedName && <span><small>Staged change (not saved)</small><strong>{stagedName}</strong></span>}
                   </div>
+                  {ruleMatch && !readOnlyReason && !dismissedRule && !stagedName && (
+                    <div className="suggestion-box" data-testid="rule-suggestion">
+                      <small>Rule matched, not applied</small>
+                      <strong>{ruleMatch.rule.category}</strong>
+                      <span>Rule: {ruleMatch.rule.name}</span>
+                      <span>Review priority: {ruleMatch.rule.reviewPriority}</span>
+                      {ruleMatch.rule.memo && <span>Suggested memo: {ruleMatch.rule.memo}</span>}
+                      <ul className="reason-list">{ruleMatch.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                      <div className="reset-actions">
+                        <button className="secondary-button" disabled={!optionFor(ruleMatch.rule.category)} onClick={() => stage(line.id, ruleMatch.rule.category)}>
+                          {optionFor(ruleMatch.rule.category) ? "Use rule suggestion" : "Category unavailable"}
+                        </button>
+                        <button className="text-button" onClick={dismissRuleSuggestion}>Dismiss</button>
+                      </div>
+                    </div>
+                  )}
                   {suggestion && !readOnlyReason && !stagedName && (
                     <div className="suggestion-box">
                       <small>Suggested, not applied</small>
@@ -2715,6 +2962,16 @@ function Settings({
   onCompanyChange,
   auditLog,
   selectedClientId,
+  selectedClientName,
+  source,
+  rules,
+  rulePreviewTransactions,
+  automationEvents,
+  recurringPatterns,
+  categoryOptions,
+  onSaveRule,
+  onToggleRule,
+  onDeleteRule,
   onReset,
 }: {
   quickBooksStatus: QuickBooksStatus;
@@ -2722,9 +2979,34 @@ function Settings({
   onStatusChange: (status: QuickBooksStatus) => void;
   onCompanyChange: (company: QuickBooksCompany) => void;
   auditLog: AuditLogEntry[];
-  selectedClientId: string | null;
+  selectedClientId: string;
+  selectedClientName: string;
+  source: "demo" | "quickbooks";
+  rules: AutomationRule[];
+  rulePreviewTransactions: Transaction[];
+  automationEvents: AutomationAuditEvent[];
+  recurringPatterns: RecurringPattern[];
+  categoryOptions: CategoryOption[];
+  onSaveRule: (draft: Omit<AutomationRule, "id" | "createdAt" | "updatedAt" | "source" | "clientId"> & { id?: string }) => void;
+  onToggleRule: (ruleId: string, enabled: boolean) => void;
+  onDeleteRule: (ruleId: string) => void;
   onReset: (clientIds: string[]) => void;
 }) {
+  type RuleDraft = Omit<AutomationRule, "id" | "createdAt" | "updatedAt" | "source" | "clientId"> & { id?: string };
+  type RuleFormState = {
+    name: string;
+    enabled: boolean;
+    priority: number;
+    payeeContains: string;
+    descriptionContains: string;
+    minAmount: string;
+    maxAmount: string;
+    transactionKind: "Any" | "Expense" | "Deposit";
+    category: string;
+    memo: string;
+    reviewPriority: TaskPriority;
+  };
+
   const [error, setError] = useState<string | null>(null);
   const [loadingCompany, setLoadingCompany] = useState(false);
   const [resetTarget, setResetTarget] = useState(selectedClientId ?? DEMO_RESET_CLIENTS[0].id);
@@ -2733,6 +3015,21 @@ function Settings({
   const [resetLoading, setResetLoading] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
   const [resetSuccess, setResetSuccess] = useState<string | null>(null);
+  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+  const [ruleForm, setRuleForm] = useState<RuleFormState>({
+    name: "",
+    enabled: true,
+    priority: 1,
+    payeeContains: "",
+    descriptionContains: "",
+    minAmount: "",
+    maxAmount: "",
+    transactionKind: "Any" as const,
+    category: "",
+    memo: "",
+    reviewPriority: "Medium" as TaskPriority,
+  });
+  const [ruleErrors, setRuleErrors] = useState<Partial<Record<"name" | "criteria" | "amount" | "category" | "priority", string>>>({});
 
   useEffect(() => {
     quickBooksService
@@ -2783,6 +3080,81 @@ function Settings({
       setLoadingCompany(false);
     }
   };
+
+  const resetRuleForm = () => {
+    setEditingRuleId(null);
+    setRuleErrors({});
+    setRuleForm({
+      name: "",
+      enabled: true,
+      priority: Math.max(1, rules.length + 1),
+      payeeContains: "",
+      descriptionContains: "",
+      minAmount: "",
+      maxAmount: "",
+      transactionKind: "Any",
+      category: categoryOptions[0]?.name ?? "",
+      memo: "",
+      reviewPriority: "Medium",
+    });
+  };
+  const effectiveCategory = ruleForm.category || categoryOptions[0]?.name || "";
+
+  const editRule = (rule: AutomationRule) => {
+    setEditingRuleId(rule.id);
+    setRuleErrors({});
+    setRuleForm({
+      name: rule.name,
+      enabled: rule.enabled,
+      priority: rule.priority,
+      payeeContains: rule.payeeContains ?? "",
+      descriptionContains: rule.descriptionContains ?? "",
+      minAmount: rule.minAmountCents !== undefined ? (rule.minAmountCents / 100).toFixed(2) : "",
+      maxAmount: rule.maxAmountCents !== undefined ? (rule.maxAmountCents / 100).toFixed(2) : "",
+      transactionKind: rule.transactionKind,
+      category: rule.category,
+      memo: rule.memo ?? "",
+      reviewPriority: rule.reviewPriority,
+    });
+  };
+
+  const currentDraft: RuleDraft = {
+    id: editingRuleId ?? undefined,
+    name: ruleForm.name.trim(),
+    enabled: ruleForm.enabled,
+    priority: Number(ruleForm.priority),
+    payeeContains: ruleForm.payeeContains.trim() || undefined,
+    descriptionContains: ruleForm.descriptionContains.trim() || undefined,
+    minAmountCents: ruleForm.minAmount ? Math.round(Number(ruleForm.minAmount) * 100) : undefined,
+    maxAmountCents: ruleForm.maxAmount ? Math.round(Number(ruleForm.maxAmount) * 100) : undefined,
+    transactionKind: ruleForm.transactionKind,
+    category: effectiveCategory,
+    memo: ruleForm.memo.trim() || undefined,
+    reviewPriority: ruleForm.reviewPriority,
+  };
+  const previewMatches = currentDraft.name
+    ? previewRule({
+        source,
+        clientId: selectedClientId,
+        createdAt: "preview",
+        updatedAt: "preview",
+        ...currentDraft,
+        id: editingRuleId ?? "preview",
+      }, rulePreviewTransactions)
+    : [];
+
+  const submitRule = () => {
+    const errors = validateRuleInput({ source, clientId: selectedClientId, createdAt: "", updatedAt: "", ...currentDraft, id: editingRuleId ?? "draft" });
+    setRuleErrors(errors);
+    if (Object.keys(errors).length > 0) return;
+    onSaveRule(currentDraft);
+    resetRuleForm();
+  };
+
+  const sortedRules = useMemo(
+    () => [...rules].sort((left, right) => left.priority - right.priority || left.name.localeCompare(right.name)),
+    [rules],
+  );
 
   return (
     <div className="page-content">
@@ -2865,13 +3237,94 @@ function Settings({
             </div>
           )}
         </section>
+        <section className="panel settings-card automation-rules-card">
+          <h2>Automation Rules</h2>
+          <p className="muted">Create reusable suggestions for {selectedClientName}. Rules never post accounting changes automatically.</p>
+          <div className="detail-list">
+            <span><small>Scope</small><strong>{selectedClientName}</strong></span>
+            <span><small>Data source</small><strong>{source === "demo" ? "Demo data" : "QuickBooks Sandbox"}</strong></span>
+          </div>
+          <div className="queue-filters">
+            <label>
+              Rule name
+              <input value={ruleForm.name} onChange={(event) => setRuleForm({ ...ruleForm, name: event.target.value })} placeholder="Home Depot materials" />
+            </label>
+            <label>
+              Priority
+              <input type="number" min={1} value={ruleForm.priority} onChange={(event) => setRuleForm({ ...ruleForm, priority: Number(event.target.value) || 1 })} />
+            </label>
+            <label>
+              Transaction kind
+              <select value={ruleForm.transactionKind} onChange={(event) => setRuleForm({ ...ruleForm, transactionKind: event.target.value as "Any" | "Expense" | "Deposit" })}>
+                <option value="Any">Any</option>
+                <option value="Expense">Expense</option>
+                <option value="Deposit">Deposit</option>
+              </select>
+            </label>
+            <label>
+              Review priority
+              <select value={ruleForm.reviewPriority} onChange={(event) => setRuleForm({ ...ruleForm, reviewPriority: event.target.value as TaskPriority })}>
+                {taskPriorities.map((priority, index) => <option key={`${priority}-${index}`} value={priority}>{priority}</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="queue-filters">
+            <label>
+              Vendor / payee contains
+              <input value={ruleForm.payeeContains} onChange={(event) => setRuleForm({ ...ruleForm, payeeContains: event.target.value })} placeholder="Home Depot" />
+            </label>
+            <label>
+              Description or memo contains
+              <input value={ruleForm.descriptionContains} onChange={(event) => setRuleForm({ ...ruleForm, descriptionContains: event.target.value })} placeholder="materials" />
+            </label>
+            <label>
+              Minimum amount
+              <input value={ruleForm.minAmount} onChange={(event) => setRuleForm({ ...ruleForm, minAmount: event.target.value })} placeholder="0.00" />
+            </label>
+            <label>
+              Maximum amount
+              <input value={ruleForm.maxAmount} onChange={(event) => setRuleForm({ ...ruleForm, maxAmount: event.target.value })} placeholder="999.99" />
+            </label>
+          </div>
+          <div className="queue-filters">
+            <label>
+              Suggested category
+              <select value={effectiveCategory} onChange={(event) => setRuleForm({ ...ruleForm, category: event.target.value })}>
+                {categoryOptions.map((option, index) => <option key={`${option.id ?? option.name}-${index}`} value={option.name}>{option.name}</option>)}
+              </select>
+            </label>
+            <label>
+              Optional memo
+              <input value={ruleForm.memo} onChange={(event) => setRuleForm({ ...ruleForm, memo: event.target.value })} placeholder="Job materials purchase" />
+            </label>
+            <label>
+              <span>Enabled</span>
+              <input type="checkbox" checked={ruleForm.enabled} onChange={(event) => setRuleForm({ ...ruleForm, enabled: event.target.checked })} />
+            </label>
+          </div>
+          {(ruleErrors.name || ruleErrors.criteria || ruleErrors.amount || ruleErrors.category || ruleErrors.priority) && <p className="settings-error" role="alert">{ruleErrors.name || ruleErrors.criteria || ruleErrors.amount || ruleErrors.category || ruleErrors.priority}</p>}
+          <div className="reset-actions">
+            <button className="secondary-button" onClick={resetRuleForm}>{editingRuleId ? "Cancel edit" : "Clear rule"}</button>
+            <button className="primary-button" onClick={submitRule}>{editingRuleId ? "Save rule" : "Create rule"}</button>
+          </div>
+          <div className="panel automation-preview-panel" data-testid="rule-preview">
+            <h3>Preview matches</h3>
+            {previewMatches.length === 0 ? <p className="muted">No current transactions match this rule yet.</p> : <div className="audit-log-list">{previewMatches.slice(0, 5).map((match, index) => <div className="audit-log-row" key={`${match.transactionId}-${index}`}><strong>{match.payee}</strong><span>{match.date} · {match.amount}</span><span>{match.reasons[0]}</span></div>)}</div>}
+          </div>
+          <div className="audit-log-list" data-testid="rules-list">
+            {sortedRules.length === 0 ? <p className="muted">No rules saved for this client yet.</p> : sortedRules.map((rule, index) => {
+              const matches = previewRule(rule, rulePreviewTransactions);
+              return <div className="audit-log-row" key={`${rule.id}-${index}`} data-testid="rule-row"><strong>{rule.name}</strong><span>{rule.enabled ? "Enabled" : "Disabled"} · Priority {rule.priority} · {rule.reviewPriority}</span><span>{rule.category}{rule.memo ? ` · Memo: ${rule.memo}` : ""}</span><span>{matches.length} current match{matches.length === 1 ? "" : "es"}</span><div className="reset-actions"><button className="text-button" onClick={() => editRule(rule)}>Edit</button><button className="text-button" onClick={() => onToggleRule(rule.id, !rule.enabled)}>{rule.enabled ? "Disable" : "Enable"}</button><button className="text-button" onClick={() => onDeleteRule(rule.id)}>Delete</button></div></div>;
+            })}
+          </div>
+        </section>
         <section className="panel settings-card demo-reset-card">
           <h2>Reset Demo Data</h2>
           <p className="muted">Restore the original demo books for one company or all five.</p>
           <label className="reset-target-label">
             <span>Company</span>
             <select value={resetTarget} onChange={(event) => { setResetTarget(event.target.value); setResetReview(null); setResetSuccess(null); }}>
-              {DEMO_RESET_CLIENTS.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+              {DEMO_RESET_CLIENTS.map((client, index) => <option key={`${client.id}-${index}`} value={client.id}>{client.name}</option>)}
               <option value="all">All five demo companies</option>
             </select>
           </label>
@@ -2893,6 +3346,16 @@ function Settings({
           <h2>Audit Log</h2>
           <p className="muted">Local test record of QuickBooks Sandbox write attempts.</p>
           {auditLog.length === 0 ? <p className="muted">No QuickBooks updates attempted.</p> : <div className="audit-log-list">{auditLog.map((entry, index) => <div className="audit-log-row" key={`${entry.timestamp}-${index}`}><strong>{entry.result}</strong><span>{entry.transactionType} · {entry.quickBooksId}</span><span>{entry.oldCategory} → {entry.newCategory}</span><small>{new Date(entry.timestamp).toLocaleString()}</small></div>)}</div>}
+        </section>
+        <section className="panel settings-card audit-log-card">
+          <h2>Automation Activity</h2>
+          <p className="muted">Tracks rule changes and automation suggestions without marking any accounting change as posted.</p>
+          {automationEvents.length === 0 ? <p className="muted">No automation activity recorded yet.</p> : <div className="audit-log-list">{automationEvents.map((event, index) => <div className="audit-log-row" key={`${event.id}-${index}`}><strong>{event.summary}</strong><span>{event.kind}</span>{event.detail && <span>{event.detail}</span>}<small>{new Date(event.at).toLocaleString()}</small></div>)}</div>}
+        </section>
+        <section className="panel settings-card audit-log-card">
+          <h2>Recurring activity</h2>
+          <p className="muted">Expected recurring transactions are reminders only and never create entries automatically.</p>
+          {recurringPatterns.length === 0 ? <p className="muted">No recurring reminders are currently open.</p> : <div className="audit-log-list">{recurringPatterns.slice(0, 8).map((pattern, index) => <div className="audit-log-row" key={`${pattern.id}-${index}`}><strong>{pattern.vendor}</strong><span>{pattern.frequency} · typical {formatMoney(pattern.typicalAmountCents / 100)}</span><span>Expected next date {formatDueDate(pattern.expectedNextDate)} · {pattern.confidence} confidence</span></div>)}</div>}
         </section>
       </div>
     </div>

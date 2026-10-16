@@ -3,6 +3,9 @@ import { describe, expect, it } from 'vitest'
 import App from './App'
 import { demoDataService } from './services/demoDataService'
 import { buildWorkTasks, summarizeTasks, type ClientRecords } from './services/workQueue'
+import { buildAutomationTasks } from './services/automationReminders'
+import { demoRecurringHistory } from './services/automationDemoData'
+import { historyFromTransactions, recurringFromHistory } from './services/recurringTransactions'
 
 const { clients, demoClient, transactions, invoices, bills, reconciliationAccounts, clientRequests, monthEndItems } = demoDataService
 
@@ -14,7 +17,15 @@ const records: ClientRecords = {
   requests: clientRequests.filter((request) => !request.quickBooksId),
   monthEnd: monthEndItems,
 }
-const summary = summarizeTasks(buildWorkTasks(records, clients.filter((client) => client.id !== demoClient.id)))
+const visibleRecurringHistory = historyFromTransactions(demoClient.id, 'demo', transactions)
+const visibleRecurringKeys = new Set(visibleRecurringHistory.map((entry) => `${entry.payee}|${entry.date}|${entry.amountCents}`))
+const recurringHistory = [
+  ...demoRecurringHistory.filter((entry) => entry.clientId === demoClient.id && !visibleRecurringKeys.has(`${entry.payee}|${entry.date}|${entry.amountCents}`)),
+  ...visibleRecurringHistory,
+]
+const recurringPatterns = recurringFromHistory(recurringHistory, '2026-10-15')
+const baseTasks = buildWorkTasks(records, clients.filter((client) => client.id !== demoClient.id))
+const summary = summarizeTasks([...baseTasks, ...buildAutomationTasks(records.client, new Map(), recurringPatterns)])
 const metric = (label: string) => new RegExp(`${label}</span><strong>([^<]+)</strong>`).exec(html)?.[1]
 
 describe('dashboard first render (demo data)', () => {
