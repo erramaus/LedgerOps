@@ -1,17 +1,14 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { demoDataService } from "./services/demoDataService";
 import type {
   Bill,
   Client,
   ClientRequest,
-  DemoReportData,
   Invoice,
   LedgerAccount,
   LedgerBill,
   LedgerInvoice,
-  LedgerReport,
   LedgerTransaction,
-  MonthEndItem,
   ReconciliationAccount,
   ReconciliationTransaction,
   Transaction,
@@ -29,7 +26,6 @@ import {
   countByClient,
   filterTasks,
   isReviewTask,
-  monthEndPercent,
   scopeRequests,
   summarizeTasks,
   taskPriorities,
@@ -60,6 +56,17 @@ import {
 import { suggestCategories } from "./services/categorySuggestions";
 import { ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
 import { demoReconSources } from "./data/demoReconciliation";
+import { DEMO_RECONCILIATION_ACCOUNTS, demoEarlierRegister } from "../shared/demoBooks";
+import { MonthEnd } from "./MonthEnd";
+import { PeriodPicker } from "./PeriodPicker";
+import { Reports } from "./Reports";
+import { useMonthEnd } from "./useMonthEnd";
+import { toMonthEndItems } from "./services/monthEndData";
+import { completionPercent, type StepView } from "../shared/monthEnd";
+import { lastCompleteMonth, type Period } from "../shared/period";
+
+// The demo books run from May to August 2026; August is the month the live demo transactions belong to.
+const DEMO_DEFAULT_PERIOD: Period = { year: 2026, month: 8 };
 
 const {
   bills: demoBills,
@@ -68,10 +75,8 @@ const {
   demoClient,
   invoices: demoInvoices,
   transactions: demoTransactions,
-  monthEndItems,
   navigationItems,
   reconciliationAccounts,
-  reports: demoReports,
 } = demoDataService;
 
 type View =
@@ -129,9 +134,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     useState<Transaction[]>(demoTransactions);
   const [selectedTransaction, setSelectedTransaction] =
     useState<Transaction | null>(null);
-  const [monthEndChecklist, setMonthEndChecklist] =
-    useState<MonthEndItem[]>(monthEndItems);
-  const [monthEndCompleted, setMonthEndCompleted] = useState(false);
+  const [period, setPeriod] = useState<Period>(DEMO_DEFAULT_PERIOD);
   const [requests, setRequests] = useState<ClientRequest[]>(clientRequests);
   const [selectedRequest, setSelectedRequest] = useState<ClientRequest | null>(
     null,
@@ -187,7 +190,6 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [appDataSource, setAppDataSource] = useState<AccountSource>("demo");
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
-  const [monthEndHistory, setMonthEndHistory] = useState<MonthEndCompletion[]>([]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => setCurrentDate(new Date()), 60_000);
@@ -249,11 +251,20 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setView("Payables");
   };
   const openReports = () => setView("Reports");
+  const openStepView = (destination: StepView) =>
+    destination === "Transactions" ? openTransactions()
+      : destination === "Bookkeeping Review" ? setView("Bookkeeping Review")
+      : destination === "Reconcile" ? openReconcile()
+      : destination === "Receivables" ? openReceivables()
+      : destination === "Payables" ? openPayables()
+      : destination === "Reports" ? openReports()
+      : openRequests();
   const openSettings = () => setView("Settings");
 
   const changeAppDataSource = async (source: AccountSource) => {
     selectClient(null);
     setAppDataSource(source);
+    setPeriod(source === "demo" ? DEMO_DEFAULT_PERIOD : lastCompleteMonth(new Date().toISOString().slice(0, 10)));
     await Promise.all([
       changeTransactionSource(source),
       changeAccountSource(source),
@@ -315,14 +326,6 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     .filter((account) => isExpenseCategoryAccount(account) && !isUncategorized(account.name))
     .map((account) => ({ id: account.quickBooksId, name: account.name }));
   const demoCategoryOptions: CategoryOption[] = [...new Set([...DEMO_CATEGORIES, ...categoriesIn(transactions).filter((name) => !isUncategorized(name) && name !== "Split")])].map((name) => ({ name }));
-
-  const updateMonthEndItem = (updatedItem: MonthEndItem) => {
-    setMonthEndChecklist((currentItems) =>
-      currentItems.map((item) =>
-        item.id === updatedItem.id ? updatedItem : item,
-      ),
-    );
-  };
 
   const updateTransaction = (updatedTransaction: Transaction) => {
     setTransactions((currentTransactions) =>
@@ -523,22 +526,36 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   };
 
   const source = appDataSource;
-  const scopedRequests = scopeRequests(requests, source);
-  const quickBooksChecklist = reviewData ? buildQuickBooksMonthEndChecklist(reviewData, scopedRequests) : [];
+  const scopedRequests = useMemo(() => scopeRequests(requests, source), [requests, source]);
+  // The client and month are chosen once here, so every workflow keeps showing the same ones.
+  const monthEndClient = source === "demo" ? { id: (selectedClient ?? demoClient).id, name: (selectedClient ?? demoClient).name } : { id: QUICKBOOKS_CLIENT_ID, name: sandboxName };
+  const todayIso = currentDate.toISOString().slice(0, 10);
+  const monthEndView = useMonthEnd({
+    enabled: view === "Month End" || (source === "demo" && (view === "Dashboard" || view === "Clients")),
+    source,
+    client: monthEndClient,
+    period,
+    today: todayIso,
+    demoTransactions: transactions,
+    requests: scopedRequests,
+    quickBooksData: reviewData,
+    refreshToken: view,
+  });
+  const monthEndItemsNow = toMonthEndItems(monthEndView.checklist);
   // Demo records exist for one client only; QuickBooks is one connected company and is never a demo client.
   const queueAvailable = source === "demo" || reviewData !== null;
   const records: ClientRecords =
     source === "demo"
-      ? { client: { id: demoClient.id, name: demoClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts, requests: scopedRequests, monthEnd: monthEndChecklist }
-      : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: quickBooksChecklist };
+      ? { client: { id: demoClient.id, name: demoClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts, requests: scopedRequests, monthEnd: monthEndItemsNow }
+      : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: monthEndItemsNow };
   const allTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== demoClient.id) : []) : [];
   const activeClient = source === "demo" ? selectedClient : null;
   const visibleTasks = filterTasks(allTasks, { clientId: activeClient?.id });
   const hasDetail = !activeClient || activeClient.id === demoClient.id;
   const showNoDetail = Boolean(activeClient) && !hasDetail && detailViews.includes(view);
   const scopeName = source === "demo" ? demoClient.name : sandboxName;
-  const clientMonthEnd = (client: Client) => (client.id === demoClient.id ? monthEndPercent(monthEndChecklist) : client.monthEnd);
-  const openedMonthEnd = source === "demo" ? (selectedClient ? clientMonthEnd(selectedClient) : null) : monthEndPercent(quickBooksChecklist);
+  const clientMonthEnd = (client: Client) => (client.id === demoClient.id ? (monthEndView.checklist ? completionPercent(monthEndView.checklist) : null) : client.monthEnd);
+  const openedMonthEnd = source === "demo" ? (selectedClient ? clientMonthEnd(selectedClient) : null) : monthEndView.checklist ? completionPercent(monthEndView.checklist) : null;
 
   const openTask = (task: WorkTask) => {
     if (source === "demo") {
@@ -739,6 +756,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             isLoading={quickBooksAccountsLoading}
             error={quickBooksAccountsError}
             today={currentDate.toISOString().slice(0, 10)}
+            period={period}
+            onPeriodChange={setPeriod}
             onSourceChange={changeAppDataSource}
           />
         ) : view === "Receivables" ? (
@@ -770,25 +789,27 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onSourceChange={changeAppDataSource}
           />
         ) : view === "Reports" ? (
-          <Reports invoices={invoices} bills={bills} reportData={demoReports} source={appDataSource} onSourceChange={changeAppDataSource} />
+          <Reports
+            source={appDataSource}
+            clientId={monthEndClient.id}
+            clientName={monthEndClient.name}
+            period={period}
+            today={todayIso}
+            quickBooksAccounts={quickBooksAccounts.length > 0 ? quickBooksAccounts : reviewData?.accounts ?? []}
+            sourceSwitch={<AccountSourceSwitch source={appDataSource} onChange={changeAppDataSource} />}
+            onPeriodChange={setPeriod}
+            onOpenReconcile={openReconcile}
+          />
         ) : view === "Month End" ? (
           <MonthEnd
             source={appDataSource}
-            checklist={monthEndChecklist}
-            quickBooksTransactions={quickBooksTransactions}
-            quickBooksAccounts={quickBooksAccounts}
-            quickBooksInvoices={quickBooksInvoices}
-            quickBooksBills={quickBooksBills}
-            reviewRequests={scopedRequests}
-            completed={monthEndCompleted}
-            onUpdate={updateMonthEndItem}
-            history={monthEndHistory}
-            onComplete={(status) => { setMonthEndCompleted(true); setMonthEndHistory((entries) => [{ client: scopeName, month: "August 2026", dateCompleted: new Date().toLocaleDateString(), checklistStatus: status, completedBy: "LedgerOps User" }, ...entries]); }}
-            onNavigate={(destination) =>
-              destination === "Transactions"
-                ? openTransactions()
-                : destination === "Reconcile" ? openReconcile() : destination === "Receivables" ? openReceivables() : destination === "Payables" ? openPayables() : destination === "Reports" ? openReports() : openRequests()
-            }
+            clientName={monthEndClient.name}
+            period={period}
+            today={todayIso}
+            view={monthEndView}
+            onPeriodChange={setPeriod}
+            sourceSwitch={<AccountSourceSwitch source={appDataSource} onChange={changeAppDataSource} />}
+            onNavigate={openStepView}
           />
         ) : view === "Client Requests" ? (
           <ClientRequests
@@ -2631,669 +2652,6 @@ function Settings({
   );
 }
 
-const reportPeriods = [
-  "This Month",
-  "Last Month",
-  "This Quarter",
-  "This Year",
-] as const;
-type ReportPeriod = (typeof reportPeriods)[number];
-type ReportName =
-  | "Profit & Loss"
-  | "Balance Sheet"
-  | "Cash Flow"
-  | "Accounts Receivable"
-  | "Accounts Payable";
-
-function Reports({
-  invoices,
-  bills,
-  reportData,
-  source,
-  onSourceChange,
-}: {
-  invoices: Invoice[];
-  bills: Bill[];
-  reportData: DemoReportData;
-  source: AccountSource;
-  onSourceChange: (source: AccountSource) => void;
-}) {
-  const [period, setPeriod] = useState<ReportPeriod>("This Month");
-  const [selectedReport, setSelectedReport] = useState<ReportName | null>(null);
-  const [quickBooksReport, setQuickBooksReport] = useState<LedgerReport | null>(
-    null,
-  );
-  const [quickBooksInvoices, setQuickBooksInvoices] = useState<LedgerInvoice[]>(
-    [],
-  );
-  const [quickBooksBills, setQuickBooksBills] = useState<LedgerBill[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const multiplier =
-    period === "Last Month"
-      ? 0.94
-      : period === "This Quarter"
-        ? 2.88
-        : period === "This Year"
-          ? 11.6
-          : 1;
-  const scale = (amount: number) => amount * multiplier;
-  const outstanding = invoices.reduce(
-    (total, invoice) => total + invoice.amount - invoice.amountPaid,
-    0,
-  );
-  const billsDue = bills.reduce(
-    (total, bill) => total + bill.amount - bill.amountPaid,
-    0,
-  );
-  const reports: { name: ReportName; description: string }[] = [
-    {
-      name: "Profit & Loss",
-      description: "See income, expenses, and net profit.",
-    },
-    {
-      name: "Balance Sheet",
-      description: "See what this client owns and owes.",
-    },
-    { name: "Cash Flow", description: "See how cash moved during the period." },
-    {
-      name: "Accounts Receivable",
-      description: "See money customers still owe.",
-    },
-    {
-      name: "Accounts Payable",
-      description: "See bills this client needs to pay.",
-    },
-  ];
-  const loadQuickBooksReport = async (
-    name: ReportName,
-    selectedPeriod: ReportPeriod,
-  ) => {
-    setLoading(true);
-    setError(null);
-    try {
-      if (name === "Accounts Receivable")
-        setQuickBooksInvoices(await quickBooksService.getInvoices());
-      else if (name === "Accounts Payable")
-        setQuickBooksBills(await quickBooksService.getBills());
-      else {
-        const reportPath =
-          name === "Profit & Loss"
-            ? "profit-loss"
-            : name === "Balance Sheet"
-              ? "balance-sheet"
-              : "cash-flow";
-        setQuickBooksReport(
-          await quickBooksService.getReport(reportPath, selectedPeriod),
-        );
-      }
-    } catch (loadError) {
-      setError(
-        loadError instanceof Error
-          ? loadError.message
-          : "Unable to load QuickBooks report.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  };
-  const selectReport = (name: ReportName) => {
-    setSelectedReport(name);
-    if (source === "quickbooks") void loadQuickBooksReport(name, period);
-  };
-  const changeSource = (nextSource: AccountSource) => {
-    onSourceChange(nextSource);
-    setQuickBooksReport(null);
-    setError(null);
-    if (nextSource === "quickbooks" && selectedReport)
-      void loadQuickBooksReport(selectedReport, period);
-  };
-  const changePeriod = (nextPeriod: ReportPeriod) => {
-    setPeriod(nextPeriod);
-    if (source === "quickbooks" && selectedReport)
-      void loadQuickBooksReport(selectedReport, nextPeriod);
-  };
-  useEffect(() => {
-    if (source === "quickbooks" && selectedReport) {
-      void loadQuickBooksReport(selectedReport, period);
-    }
-  }, [source, selectedReport, period]);
-  if (selectedReport)
-    return source === "quickbooks" ? (
-      <QuickBooksReportDetail
-        name={selectedReport}
-        period={period}
-        report={quickBooksReport}
-        invoices={quickBooksInvoices}
-        bills={quickBooksBills}
-        loading={loading}
-        error={error}
-        onBack={() => setSelectedReport(null)}
-      />
-    ) : (
-      <ReportDetail
-        name={selectedReport}
-        period={period}
-        scale={scale}
-        outstanding={outstanding}
-        billsDue={billsDue}
-        reportData={reportData}
-        onBack={() => setSelectedReport(null)}
-      />
-    );
-
-  return (
-    <div className="page-content">
-      <section className="welcome-row">
-        <div>
-          <h2>Reports</h2>
-          <p className="muted">Simple financial reports for <ClientName />.</p>
-        </div>
-        <div className="period-selector" aria-label="Report period">
-          {reportPeriods.map((option) => (
-            <button
-              className={period === option ? "active" : ""}
-              key={option}
-              onClick={() => changePeriod(option)}
-            >
-              {option}
-            </button>
-          ))}
-        </div>
-      </section>
-      <AccountSourceSwitch source={source} onChange={changeSource} />
-      {loading && (
-        <div className="data-state-message">
-          Loading QuickBooks Sandbox report...
-        </div>
-      )}
-      {error && <div className="data-state-message error">{error}</div>}
-      <div className="report-card-grid">
-        {reports.map((report) => (
-          <button
-            className="report-card"
-            key={report.name}
-            onClick={() => selectReport(report.name)}
-          >
-            <span className="report-icon">▥</span>
-            <span className="report-card-copy">
-              <strong>{report.name}</strong>
-              <small>{period} · August 2026</small>
-              <span>{report.description}</span>
-            </span>
-            <span className="report-open">Open report →</span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function QuickBooksReportDetail({
-  name,
-  period,
-  report,
-  invoices,
-  bills,
-  loading,
-  error,
-  onBack,
-}: {
-  name: ReportName;
-  period: ReportPeriod;
-  report: LedgerReport | null;
-  invoices: LedgerInvoice[];
-  bills: LedgerBill[];
-  loading: boolean;
-  error: string | null;
-  onBack: () => void;
-}) {
-  const row = (label: string, amount: number, bold = false) => (
-    <div className={`report-row ${bold ? "bold" : ""}`}>
-      <span>{label}</span>
-      <strong>{formatMoney(amount)}</strong>
-    </div>
-  );
-  const total = (label: string) =>
-    report?.totals.find((line) =>
-      line.label.toLowerCase().includes(label.toLowerCase()),
-    );
-  const reportContent = report
-    ? report.sections.map((section) => (
-        <div className="report-section" key={section.label}>
-          <h3>{section.label}</h3>
-          {section.lines.map((line) => row(line.label, line.amount))}
-        </div>
-      ))
-    : null;
-  const invoiceOutstanding = invoices.reduce(
-    (sum, invoice) => sum + invoice.amount - invoice.amountPaid,
-    0,
-  );
-  const billOutstanding = bills.reduce(
-    (sum, bill) => sum + bill.amount - bill.amountPaid,
-    0,
-  );
-  const summaryContent =
-    name === "Accounts Receivable" ? (
-      <div className="report-section">
-        {row("Total Outstanding", invoiceOutstanding, true)}
-        {row(
-          "Current",
-          invoices
-            .filter((invoice) => invoice.status === "Open")
-            .reduce(
-              (sum, invoice) => sum + invoice.amount - invoice.amountPaid,
-              0,
-            ),
-        )}
-        {row(
-          "Overdue",
-          invoices
-            .filter((invoice) => invoice.status === "Overdue")
-            .reduce(
-              (sum, invoice) => sum + invoice.amount - invoice.amountPaid,
-              0,
-            ),
-        )}
-      </div>
-    ) : name === "Accounts Payable" ? (
-      <div className="report-section">
-        {row("Total Bills Due", billOutstanding, true)}
-        {row(
-          "Due Soon",
-          bills
-            .filter((bill) => bill.status === "Due Soon")
-            .reduce((sum, bill) => sum + bill.amount - bill.amountPaid, 0),
-        )}
-        {row(
-          "Overdue",
-          bills
-            .filter((bill) => bill.status === "Overdue")
-            .reduce((sum, bill) => sum + bill.amount - bill.amountPaid, 0),
-        )}
-      </div>
-    ) : (
-      <>
-        {reportContent}
-        <div className="report-total">
-          <span>
-            {name === "Profit & Loss"
-              ? "Net Profit"
-              : name === "Cash Flow"
-                ? "Ending Cash"
-                : "Total Liabilities + Equity"}
-          </span>
-          <strong>
-            {formatMoney(
-              total(
-                name === "Profit & Loss"
-                  ? "net income"
-                  : name === "Cash Flow"
-                    ? "ending cash"
-                    : "liabilities and equity",
-              )?.amount || 0,
-            )}
-          </strong>
-        </div>
-      </>
-    );
-  return (
-    <div className="page-content report-detail-page">
-      <div className="report-detail-toolbar">
-        <button className="back-button" onClick={onBack}>
-          ← All reports
-        </button>
-        <span className="read-only-label">QuickBooks Sandbox · Read only</span>
-        <button
-          className="secondary-button print-button"
-          onClick={() => window.print()}
-        >
-          Print report <span>⎙</span>
-        </button>
-      </div>
-      <section className="report-detail-heading">
-        <div>
-          <p className="eyebrow"><ClientName upper /> · {period.toUpperCase()}</p>
-          <h2>{name}</h2>
-          <p className="muted">Live QuickBooks Online report</p>
-        </div>
-      </section>
-      {loading && (
-        <div className="data-state-message">
-          Loading QuickBooks Sandbox report...
-        </div>
-      )}
-      {error && <div className="data-state-message error">{error}</div>}
-      <div className="report-paper">{summaryContent}</div>
-    </div>
-  );
-}
-
-function ReportDetail({
-  name,
-  period,
-  scale,
-  outstanding,
-  billsDue,
-  reportData,
-  onBack,
-}: {
-  name: ReportName;
-  period: ReportPeriod;
-  scale: (amount: number) => number;
-  outstanding: number;
-  billsDue: number;
-  reportData: DemoReportData;
-  onBack: () => void;
-}) {
-  const printReport = () => window.print();
-  const income = scale(84260);
-  const expenses = scale(52418);
-  const netProfit = income - expenses;
-  const row = (label: string, amount: number, bold = false) => (
-    <div className={`report-row ${bold ? "bold" : ""}`}>
-      <span>{label}</span>
-      <strong>{formatMoney(amount)}</strong>
-    </div>
-  );
-  const section = (
-    title: string,
-    rows: { label: string; amount: number }[],
-    total: { label: string; amount: number },
-  ) => (
-    <div className="report-section">
-      <h3>{title}</h3>
-      {rows.map((line) => row(line.label, scale(line.amount)))}
-      {row(total.label, scale(total.amount), true)}
-    </div>
-  );
-
-  let content: ReactNode;
-  if (name === "Profit & Loss")
-    content = (
-      <>
-        {section("Income", reportData.income, {
-          label: "Total Income",
-          amount: 84260,
-        })}
-        {section("Expenses", reportData.expenses, {
-          label: "Total Expenses",
-          amount: 52418,
-        })}
-        <div className="report-total profit">
-          <span>Net Profit</span>
-          <strong>{formatMoney(netProfit)}</strong>
-        </div>
-      </>
-    );
-  else if (name === "Balance Sheet")
-    content = (
-      <>
-        {section(
-          "Assets",
-          [
-            ...reportData.assets,
-            { label: "Accounts Receivable", amount: outstanding },
-          ],
-          { label: "Total Assets", amount: 79661.72 + outstanding },
-        )}
-        {section(
-          "Liabilities",
-          [
-            ...reportData.liabilities,
-            { label: "Accounts Payable", amount: billsDue },
-          ],
-          { label: "Total Liabilities", amount: 18010.3 + billsDue },
-        )}
-        {section(
-          "Equity",
-          [
-            ...reportData.equity,
-            { label: "Current Year Earnings", amount: netProfit },
-          ],
-          { label: "Total Equity", amount: 25000 + netProfit },
-        )}
-        <div className="report-total">
-          <span>Total Liabilities + Equity</span>
-          <strong>{formatMoney(43010.3 + billsDue + netProfit)}</strong>
-        </div>
-      </>
-    );
-  else if (name === "Cash Flow")
-    content = (
-      <div className="report-section cash-flow-report">
-        {reportData.cashFlow.map((line) =>
-          row(line.label, scale(line.amount), true),
-        )}
-        {row("Net Change in Cash", scale(26100), true)}
-        {row("Ending Cash Balance", scale(48421.72), true)}
-      </div>
-    );
-  else if (name === "Accounts Receivable")
-    content = (
-      <div className="report-section">
-        {row("Total Outstanding", outstanding, true)}
-        {row("Current", scale(4780))}
-        {row("1-30 Days Overdue", scale(2840))}
-        {row("31-60 Days Overdue", scale(0))}
-        {row("60+ Days Overdue", scale(0))}
-      </div>
-    );
-  else
-    content = (
-      <div className="report-section">
-        {row("Total Bills Due", billsDue, true)}
-        {row("Due This Week", scale(986.44))}
-        {row("Overdue", scale(286))}
-        {row("Paid This Month", scale(210))}
-      </div>
-    );
-
-  return (
-    <div className="page-content report-detail-page">
-      <div className="report-detail-toolbar">
-        <button className="back-button" onClick={onBack}>
-          ← All reports
-        </button>
-        <button className="secondary-button print-button" onClick={printReport}>
-          Print report <span>⎙</span>
-        </button>
-      </div>
-      <section className="report-detail-heading">
-        <div>
-          <p className="eyebrow"><ClientName upper /> · {period.toUpperCase()}</p>
-          <h2>{name}</h2>
-          <p className="muted">August 2026 · Fake demo report</p>
-        </div>
-      </section>
-      <div className="report-paper">{content}</div>
-    </div>
-  );
-}
-
-function buildQuickBooksMonthEndChecklist(data: QuickBooksReviewData, requests: ClientRequest[]): MonthEndItem[] {
-  const reviewItems = buildReviewTasks({ client: { id: QUICKBOOKS_CLIENT_ID, name: "QuickBooks Sandbox" }, transactions: data.transactions, invoices: data.invoices, bills: data.bills, accounts: data.accounts, reconciliations: [], requests: [], monthEnd: [] });
-  const transactionIssues = reviewItems.filter((item) => item.type === "Transactions");
-  const hasIssue = (kind: WorkTask["kind"]) => reviewItems.some((review) => review.kind === kind);
-  const overdueInvoices = data.invoices.filter((invoice) => invoice.status === "Overdue");
-  const overdueBills = data.bills.filter((bill) => bill.status === "Overdue");
-  const openRequests = requests.filter((request) => request.status !== "Resolved");
-  const item = (id: string, label: string, status: MonthEndItem["status"], explanation?: string, relatedView?: MonthEndItem["relatedView"], relatedLabel?: string): MonthEndItem => ({ id, label, status, explanation, relatedView, relatedLabel });
-  return [
-    item("qb-bank", "Bank accounts reviewed", "Not Available", "Account review tracking is not available yet.", "Reconcile", "Go to Reconcile"),
-    item("qb-card", "Credit card accounts reviewed", "Not Available", "Account review tracking is not available yet.", "Reconcile", "Go to Reconcile"),
-    item("qb-transactions", "Transactions needing review", transactionIssues.length === 0 ? "Complete" : "Needs Attention", transactionIssues.length ? `${transactionIssues.length} transactions still need attention` : undefined, "Transactions", "Go to Transactions"),
-    item("qb-category", "Missing categories", hasIssue("uncategorized") ? "Needs Attention" : "Complete", hasIssue("uncategorized") ? "Some transactions still need categories." : undefined, "Transactions", "Go to Transactions"),
-    item("qb-payee", "Missing payees", hasIssue("missing-payee") ? "Needs Attention" : "Complete", hasIssue("missing-payee") ? "Some transactions have unknown payees." : undefined, "Transactions", "Go to Transactions"),
-    item("qb-receipts", "Missing receipts", hasIssue("needs-receipt") ? "Needs Attention" : "Complete", hasIssue("needs-receipt") ? "Some transactions may need receipts." : undefined, "Transactions", "Go to Transactions"),
-    item("qb-invoices", "Overdue invoices reviewed", overdueInvoices.length === 0 ? "Complete" : "Needs Attention", overdueInvoices.length ? `${overdueInvoices.length} overdue invoices need review` : undefined, "Receivables", "Go to Receivables"),
-    item("qb-bills", "Overdue bills reviewed", overdueBills.length === 0 ? "Complete" : "Needs Attention", overdueBills.length ? `${overdueBills.length} overdue bills need review` : undefined, "Payables", "Go to Payables"),
-    item("qb-requests", "Open client requests", openRequests.length === 0 ? "Complete" : "Needs Attention", openRequests.length ? `${openRequests.length} questions are waiting for client responses` : undefined, "Client Requests", "Go to Client Requests"),
-    item("qb-reconcile", "Reconciliation issues", "Not Available", "QuickBooks reconciliation statement data is not available yet.", "Reconcile", "Go to Reconcile"),
-    item("qb-pnl", "Profit & Loss reviewed", "Not Available", "Report review tracking is not available yet.", "Reports", "Go to Reports"),
-    item("qb-balance", "Balance Sheet reviewed", "Not Available", "Report review tracking is not available yet.", "Reports", "Go to Reports"),
-  ];
-}
-
-function MonthEnd({
-  source,
-  checklist,
-  quickBooksTransactions,
-  quickBooksAccounts,
-  quickBooksInvoices,
-  quickBooksBills,
-  reviewRequests,
-  completed,
-  onUpdate,
-  onComplete,
-  history,
-  onNavigate,
-}: {
-  source: AccountSource;
-  checklist: MonthEndItem[];
-  quickBooksTransactions: LedgerTransaction[];
-  quickBooksAccounts: LedgerAccount[];
-  quickBooksInvoices: LedgerInvoice[];
-  quickBooksBills: LedgerBill[];
-  reviewRequests: ClientRequest[];
-  completed: boolean;
-  onUpdate: (item: MonthEndItem) => void;
-  onComplete: (status: string) => void;
-  history: MonthEndCompletion[];
-  onNavigate: (destination: NonNullable<MonthEndItem["relatedView"]>) => void;
-}) {
-  const activeChecklist = source === "quickbooks" ? buildQuickBooksMonthEndChecklist({ transactions: quickBooksTransactions, accounts: quickBooksAccounts, invoices: quickBooksInvoices, bills: quickBooksBills }, reviewRequests) : checklist;
-  const completedCount = activeChecklist.filter(
-    (item) => item.status === "Complete",
-  ).length;
-  const progress = Math.round((completedCount / activeChecklist.length) * 100);
-  const attentionCount = activeChecklist.filter(
-    (item) => item.status !== "Complete",
-  ).length;
-  const [selectedItemId, setSelectedItemIdState] = useState<string | null>(
-    null,
-  );
-  const selectedItem = activeChecklist.find((item) => item.id === selectedItemId);
-  const setSelectedItemId = (nextId: string | null) => {
-    if (selectedItemId && nextId === null) {
-      const item = activeChecklist.find(
-        (checklistItem) => checklistItem.id === selectedItemId,
-      );
-      if (item && item.status !== "Complete")
-        onUpdate({ ...item, status: "Complete" });
-    }
-    setSelectedItemIdState(nextId);
-  };
-
-  return (
-    <div className="page-content">
-      <section className="month-end-hero">
-        <div>
-          <p className="eyebrow"><ClientName upper /> · AUGUST 2026</p>
-          <h2>Month End</h2>
-          <p className="muted">
-            Finish the monthly checklist and get the books ready.
-          </p>
-        </div>
-        <div className="month-progress-summary">
-          <span>Month-End Progress</span>
-          <strong>{completed ? "100%" : `${progress}%`} Complete</strong>
-          <div className="large-progress">
-            <span style={{ width: `${completed ? 100 : progress}%` }} />
-          </div>
-        </div>
-      </section>
-      {completed ? (
-        <div className="ready-banner">
-          <div>
-            <h2>August books are ready</h2>
-            <p className="muted">
-              <ClientName />'s August 2026 month end is complete.
-            </p>
-          </div>
-          <span>✓</span>
-        </div>
-      ) : (
-        <div className="month-attention-summary">
-          <strong>{attentionCount}</strong>{" "}
-          {attentionCount === 1 ? "item needs" : "items need"} attention
-        </div>
-      )}
-      {source === "quickbooks" && <div className={`reconcile-status ${progress === 100 ? "ready" : "problem"}`}>{progress === 100 ? "Ready to Close" : "Not Ready to Close"}</div>}
-      <section className="panel month-checklist">
-        <div className="panel-heading">
-          <div>
-            <h2>Month-end checklist</h2>
-            <p className="muted">Click an item to see its current status.</p>
-          </div>
-          <span className="count-pill">
-            {completedCount} of {activeChecklist.length} complete
-          </span>
-        </div>
-        <div className="month-items">
-          {activeChecklist.map((item) => (
-            <button
-              className={`month-item ${item.status.toLowerCase().replaceAll(" ", "-")}`}
-              key={item.id}
-              onClick={() =>
-                setSelectedItemId(selectedItemId === item.id ? null : item.id)
-              }
-            >
-              <span
-                className={`month-check ${item.status === "Complete" ? "checked" : ""}`}
-              >
-                {item.status === "Complete"
-                  ? "✓"
-                  : item.status === "Needs Attention"
-                    ? "!"
-                    : ""}
-              </span>
-              <span className="month-item-label">
-                <strong>{item.label}</strong>
-                {selectedItemId === item.id && item.explanation && (
-                  <span className="month-explanation">{item.explanation}</span>
-                )}
-              </span>
-              <span
-                className={`month-status ${item.status.toLowerCase().replaceAll(" ", "-")}`}
-              >
-                {item.status}
-              </span>
-              <span className="row-arrow">
-                {selectedItemId === item.id ? "⌃" : "→"}
-              </span>
-            </button>
-          ))}
-        </div>
-        {selectedItem?.explanation && selectedItem.relatedView && (
-          <div className="month-related-action">
-            <div>
-              <strong>{selectedItem.explanation}</strong>
-              <span>Take care of this item in the related section.</span>
-            </div>
-            <button
-              className="secondary-button"
-              onClick={() => onNavigate(selectedItem.relatedView!)}
-            >
-              {selectedItem.relatedLabel} <span>→</span>
-            </button>
-          </div>
-        )}
-      </section>
-      <button
-        className="primary-button complete-month-button"
-        disabled={progress !== 100 || completed}
-        onClick={() => onComplete(activeChecklist.map((item) => `${item.label}: ${item.status}`).join("; "))}
-      >
-        {completed ? "Month End Complete" : "Complete Month End"}{" "}
-        <span>{completed ? "✓" : "→"}</span>
-      </button>
-      {history.length > 0 && <section className="panel month-history"><h2>Month-End History</h2>{history.map((entry, index) => <div className="audit-log-row" key={`${entry.dateCompleted}-${index}`}><strong>{entry.month}</strong><span>{entry.client} · Completed {entry.dateCompleted}</span><span>{entry.checklistStatus}</span><small>Completed by: {entry.completedBy}</small></div>)}</section>}
-    </div>
-  );
-}
-
 function Reconcile({
   source,
   clientRef,
@@ -3301,6 +2659,8 @@ function Reconcile({
   isLoading,
   error,
   today,
+  period,
+  onPeriodChange,
   onSourceChange,
 }: {
   source: AccountSource;
@@ -3309,6 +2669,8 @@ function Reconcile({
   isLoading: boolean;
   error: string | null;
   today: string;
+  period: Period;
+  onPeriodChange: (period: Period) => void;
   onSourceChange: (source: AccountSource) => void;
 }) {
   const options: ReconAccount[] =
@@ -3327,7 +2689,9 @@ function Reconcile({
     if (source === "quickbooks") return quickBooksService.getReconciliationData(accountId, through);
     const item = demoReconSources.find((candidate) => candidate.id === accountId);
     if (!item) throw new Error("That demo account was not found.");
-    return { transactions: item.transactions, completeness: { complete: true, reasons: [] } };
+    const ledgerId = DEMO_RECONCILIATION_ACCOUNTS.find((account) => account.id === accountId)?.ledgerId as "checking" | "card" | undefined;
+    const earlier = ledgerId ? demoEarlierRegister(ledgerId).filter((transaction) => transaction.date <= through) : [];
+    return { transactions: [...earlier, ...item.transactions.filter((transaction) => transaction.date <= through)], completeness: { complete: true, reasons: [] } };
   };
 
   return (
@@ -3337,7 +2701,7 @@ function Reconcile({
           <h2>Reconcile</h2>
           <p className="muted">Make sure each account matches its statement.</p>
         </div>
-        <span className="count-pill"><ClientName /></span>
+        <PeriodPicker period={period} today={today} onChange={onPeriodChange} />
       </section>
       <AccountSourceSwitch source={source} onChange={onSourceChange} />
       {isLoading && (
@@ -3346,7 +2710,7 @@ function Reconcile({
         </div>
       )}
       {error && <div className="data-state-message error">{error}</div>}
-      <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} />
+      <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} period={period} />
     </div>
   );
 }

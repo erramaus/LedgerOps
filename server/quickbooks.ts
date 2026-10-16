@@ -512,3 +512,72 @@ async function queryAccounts() {
   const result = await response.json() as QuickBooksQueryResponse
   return result.QueryResponse?.Account || []
 }
+
+export const REPORT_PATHS = {
+  'profit-loss': 'ProfitAndLoss',
+  'balance-sheet': 'BalanceSheet',
+  'cash-flow': 'CashFlow',
+  'trial-balance': 'TrialBalance',
+  'general-ledger': 'GeneralLedger',
+  'ar-aging': 'AgedReceivables',
+  'ap-aging': 'AgedPayables',
+} as const
+export type QuickBooksReportKey = keyof typeof REPORT_PATHS
+
+/** Read-only: one QuickBooks report for exact dates. The response is passed on untouched so every figure stays QuickBooks' own. */
+export async function getReportData(report: QuickBooksReportKey, start: string, end: string) {
+  if (!tokens) throw new Error('QuickBooks is not connected.')
+  if (tokens.expiresAt <= Date.now()) throw new Error('QuickBooks access token has expired. Reconnect to continue.')
+  const reportPath = REPORT_PATHS[report]
+  const url = new URL(`${sandboxBaseUrl}/v3/company/${tokens.realmId}/reports/${reportPath}`)
+  if (report === 'ar-aging' || report === 'ap-aging') {
+    url.searchParams.set('report_date', end)
+  } else {
+    url.searchParams.set('start_date', start)
+    url.searchParams.set('end_date', end)
+  }
+  if (report === 'profit-loss' || report === 'balance-sheet' || report === 'cash-flow') url.searchParams.set('accounting_method', 'Accrual')
+  url.searchParams.set('minorversion', '75')
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: 'application/json' } })
+  if (!response.ok) throw new Error(`QuickBooks ${reportPath} report failed (${response.status}).`)
+  const result = (await response.json()) as { Header?: unknown; Columns?: unknown; Rows?: unknown }
+  return { Header: result.Header, Columns: result.Columns, Rows: result.Rows }
+}
+
+type ListCompleteness = { complete: boolean; reasons: string[] }
+
+async function countEntity(entity: string): Promise<number | null> {
+  if (!tokens) throw new Error('QuickBooks is not connected.')
+  const url = new URL(`${sandboxBaseUrl}/v3/company/${tokens.realmId}/query`)
+  url.searchParams.set('query', `SELECT COUNT(*) FROM ${entity}`)
+  url.searchParams.set('minorversion', '75')
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: 'application/json' } })
+  if (!response.ok) return null
+  const count = ((await response.json()) as { QueryResponse?: { totalCount?: number } }).QueryResponse?.totalCount
+  return typeof count === 'number' ? count : null
+}
+
+/**
+ * The list endpoints read a single page per record type. This counts what QuickBooks holds and says whether
+ * every record fits in the page that was read; if the count cannot be obtained the lists are NOT reported complete.
+ */
+export async function getListCompleteness() {
+  if (!tokens) throw new Error('QuickBooks is not connected.')
+  if (tokens.expiresAt <= Date.now()) throw new Error('QuickBooks access token has expired. Reconnect to continue.')
+  const check = async (entities: string[], limit: number): Promise<ListCompleteness> => {
+    const reasons: string[] = []
+    const counts = await Promise.all(entities.map((entity) => countEntity(entity).catch(() => null)))
+    counts.forEach((count, index) => {
+      if (count === null) reasons.push(`The number of ${entities[index]} records could not be confirmed.`)
+      else if (count > limit) reasons.push(`QuickBooks has ${count} ${entities[index]} records but only the first ${limit} are loaded.`)
+    })
+    return { complete: reasons.length === 0, reasons }
+  }
+  const [transactions, invoices, bills, accounts] = await Promise.all([
+    check(['Purchase', 'Check', 'CreditCardPayment', 'Deposit', 'Payment', 'Transfer'], 100),
+    check(['Invoice'], 1000),
+    check(['Bill'], 1000),
+    check(['Account'], 1000),
+  ])
+  return { transactions, invoices, bills, accounts }
+}

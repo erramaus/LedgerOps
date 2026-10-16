@@ -1,3 +1,6 @@
+import { demoClientFigures } from '../../shared/demoMonthEnd'
+import { formatCents } from '../../shared/reconciliation'
+
 export type Client = {
   id: string
   name: string
@@ -143,6 +146,9 @@ export type Bill = {
   status: BillStatus
 }
 
+// Calculated from the demo ledger so the dashboard can never disagree with the reports.
+const demoAugust = demoClientFigures({ year: 2026, month: 8 })
+
 export const demoClient: Client = {
   id: 'abc-plumbing',
   name: 'ABC Plumbing',
@@ -152,12 +158,12 @@ export const demoClient: Client = {
   attention: 6,
   reconciliation: 'Ready to complete',
   monthEnd: 90,
-  income: '$84,260',
-  expenses: '$52,418',
-  profit: '$31,842',
-  bankBalance: '$48,421.72',
-  accountsReceivable: '$12,840',
-  accountsPayable: '$6,210',
+  income: formatCents(demoAugust.incomeCents),
+  expenses: formatCents(demoAugust.expensesCents),
+  profit: formatCents(demoAugust.profitCents),
+  bankBalance: formatCents(demoAugust.bankBalanceCents),
+  accountsReceivable: formatCents(demoAugust.receivableCents),
+  accountsPayable: formatCents(demoAugust.payableCents),
 }
 
 export const clients: Client[] = [

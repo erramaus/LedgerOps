@@ -17,6 +17,7 @@ import {
   type StatementLine,
 } from "../shared/reconciliation";
 import { applyMapping, parseCsv, suggestMapping, type CsvMapping } from "../shared/statementCsv";
+import { periodEnd, periodStart, type Period } from "../shared/period";
 import { buildReconciliationCsv, reportFileName } from "./services/reconciliationReport";
 import { ReconciliationApiError, reconciliationService, type RecordSummary, type Storage } from "./services/reconciliationService";
 
@@ -62,12 +63,15 @@ export function ReconcileWorkspace({
   accounts,
   loadAccountData,
   today,
+  period,
 }: {
   source: Source;
   client: { id: string; name: string };
   accounts: ReconAccount[];
   loadAccountData: (accountId: string, through: string) => Promise<AccountData>;
   today: string;
+  /** The accounting month chosen elsewhere in the app; statements default to it. */
+  period?: Period;
 }) {
   const [step, setStep] = useState<Step>("accounts");
   const [storage, setStorage] = useState<Storage | null>(null);
@@ -110,17 +114,23 @@ export function ReconcileWorkspace({
 
   const chooseAccount = (chosen: ReconAccount) => {
     const last = completedFor(chosen.id).slice(-1)[0];
-    const month = previousMonth(today);
+    const month = period ? { start: periodStart(period), end: periodEnd(period) } : previousMonth(today);
     setAccount(chosen);
     setWork(null);
     setError(null);
     setNotice(null);
+    const d = chosen.defaults;
+    const demoMatchesMonth = Boolean(d) && d!.periodEnd === month.end;
     if (last) {
-      setForm({ periodStart: addDays(last.periodEnd, 1), periodEnd: month.end, statementDate: month.end, beginning: centsToInput(last.endingCents), ending: "", openingConfirmed: false });
+      const start = addDays(last.periodEnd, 1);
+      setForm({ periodStart: start, periodEnd: month.end, statementDate: month.end, beginning: centsToInput(last.endingCents), ending: demoMatchesMonth ? centsToInput(d!.endingCents) : "", openingConfirmed: false });
       setStatementLines([]);
-    } else if (chosen.defaults) {
-      const d = chosen.defaults;
+    } else if (d && demoMatchesMonth) {
       setForm({ periodStart: d.periodStart, periodEnd: d.periodEnd, statementDate: d.statementDate, beginning: centsToInput(d.beginningCents), ending: centsToInput(d.endingCents), openingConfirmed: false });
+      setStatementLines([]);
+    } else if (chosen.defaults && !period) {
+      const defaults = chosen.defaults;
+      setForm({ periodStart: defaults.periodStart, periodEnd: defaults.periodEnd, statementDate: defaults.statementDate, beginning: centsToInput(defaults.beginningCents), ending: centsToInput(defaults.endingCents), openingConfirmed: false });
       setStatementLines([]);
     } else {
       setForm({ periodStart: month.start, periodEnd: month.end, statementDate: month.end, beginning: "", ending: "", openingConfirmed: false });

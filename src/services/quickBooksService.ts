@@ -1,6 +1,10 @@
 import type { LedgerAccount, LedgerBill, LedgerContact, LedgerInvoice, LedgerReport, LedgerTransaction } from './bookkeepingTypes'
 import { apiFetch } from './apiClient'
 import type { Completeness, ReconTxn } from '../../shared/reconciliation'
+import type { ReportId } from '../../shared/accounting'
+import type { QbReportJson } from '../../shared/qbReports'
+
+export type ListCompleteness = { transactions: Completeness; invoices: Completeness; bills: Completeness; accounts: Completeness }
 
 /** A failed update, with the server's machine-readable reason (e.g. STALE, UNSUPPORTED). */
 export class QuickBooksUpdateError extends Error {
@@ -89,6 +93,20 @@ export const quickBooksService = {
     const result = await response.json() as { bills?: LedgerBill[]; error?: string }
     if (!response.ok) throw new Error(result.error || 'Unable to load QuickBooks bills.')
     return result.bills || []
+  },
+  /** Read-only. One QuickBooks report for exact dates; every figure is QuickBooks' own. */
+  getReportData: async (report: ReportId, start: string, end: string): Promise<QbReportJson> => {
+    const response = await apiFetch(`/api/quickbooks/report-data/${report}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)
+    const result = await response.json().catch(() => ({})) as { report?: QbReportJson; error?: string }
+    if (!response.ok || !result.report) throw new Error(result.error || 'Unable to load the QuickBooks report.')
+    return result.report
+  },
+  /** Read-only. Whether the lists loaded above hold everything QuickBooks has, or were cut off at a page limit. */
+  getListCompleteness: async (): Promise<ListCompleteness> => {
+    const response = await apiFetch('/api/quickbooks/list-completeness')
+    const result = await response.json().catch(() => ({})) as Partial<ListCompleteness> & { error?: string }
+    if (!response.ok || !result.transactions || !result.invoices || !result.bills || !result.accounts) throw new Error(result.error || 'Unable to check that the QuickBooks lists are complete.')
+    return result as ListCompleteness
   },
   getReport: async (report: 'profit-loss' | 'balance-sheet' | 'cash-flow', period: string): Promise<LedgerReport> => {
     const response = await apiFetch(`/api/quickbooks/reports/${report}?period=${encodeURIComponent(period)}`)

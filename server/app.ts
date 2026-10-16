@@ -16,6 +16,12 @@ import type * as quickbooksModule from './quickbooks.js'
 import { TransactionUpdateError } from './transactionLines.js'
 import { createReconciliationRouter } from './reconciliations.js'
 import { MemoryReconciliationStore, type ReconciliationStore } from './reconciliationStore.js'
+import { createMonthEndRouter } from './monthEnd.js'
+import { MemoryMonthEndStore, type MonthEndStore } from './monthEndStore.js'
+import type { QuickBooksReportKey } from './quickbooks.js'
+import { isValidIsoDate } from '../shared/period.js'
+
+const REPORT_KEYS: QuickBooksReportKey[] = ['profit-loss', 'balance-sheet', 'cash-flow', 'trial-balance', 'general-ledger', 'ar-aging', 'ap-aging']
 
 export type QuickBooksGateway = typeof quickbooksModule
 
@@ -36,6 +42,7 @@ export type AppDependencies = {
   authProvider?: AuthProvider
   sessionStore?: session.Store
   reconciliationStore?: ReconciliationStore
+  monthEndStore?: MonthEndStore
   now?: () => number
 }
 
@@ -192,7 +199,9 @@ export function createApp(dependencies: AppDependencies) {
 
   const router = express.Router()
   app.use('/api/quickbooks', requireAuth, requireCsrf, router)
-  app.use('/api/reconciliations', requireAuth, requireCsrf, createReconciliationRouter({ store: dependencies.reconciliationStore ?? new MemoryReconciliationStore(), quickbooks, now }))
+  const reconciliationStore = dependencies.reconciliationStore ?? new MemoryReconciliationStore()
+  app.use('/api/reconciliations', requireAuth, requireCsrf, createReconciliationRouter({ store: reconciliationStore, quickbooks, now }))
+  app.use('/api/month-end', requireAuth, requireCsrf, createMonthEndRouter({ store: dependencies.monthEndStore ?? new MemoryMonthEndStore(), reconciliations: reconciliationStore, quickbooks, now }))
 
   const fail = (response: Response, error: unknown, fallback: string) =>
     response.status(400).json({ error: error instanceof Error ? error.message : fallback })
@@ -345,6 +354,29 @@ export function createApp(dependencies: AppDependencies) {
       response.json({ bills: await quickbooks.getBills() })
     } catch (error) {
       fail(response, error, 'Unable to load QuickBooks bills.')
+    }
+  })
+
+  // Read-only: one report for exact dates, passed through from QuickBooks untouched.
+  router.get('/report-data/:report', async (request, response) => {
+    const report = String(request.params.report)
+    const start = typeof request.query.start === 'string' ? request.query.start : ''
+    const end = typeof request.query.end === 'string' ? request.query.end : ''
+    if (!REPORT_KEYS.includes(report as QuickBooksReportKey)) return response.status(404).json({ error: 'Unsupported QuickBooks report.' })
+    if (!isValidIsoDate(end) || (report !== 'ar-aging' && report !== 'ap-aging' && (!isValidIsoDate(start) || start > end))) return response.status(400).json({ error: 'Valid report dates are required.' })
+    try {
+      response.json({ report: await quickbooks.getReportData(report as QuickBooksReportKey, start, end) })
+    } catch (error) {
+      fail(response, error, 'Unable to load QuickBooks report.')
+    }
+  })
+
+  // Read-only: whether the page-limited list endpoints hold everything QuickBooks has.
+  router.get('/list-completeness', async (_request, response) => {
+    try {
+      response.json(await quickbooks.getListCompleteness())
+    } catch (error) {
+      fail(response, error, 'Unable to check that the QuickBooks lists are complete.')
     }
   })
 

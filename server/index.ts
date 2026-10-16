@@ -7,6 +7,8 @@ import { createOidcProvider } from './oidc.js'
 import * as quickbooks from './quickbooks.js'
 import { createPostgresSessionStore } from './sessionStore.js'
 import { MemoryReconciliationStore, PostgresReconciliationStore } from './reconciliationStore.js'
+import { MemoryMonthEndStore, PostgresMonthEndStore } from './monthEndStore.js'
+import { seedDemoRecords } from './demoSeed.js'
 
 const port = Number(process.env.PORT || 3001)
 const loaded = loadConfig(process.env)
@@ -31,7 +33,11 @@ if (loaded.missing.length > 0) {
 const reconciliationStore = loaded.databaseUrl ? new PostgresReconciliationStore(loaded.databaseUrl) : new MemoryReconciliationStore()
 if (!reconciliationStore.durable) console.warn('DATABASE_URL is not set: reconciliation records are temporary development records and will be lost on restart.')
 
-const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore })
+const monthEndStore = loaded.databaseUrl ? new PostgresMonthEndStore(loaded.databaseUrl) : new MemoryMonthEndStore()
+if (!monthEndStore.durable) console.warn('DATABASE_URL is not set: month-end records are temporary development records and will be lost on restart.')
+seedDemoRecords(reconciliationStore, monthEndStore).catch((error) => console.warn('Demo scenario records could not be created:', error instanceof Error ? error.message : error))
+
+const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore })
 
 app.listen(port, () => {
   console.log(`LedgerOps backend listening on port ${port}`)
