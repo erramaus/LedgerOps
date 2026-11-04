@@ -7,6 +7,7 @@ const openReconcile = async (page: Page) => {
   await page.goto('./')
   await expect(page.getByRole('heading', { name: /get to work/i })).toBeVisible()
   await nav(page, /Reconcile/).click()
+  await page.locator('label.client-switcher select').selectOption({ label: 'ABC Plumbing' })
   await expect(page.getByTestId('storage-label')).toBeVisible()
 }
 const enterCardReconcile = async (page: Page) => {
@@ -34,6 +35,8 @@ test.describe('Phase 6: missing demo transactions', () => {
     await enterCardReconcile(page)
 
     await page.getByRole('button', { name: /Clear all suggested matches/ }).click()
+
+    await page.getByTestId('bulk-confirm').getByRole('button', { name: /^Confirm/ }).click()
     await expect(page.getByTestId('remaining-difference')).toHaveText('$224.20')
     await expect(page.getByText(/LedgerOps never adds a transaction on its own/)).toBeVisible()
 

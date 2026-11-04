@@ -47,7 +47,7 @@ describe('demo data supports split transactions', () => {
   })
 
   it('labels split transactions in lists without hiding that they are split', () => {
-    expect(categoryLabel(costco)).toBe('Split (3)')
+    expect(categoryLabel(costco)).toBe('Split (3 lines)')
     expect(categoryLabel(byId('txn-003'))).toBe('Fuel')
   })
 

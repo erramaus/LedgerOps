@@ -228,7 +228,7 @@ export type PreviousRecon = { endingCents: number; periodEnd: string; clearedTra
 export type IssueCode =
   | 'period_invalid' | 'dates_invalid' | 'period_in_future' | 'period_overlap' | 'opening_mismatch' | 'opening_unconfirmed'
   | 'data_incomplete' | 'cleared_unknown' | 'statement_empty' | 'statement_coverage' | 'statement_out_of_period'
-  | 'statement_lines_unmatched' | 'cleared_without_line' | 'amount_discrepancy' | 'previously_cleared_changed'
+  | 'statement_lines_unmatched' | 'cleared_without_line' | 'amount_discrepancy' | 'statement_line_reused' | 'transaction_matched_twice' | 'previously_cleared_changed'
   | 'not_balanced' | 'already_completed' | 'possible_duplicate' | 'statement_duplicate_lines' | 'assumed_opening'
 export type Issue = { code: IssueCode; severity: 'blocking' | 'warning'; message: string }
 
@@ -346,6 +346,10 @@ export function computeReconciliation(rec: CalcInput, options: CalcOptions = {})
       return line.amountCents !== transaction.amountCents || line.direction !== transaction.direction ? [`${describeLine(line)} was matched to ${describeTxn(transaction)}`] : []
     })
     if (mismatched.length > 0) add('amount_discrepancy', 'blocking', `Amounts differ between the statement and your books: ${list(mismatched)}.`)
+    const linesUsedTwice = [...new Set(validMatches.filter((match, index) => validMatches.findIndex((other) => other.lineId === match.lineId) !== index).map((match) => match.lineId))]
+    if (linesUsedTwice.length > 0) add('statement_line_reused', 'blocking', `Each statement line can explain only one transaction, but ${list(linesUsedTwice.map((lineId) => describeLine(lineById.get(lineId)!)))} ${linesUsedTwice.length === 1 ? 'is' : 'are'} matched to more than one.`)
+    const txnsUsedTwice = [...new Set(validMatches.filter((match, index) => validMatches.findIndex((other) => other.txnId === match.txnId) !== index).map((match) => match.txnId))]
+    if (txnsUsedTwice.length > 0) add('transaction_matched_twice', 'blocking', `Each transaction can match only one statement line, but ${list(txnsUsedTwice.map((txnId) => describeTxn(txnById.get(txnId)!)))} ${txnsUsedTwice.length === 1 ? 'is' : 'are'} matched to more than one.`)
     if (unmatchedLines.length > 0) add('statement_lines_unmatched', 'blocking', `${unmatchedLines.length} statement line${unmatchedLines.length === 1 ? ' is' : 's are'} not matched to a transaction in your books: ${list(unmatchedLines.map(describeLine))}.`)
     if (clearedWithoutLine.length > 0) add('cleared_without_line', 'blocking', `${clearedWithoutLine.length} cleared transaction${clearedWithoutLine.length === 1 ? ' has' : 's have'} no matching statement line: ${list(clearedWithoutLine.map(describeTxn))}.`)
     if (statementDuplicates.length > 0) add('statement_duplicate_lines', 'warning', `${statementDuplicates.length} group${statementDuplicates.length === 1 ? '' : 's'} of identical statement lines. Check they are not import duplicates.`)

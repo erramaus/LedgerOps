@@ -383,3 +383,54 @@ describe('reopening', () => {
     expect(Object.keys(response.body.record.signoffs).sort()).toEqual(expect.arrayContaining(['payables', 'receivables', 'statements']))
   })
 })
+
+describe('review evidence and exceptions', () => {
+  it('accepting an exception needs a note on the server, and the evidence, as-of date and exceptions are stored with the review and in the history', async () => {
+    const { agent, csrf } = await signIn(build())
+    const exceptions = ['1 overdue invoice totalling $2,840.00 as of 2026-08-31.']
+    const refused = await signoff(agent, csrf, id('2026-08'), 'receivables', 0, { exceptions, asOf: '2026-08-31', note: '' })
+    expect(refused.status).toBe(400)
+    expect(refused.body.code).toBe('NOTE_REQUIRED')
+    const accepted = await signoff(agent, csrf, id('2026-08'), 'receivables', 0, { exceptions, asOf: '2026-08-31', note: 'Customer promised payment on the 5th' })
+    expect(accepted.status).toBe(200)
+    expect(accepted.body.record.signoffs.receivables).toMatchObject({ by: 'bookkeeper@example.com', at: '2026-10-01T12:00:00.000Z', exceptions, asOf: '2026-08-31', note: 'Customer promised payment on the 5th' })
+    expect(accepted.body.record.history.at(-1)).toMatchObject({ action: 'signed_off', step: 'receivables', figures: 'figures', exceptions, note: 'Customer promised payment on the 5th' })
+  })
+
+  it('a review with no exceptions still needs no note, and records none', async () => {
+    const { agent, csrf } = await signIn(build())
+    const response = await signoff(agent, csrf, id('2026-07'), 'statements', 0, { exceptions: [], note: '' })
+    expect(response.status).toBe(200)
+    expect(response.body.record.signoffs.statements.exceptions).toBeUndefined()
+  })
+
+  it('rejects malformed exceptions and as-of dates', async () => {
+    const { agent, csrf } = await signIn(build())
+    expect((await signoff(agent, csrf, id('2026-07'), 'payables', 0, { exceptions: 'all of them' })).status).toBe(400)
+    expect((await signoff(agent, csrf, id('2026-07'), 'payables', 0, { exceptions: [1, 2], note: 'ok ok' })).status).toBe(400)
+    expect((await signoff(agent, csrf, id('2026-07'), 'payables', 0, { asOf: 'yesterday' })).status).toBe(400)
+  })
+
+  it('closing refuses a stored review that accepted an exception without a note, whatever the browser sends', async () => {
+    const harness = build()
+    await seedDemoRecords(harness.reconciliations, harness.monthEnd)
+    const { agent, csrf } = await signIn(harness)
+    await signEverything(agent, csrf, harness, '2026-07')
+    const stored = (await harness.monthEnd.get(id('2026-07')))!
+    await harness.monthEnd.put({ ...stored, version: stored.version + 1, signoffs: { ...stored.signoffs, receivables: { ...stored.signoffs.receivables!, note: '', exceptions: ['1 overdue invoice.'] } } }, stored.version)
+    const response = await post(agent, csrf, id('2026-07'), '/close', { ...(await closeBodyFor(harness, '2026-07')), expectedVersion: stored.version + 1 })
+    expect(response.status).toBe(422)
+    expect(response.body.error).toContain('without a note')
+    expect((await harness.monthEnd.get(id('2026-07')))!.status).toBe('open')
+  })
+
+  it('the closing event keeps the exceptions that were accepted, next to who and when', async () => {
+    const harness = build()
+    await seedDemoRecords(harness.reconciliations, harness.monthEnd)
+    const { agent, csrf } = await signIn(harness)
+    await signEverything(agent, csrf, harness, '2026-07')
+    const closed = await post(agent, csrf, id('2026-07'), '/close', { ...(await closeBodyFor(harness, '2026-07')), exceptions: ['1 overdue bill totalling $100.00 as of 2026-07-31.'] })
+    expect(closed.status, JSON.stringify(closed.body)).toBe(200)
+    expect(closed.body.record.history.at(-1)).toMatchObject({ action: 'closed', by: 'bookkeeper@example.com', at: '2026-10-01T12:00:00.000Z', exceptions: ['1 overdue bill totalling $100.00 as of 2026-07-31.'] })
+  })
+})

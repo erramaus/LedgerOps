@@ -1,4 +1,4 @@
-import type { Page, Route } from '@playwright/test'
+import { expect, type Page, type Route } from '@playwright/test'
 import express from 'express'
 import request from 'supertest'
 import { buildAdditionalDemoMonthEndRecords, buildAdditionalDemoReconciliations, buildDemoMonthEndRecords, buildDemoReconciliations } from '../shared/demoMonthEnd'
@@ -220,7 +220,7 @@ export class FakeDemoReset {
   }
 }
 
-export async function mockApp(page: Page, options: { authenticated?: boolean; quickBooks?: FakeQuickBooks; reconciliations?: FakeReconciliations; monthEnd?: FakeMonthEnd; demoEntries?: FakeDemoEntries; demoJournals?: FakeDemoJournals; demoPayments?: FakeDemoPayments; demoWorkpapers?: FakeDemoWorkpapers; demoReset?: FakeDemoReset; beforeDemoResetSeed?: () => void } = {}) {
+export async function mockApp(page: Page, options: { authenticated?: boolean; devBypass?: boolean; quickBooks?: FakeQuickBooks; reconciliations?: FakeReconciliations; monthEnd?: FakeMonthEnd; demoEntries?: FakeDemoEntries; demoJournals?: FakeDemoJournals; demoPayments?: FakeDemoPayments; demoWorkpapers?: FakeDemoWorkpapers; demoReset?: FakeDemoReset; beforeDemoResetSeed?: () => void } = {}) {
   const quickBooks = options.quickBooks ?? new FakeQuickBooks()
   const reconciliations = options.reconciliations ?? new FakeReconciliations()
   reconciliations.register = () => quickBooks.register
@@ -240,9 +240,9 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; qu
     return route.abort()
   })
   await page.route('**/api/auth/session', (route) =>
-    json(route, options.authenticated === false ? { configured: true, authenticated: false } : { configured: true, authenticated: true, user, csrfToken: CSRF_TOKEN }),
+    json(route, options.authenticated === false ? { configured: true, authenticated: false } : { configured: true, authenticated: true, user, csrfToken: CSRF_TOKEN, ...(options.devBypass ? { devBypass: true } : {}) }),
   )
-  await page.route('**/api/quickbooks/status', (route) => json(route, { connected: true, environment: 'sandbox' }))
+  await page.route('**/api/quickbooks/status', (route) => options.devBypass ? json(route, { error: 'Authentication required.' }, 401) : json(route, { connected: true, environment: 'sandbox' }))
   await page.route('**/api/quickbooks/transactions', (route) => {
     quickBooks.transactionLoads += 1
     return json(route, { transactions: quickBooks.transactions })
@@ -526,4 +526,13 @@ export function qbSampleReports(): Record<string, QbReportJson> {
       Rows: { Row: [{ type: 'Data', ColData: cols('2026-09-05', 'Sandbox sale', '100.00', '100.00') }] },
     },
   }
+}
+
+/** Month End review: opens the confirmation, adds a note when one is required, and confirms. */
+export async function confirmReview(page: Page, name: string, note = 'Reviewed with the client; the exceptions are expected.') {
+  await page.getByRole('button', { name, exact: true }).click()
+  const box = page.getByRole('textbox', { name: /^Note for/ })
+  if (await box.count()) await box.fill(note)
+  await page.getByRole('button', { name: 'Confirm review' }).click()
+  await expect(page.getByRole('button', { name, exact: true })).toHaveCount(0)
 }

@@ -43,7 +43,7 @@ test.describe('demo data: split transactions', () => {
     await expect(details).toContainText('Costco Wholesale')
     await expect(details).toContainText('$286.40')
     await expect(details).toContainText('Chase Business Credit Card')
-    await expect(details).toContainText('Split (3)')
+    await expect(details).toContainText('Split (3 lines)')
     await expect(details).toContainText('Shop supplies and breakroom restock')
     await expect(details).toContainText('Needs Review')
 

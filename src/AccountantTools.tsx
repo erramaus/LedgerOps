@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { AdjustingEntryType, DemoJournalEntryInput, DemoJournalRecord } from '../shared/demoJournalEntries'
 import type { DemoWorkpaperInput, DemoWorkpaperRecord, WorkpaperStatus } from '../shared/demoWorkpapers'
 import { periodEnd, type Period } from '../shared/period'
 import { formatCents } from '../shared/reconciliation'
+import { journalReadiness, parseAmountCents as parseAmount } from './services/journalForm'
 
 type AccountantAccount = { id: string; name: string; active: boolean; accountType: string }
 
@@ -31,12 +32,6 @@ type WorkpaperFormState = {
 }
 
 const amountText = (cents: number) => (cents === 0 ? '' : (cents / 100).toFixed(2))
-const parseAmount = (value: string) => {
-  const trimmed = value.trim()
-  if (!trimmed) return 0
-  if (!/^-?\d+(\.\d{0,2})?$/.test(trimmed)) return Number.NaN
-  return Math.round(Number(trimmed) * 100)
-}
 const periodKey = (period: Period) => `${period.year}-${String(period.month).padStart(2, '0')}`
 const splitList = (value: string) => value.split(',').map((item) => item.trim()).filter(Boolean)
 const accountOptions = (accounts: AccountantAccount[]) => accounts.filter((account) => account.active).sort((left, right) => left.name.localeCompare(right.name))
@@ -98,6 +93,35 @@ function emptyWorkpaper(period: Period, preparedBy: string): WorkpaperFormState 
   }
 }
 
+function Disclosure({ id, title, countLabel, open, onToggle, unsaved, action, children }: { id: string; title: string; countLabel: string; open: boolean; onToggle: () => void; unsaved: boolean; action: ReactNode; children: ReactNode }) {
+  return (
+    <section className="panel accountant-panel" aria-label={title}>
+      <div className="disclosure-header">
+        <button type="button" className="disclosure-toggle" aria-expanded={open} aria-controls={id} onClick={onToggle}>
+          <span aria-hidden="true">{open ? '▾' : '▸'}</span>
+          <strong>{title}</strong>
+          <span className="count-badge">{countLabel}</span>
+          {unsaved && <span className="count-badge warning">Unsaved changes</span>}
+        </button>
+        {action}
+      </div>
+      <div id={id} hidden={!open}>{children}</div>
+    </section>
+  )
+}
+
+function DiscardWarning({ what, onDiscard, onKeep }: { what: string; onDiscard: () => void; onKeep: () => void }) {
+  return (
+    <div className="data-state-message error" role="alert" data-testid="discard-warning">
+      <strong>Discard unsaved changes?</strong> Your {what} has edits that have not been saved. Continuing will replace them.
+      <div className="reset-actions">
+        <button type="button" className="secondary-button" onClick={onDiscard}>Discard changes</button>
+        <button type="button" className="primary-button" onClick={onKeep}>Keep editing</button>
+      </div>
+    </div>
+  )
+}
+
 export function AccountantTools({
   source,
   clientName,
@@ -140,28 +164,74 @@ export function AccountantTools({
   const [workpaperMessage, setWorkpaperMessage] = useState<string | null>(null)
   const [workpaperBusy, setWorkpaperBusy] = useState(false)
 
+  const [journalBase, setJournalBase] = useState(() => JSON.stringify(emptyJournal(period)))
+  const [workpaperBase, setWorkpaperBase] = useState(() => JSON.stringify(emptyWorkpaper(period, userDisplay)))
+  const [journalOpen, setJournalOpen] = useState(false)
+  const [workpaperOpen, setWorkpaperOpen] = useState(false)
+  const [pendingJournal, setPendingJournal] = useState<(() => void) | null>(null)
+  const [pendingWorkpaper, setPendingWorkpaper] = useState<(() => void) | null>(null)
+
   const selectedJournal = journals.find((record) => record.id === selectedJournalId) ?? null
   const selectedWorkpaper = workpapers.find((record) => record.id === selectedWorkpaperId) ?? null
+  const journalDirty = JSON.stringify(journalForm) !== journalBase
+  const workpaperDirty = JSON.stringify(workpaperForm) !== workpaperBase
 
-  useEffect(() => {
-    if (!selectedJournal) setJournalForm(emptyJournal(period))
-    else setJournalForm(journalToForm(selectedJournal))
+  const loadJournal = (id: string | null, form: JournalFormState) => {
+    setSelectedJournalId(id)
+    setJournalForm(form)
+    setJournalBase(JSON.stringify(form))
     setJournalErrors({})
     setJournalMessage(null)
-  }, [selectedJournalId, selectedJournal, period])
-
-  useEffect(() => {
-    if (!selectedWorkpaper) setWorkpaperForm(emptyWorkpaper(period, userDisplay))
-    else setWorkpaperForm(workpaperToForm(selectedWorkpaper))
+    setPendingJournal(null)
+    setJournalOpen(true)
+  }
+  const loadWorkpaper = (id: string | null, form: WorkpaperFormState) => {
+    setSelectedWorkpaperId(id)
+    setWorkpaperForm(form)
+    setWorkpaperBase(JSON.stringify(form))
     setWorkpaperErrors({})
     setWorkpaperMessage(null)
-  }, [selectedWorkpaperId, selectedWorkpaper, period, userDisplay])
+    setPendingWorkpaper(null)
+    setWorkpaperOpen(true)
+  }
+  // Replacing a form that has unsaved edits needs explicit confirmation.
+  const guardJournal = (action: () => void) => { if (journalDirty) setPendingJournal(() => action); else action() }
+  const guardWorkpaper = (action: () => void) => { if (workpaperDirty) setPendingWorkpaper(() => action); else action() }
 
-  const journalTotals = useMemo(() => journalForm.lines.reduce((total, line) => ({
-    debit: total.debit + (Number.isFinite(parseAmount(line.debit)) ? parseAmount(line.debit) : 0),
-    credit: total.credit + (Number.isFinite(parseAmount(line.credit)) ? parseAmount(line.credit) : 0),
-  }), { debit: 0, credit: 0 }), [journalForm.lines])
+  // Reload the form when the open record itself changes (for example after posting or reversing it).
+  useEffect(() => {
+    if (!selectedJournal) return
+    const form = journalToForm(selectedJournal)
+    setJournalForm(form)
+    setJournalBase(JSON.stringify(form))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedJournal?.id, selectedJournal?.version])
 
+  useEffect(() => {
+    if (!selectedWorkpaper) return
+    const form = workpaperToForm(selectedWorkpaper)
+    setWorkpaperForm(form)
+    setWorkpaperBase(JSON.stringify(form))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedWorkpaper?.id, selectedWorkpaper?.updatedAt])
+
+  // A new, untouched form follows the selected period; edited work is never overwritten.
+  useEffect(() => {
+    if (!selectedJournalId && !journalDirty) {
+      const form = emptyJournal(period)
+      setJournalForm(form)
+      setJournalBase(JSON.stringify(form))
+    }
+    if (!selectedWorkpaperId && !workpaperDirty) {
+      const form = emptyWorkpaper(period, userDisplay)
+      setWorkpaperForm(form)
+      setWorkpaperBase(JSON.stringify(form))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [period.year, period.month, userDisplay])
+
+  const readiness = useMemo(() => journalReadiness(journalForm.lines), [journalForm.lines])
+  const balanceLabel = readiness.state === 'balanced' ? 'Balanced' : readiness.state === 'empty' ? 'Nothing entered' : 'Not balanced'
   const postedEntries = journals.filter((record) => record.status !== 'Draft')
   const periodWorkpapers = workpapers.filter((record) => record.input.period === periodKey(period))
 
@@ -231,7 +301,7 @@ export function AccountantTools({
     try {
       if (selectedJournal?.status === 'Draft') await onUpdateJournal(selectedJournal, toJournalInput())
       else await onCreateJournal(toJournalInput())
-      setSelectedJournalId(null)
+      loadJournal(null, emptyJournal(period))
       setJournalMessage(selectedJournal?.status === 'Draft' ? 'Draft journal updated.' : 'Draft journal created.')
     } catch (error) {
       setJournalMessage(applyErrors(error, setJournalErrors, 'The journal entry could not be saved.'))
@@ -277,7 +347,7 @@ export function AccountantTools({
     try {
       if (selectedWorkpaper) await onUpdateWorkpaper(selectedWorkpaper, toWorkpaperInput())
       else await onCreateWorkpaper(toWorkpaperInput())
-      setSelectedWorkpaperId(null)
+      loadWorkpaper(null, emptyWorkpaper(period, userDisplay))
       setWorkpaperMessage(selectedWorkpaper ? 'Workpaper updated.' : 'Workpaper saved.')
     } catch (error) {
       setWorkpaperMessage(applyErrors(error, setWorkpaperErrors, 'The workpaper could not be saved.'))
@@ -313,21 +383,28 @@ export function AccountantTools({
 
   return (
     <div className="accountant-tools-grid">
-      <section className="panel accountant-panel">
-        <div className="panel-heading">
-          <div>
-            <h2>Journal Entry Workspace</h2>
-            <p className="muted">Draft, post, reverse, and review adjusting entries for {clientName}. Posted demo entries flow into the General Ledger, Trial Balance, Balance Sheet, and Profit and Loss.</p>
+      <Disclosure
+        id="journal-section"
+        title="Journal Entries"
+        countLabel={`${journals.length} ${journals.length === 1 ? 'entry' : 'entries'}`}
+        open={journalOpen}
+        onToggle={() => setJournalOpen(!journalOpen)}
+        unsaved={journalDirty}
+        action={<button type="button" className="primary-button" onClick={() => guardJournal(() => loadJournal(null, emptyJournal(period)))}>New journal entry</button>}
+      >
+        <p className="muted">Draft, post, reverse, and review adjusting entries for {clientName}. Posted demo entries flow into the General Ledger, Trial Balance, Balance Sheet, and Profit and Loss.</p>
+        <fieldset className="accountant-templates">
+          <legend>Adjusting entry templates</legend>
+          <p className="muted">Choosing a template only fills in the form below. Nothing is posted: every journal entry needs your review, and a saved draft must be posted separately.</p>
+          <div className="accountant-template-row" aria-label="Adjusting entry templates">
+            {(['Accrued Expense', 'Prepaid Expense', 'Depreciation', 'Accrued Income', 'Correction', 'Reclassification'] as const).map((option) => (
+              <button type="button" key={option} className="filter-button" onClick={() => guardJournal(() => loadJournal(null, template(option)))}>
+                {option}
+              </button>
+            ))}
           </div>
-          <button className="secondary-button" onClick={() => { setSelectedJournalId(null); setJournalForm(emptyJournal(period)); }}>New journal entry</button>
-        </div>
-        <div className="accountant-template-row" aria-label="Adjusting entry templates">
-          {(['Accrued Expense', 'Prepaid Expense', 'Depreciation', 'Accrued Income', 'Correction', 'Reclassification'] as const).map((option) => (
-            <button key={option} className="filter-button" onClick={() => { setSelectedJournalId(null); setJournalForm(template(option)); }}>
-              {option}
-            </button>
-          ))}
-        </div>
+        </fieldset>
+        {pendingJournal && <DiscardWarning what="journal entry" onDiscard={() => { const next = pendingJournal; setPendingJournal(null); next() }} onKeep={() => setPendingJournal(null)} />}
         <div className="accountant-split">
           <div className="accountant-form">
             <div className="queue-filters">
@@ -356,44 +433,49 @@ export function AccountantTools({
               <textarea aria-label="Journal explanation" value={journalForm.explanation} onChange={(event) => setJournalForm({ ...journalForm, explanation: event.target.value })} />
             </label>
             <div className="journal-line-list">
-              <div className="journal-line-heading"><strong>Lines</strong><small>{journalTotals.debit === journalTotals.credit ? 'Balanced' : 'Out of balance'}</small></div>
-              {journalForm.lines.map((line, index) => (
-                <div className="journal-line-editor" key={`${index}-${selectedJournalId ?? 'new'}`}>
-                  <label>
-                    Account
-                    <select aria-label={`Line ${index + 1} account`} value={line.accountId} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, accountId: event.target.value } : item) })}>
-                      <option value="">Choose account</option>
-                      {selectableAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
-                    </select>
-                  </label>
-                  <label>
-                    Debit
-                    <input aria-label={`Line ${index + 1} debit`} value={line.debit} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, debit: event.target.value } : item) })} />
-                  </label>
-                  <label>
-                    Credit
-                    <input aria-label={`Line ${index + 1} credit`} value={line.credit} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, credit: event.target.value } : item) })} />
-                  </label>
-                  <label>
-                    Memo
-                    <input aria-label={`Line ${index + 1} memo`} value={line.memo} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, memo: event.target.value } : item) })} />
-                  </label>
-                </div>
-              ))}
+              <div className="journal-line-heading">
+                <strong>Journal lines</strong>
+                <small data-testid="journal-balance-status" className={`balance-pill ${readiness.state}`}>{balanceLabel}</small>
+              </div>
+              <div className="journal-table-scroll">
+                <table className="journal-lines-table">
+                  <thead>
+                    <tr><th scope="col">Account</th><th scope="col">Debit</th><th scope="col">Credit</th><th scope="col">Memo</th><th scope="col">Remove</th></tr>
+                  </thead>
+                  <tbody>
+                    {journalForm.lines.map((line, index) => (
+                      <tr key={`${index}-${selectedJournalId ?? 'new'}`}>
+                        <td>
+                          <select aria-label={`Line ${index + 1} account`} value={line.accountId} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, accountId: event.target.value } : item) })}>
+                            <option value="">Choose account</option>
+                            {selectableAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                          </select>
+                        </td>
+                        <td><input inputMode="decimal" aria-label={`Line ${index + 1} debit`} value={line.debit} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, debit: event.target.value } : item) })} /></td>
+                        <td><input inputMode="decimal" aria-label={`Line ${index + 1} credit`} value={line.credit} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, credit: event.target.value } : item) })} /></td>
+                        <td><input aria-label={`Line ${index + 1} memo`} value={line.memo} onChange={(event) => setJournalForm({ ...journalForm, lines: journalForm.lines.map((item, row) => row === index ? { ...item, memo: event.target.value } : item) })} /></td>
+                        <td><button type="button" className="secondary-button" aria-label={`Remove line ${index + 1}`} disabled={journalForm.lines.length <= 2} onClick={() => setJournalForm({ ...journalForm, lines: journalForm.lines.filter((_, row) => row !== index) })}>Remove</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
             <div className="reset-actions">
-              <button className="secondary-button" onClick={() => setJournalForm({ ...journalForm, lines: [...journalForm.lines, { accountId: '', debit: '', credit: '', memo: '' }] })}>Add line</button>
-              {journalForm.lines.length > 2 && <button className="secondary-button" onClick={() => setJournalForm({ ...journalForm, lines: journalForm.lines.slice(0, -1) })}>Remove last line</button>}
+              <button type="button" className="secondary-button" onClick={() => setJournalForm({ ...journalForm, lines: [...journalForm.lines, { accountId: '', debit: '', credit: '', memo: '' }] })}>Add line</button>
             </div>
             <div className="journal-totals" data-testid="journal-totals">
-              <span>Total debit: <strong>{formatCents(journalTotals.debit)}</strong></span>
-              <span>Total credit: <strong>{formatCents(journalTotals.credit)}</strong></span>
+              <span>Total debits: <strong data-testid="total-debits">{formatCents(readiness.debitCents)}</strong></span>
+              <span>Total credits: <strong data-testid="total-credits">{formatCents(readiness.creditCents)}</strong></span>
+              <span>Difference: <strong data-testid="journal-difference">{formatCents(Math.abs(readiness.differenceCents))}</strong></span>
             </div>
+            {!readiness.ready && <ul className="muted journal-readiness" data-testid="journal-readiness">{readiness.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
             {journalMessage && <div className={`data-state-message ${Object.keys(journalErrors).length > 0 ? 'error' : ''}`}>{journalMessage}</div>}
             <div className="reset-actions">
-              <button className="primary-button" disabled={journalBusy} onClick={() => void saveJournal()}>{selectedJournal?.status === 'Draft' ? 'Update draft' : 'Save draft'} <span>→</span></button>
-              {selectedJournal?.status === 'Draft' && <button className="secondary-button" disabled={journalBusy} onClick={() => void postJournal()}>Post journal entry</button>}
+              <button type="button" className="primary-button" disabled={journalBusy} onClick={() => void saveJournal()}>{selectedJournal?.status === 'Draft' ? 'Update draft' : 'Save draft'} <span>→</span></button>
+              {selectedJournal?.status === 'Draft' && <button type="button" className="secondary-button" disabled={journalBusy || journalDirty || !readiness.ready} onClick={() => void postJournal()}>Post journal entry</button>}
             </div>
+            {selectedJournal?.status === 'Draft' && journalDirty && <p className="muted">Update the draft before posting so the posted entry matches what you see.</p>}
             {selectedJournal?.status === 'Posted' && (
               <div className="portal-compose">
                 <label>
@@ -413,7 +495,7 @@ export function AccountantTools({
             </div>
             <div className="audit-log-list">
               {journals.map((record) => (
-                <button className={`audit-log-row selectable ${selectedJournalId === record.id ? 'selected' : ''}`} key={record.id} onClick={() => setSelectedJournalId(record.id)}>
+                <button type="button" className={`audit-log-row selectable ${selectedJournalId === record.id ? 'selected' : ''}`} key={record.id} onClick={() => guardJournal(() => loadJournal(record.id, journalToForm(record)))}>
                   <strong>{record.input.description}</strong>
                   <span>{record.status} · {record.input.date}</span>
                   <span>{record.input.referenceNumber || 'No reference'} · {formatCents(record.input.lines.reduce((sum, line) => sum + line.debitCents, 0))}</span>
@@ -443,80 +525,90 @@ export function AccountantTools({
             )}
           </div>
         </div>
-      </section>
+      </Disclosure>
 
-      <section className="panel accountant-panel">
-        <div className="panel-heading">
-          <div>
-            <h2>Workpapers</h2>
-            <p className="muted">Account review notes, supporting references, reconciliation links, and adjusting-entry references for {clientName}.</p>
-          </div>
-          <button className="secondary-button" onClick={() => { setSelectedWorkpaperId(null); setWorkpaperForm(emptyWorkpaper(period, userDisplay)); }}>New workpaper</button>
-        </div>
+      <Disclosure
+        id="workpaper-section"
+        title="Workpapers"
+        countLabel={`${workpapers.length} ${workpapers.length === 1 ? 'workpaper' : 'workpapers'}`}
+        open={workpaperOpen}
+        onToggle={() => setWorkpaperOpen(!workpaperOpen)}
+        unsaved={workpaperDirty}
+        action={<button type="button" className="primary-button" onClick={() => guardWorkpaper(() => loadWorkpaper(null, emptyWorkpaper(period, userDisplay)))}>New workpaper</button>}
+      >
+        <p className="muted">Account review notes, supporting references, reconciliation links, and adjusting-entry references for {clientName}. Documents are referenced by name only; LedgerOps does not upload files.</p>
+        {pendingWorkpaper && <DiscardWarning what="workpaper" onDiscard={() => { const next = pendingWorkpaper; setPendingWorkpaper(null); next() }} onKeep={() => setPendingWorkpaper(null)} />}
         <div className="accountant-split">
           <div className="accountant-form">
-            <div className="queue-filters">
+            <fieldset className="accountant-fieldset">
+              <legend>Basic information</legend>
+              <div className="queue-filters">
+                <label>
+                  Title
+                  <input aria-label="Workpaper title" value={workpaperForm.title} onChange={(event) => setWorkpaperForm({ ...workpaperForm, title: event.target.value })} />
+                </label>
+                <label>
+                  Period
+                  <input aria-label="Workpaper period" value={workpaperForm.period} onChange={(event) => setWorkpaperForm({ ...workpaperForm, period: event.target.value })} />
+                </label>
+                <label>
+                  Account
+                  <select aria-label="Workpaper account" value={workpaperForm.accountId} onChange={(event) => setWorkpaperForm({ ...workpaperForm, accountId: event.target.value })}>
+                    <option value="">Choose account</option>
+                    {selectableAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                  </select>
+                </label>
+              </div>
+            </fieldset>
+            <fieldset className="accountant-fieldset">
+              <legend>Review details</legend>
               <label>
-                Title
-                <input aria-label="Workpaper title" value={workpaperForm.title} onChange={(event) => setWorkpaperForm({ ...workpaperForm, title: event.target.value })} />
+                Account review notes
+                <textarea aria-label="Account review notes" value={workpaperForm.note} onChange={(event) => setWorkpaperForm({ ...workpaperForm, note: event.target.value })} />
               </label>
-              <label>
-                Period
-                <input aria-label="Workpaper period" value={workpaperForm.period} onChange={(event) => setWorkpaperForm({ ...workpaperForm, period: event.target.value })} />
-              </label>
-              <label>
-                Account
-                <select aria-label="Workpaper account" value={workpaperForm.accountId} onChange={(event) => setWorkpaperForm({ ...workpaperForm, accountId: event.target.value })}>
-                  <option value="">Choose account</option>
-                  {selectableAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
-                </select>
-              </label>
-            </div>
-            <label>
-              Account review notes
-              <textarea aria-label="Account review notes" value={workpaperForm.note} onChange={(event) => setWorkpaperForm({ ...workpaperForm, note: event.target.value })} />
-            </label>
-            <div className="queue-filters">
-              <label>
-                Supporting document references
-                <input aria-label="Supporting document references" value={workpaperForm.supportingDocumentRefs} onChange={(event) => setWorkpaperForm({ ...workpaperForm, supportingDocumentRefs: event.target.value })} placeholder="Receipt-114, BankStmt-Aug" />
-              </label>
-              <label>
-                Reconciliation links
-                <input aria-label="Reconciliation links" value={workpaperForm.reconciliationLinks} onChange={(event) => setWorkpaperForm({ ...workpaperForm, reconciliationLinks: event.target.value })} placeholder="chase-checking-2026-08" />
-              </label>
-            </div>
-            <div className="queue-filters">
-              <label>
-                Adjusting entry references
-                <input aria-label="Adjusting entry references" value={workpaperForm.adjustingEntryIds} onChange={(event) => setWorkpaperForm({ ...workpaperForm, adjustingEntryIds: event.target.value })} placeholder="journal-123, journal-456" />
-              </label>
-              <label>
-                Review status
-                <select aria-label="Workpaper status" value={workpaperForm.reviewStatus} onChange={(event) => setWorkpaperForm({ ...workpaperForm, reviewStatus: event.target.value as WorkpaperStatus })}>
-                  <option value="Open">Open</option>
-                  <option value="Prepared">Prepared</option>
-                  <option value="Reviewed">Reviewed</option>
-                </select>
-              </label>
-            </div>
-            <div className="queue-filters">
-              <label>
-                Prepared by
-                <input aria-label="Prepared by" value={workpaperForm.preparedBy} onChange={(event) => setWorkpaperForm({ ...workpaperForm, preparedBy: event.target.value })} />
-              </label>
-              <label>
-                Reviewed by
-                <input aria-label="Reviewed by" value={workpaperForm.reviewedBy} onChange={(event) => setWorkpaperForm({ ...workpaperForm, reviewedBy: event.target.value })} />
-              </label>
-              <label>
-                Workpaper date
-                <input aria-label="Workpaper date" type="date" value={workpaperForm.workDate} onChange={(event) => setWorkpaperForm({ ...workpaperForm, workDate: event.target.value })} />
-              </label>
-            </div>
+              <div className="queue-filters">
+                <label>
+                  Supporting document references
+                  <input aria-label="Supporting document references" value={workpaperForm.supportingDocumentRefs} onChange={(event) => setWorkpaperForm({ ...workpaperForm, supportingDocumentRefs: event.target.value })} placeholder="Receipt-114, BankStmt-Aug" />
+                </label>
+                <label>
+                  Reconciliation links
+                  <input aria-label="Reconciliation links" value={workpaperForm.reconciliationLinks} onChange={(event) => setWorkpaperForm({ ...workpaperForm, reconciliationLinks: event.target.value })} placeholder="chase-checking-2026-08" />
+                </label>
+                <label>
+                  Adjusting entry references
+                  <input aria-label="Adjusting entry references" value={workpaperForm.adjustingEntryIds} onChange={(event) => setWorkpaperForm({ ...workpaperForm, adjustingEntryIds: event.target.value })} placeholder="journal-123, journal-456" />
+                </label>
+              </div>
+            </fieldset>
+            <fieldset className="accountant-fieldset">
+              <legend>Approval</legend>
+              <div className="queue-filters">
+                <label>
+                  Review status
+                  <select aria-label="Workpaper status" value={workpaperForm.reviewStatus} onChange={(event) => setWorkpaperForm({ ...workpaperForm, reviewStatus: event.target.value as WorkpaperStatus })}>
+                    <option value="Open">Open</option>
+                    <option value="Prepared">Prepared</option>
+                    <option value="Reviewed">Reviewed</option>
+                  </select>
+                </label>
+                <label>
+                  Prepared by
+                  <input aria-label="Prepared by" value={workpaperForm.preparedBy} onChange={(event) => setWorkpaperForm({ ...workpaperForm, preparedBy: event.target.value })} />
+                </label>
+                <label>
+                  Reviewed by
+                  <input aria-label="Reviewed by" value={workpaperForm.reviewedBy} onChange={(event) => setWorkpaperForm({ ...workpaperForm, reviewedBy: event.target.value })} />
+                </label>
+                <label>
+                  Workpaper date
+                  <input aria-label="Workpaper date" type="date" value={workpaperForm.workDate} onChange={(event) => setWorkpaperForm({ ...workpaperForm, workDate: event.target.value })} />
+                </label>
+              </div>
+            </fieldset>
             {workpaperMessage && <div className={`data-state-message ${Object.keys(workpaperErrors).length > 0 ? 'error' : ''}`}>{workpaperMessage}</div>}
             <div className="reset-actions">
-              <button className="primary-button" disabled={workpaperBusy} onClick={() => void saveWorkpaper()}>{selectedWorkpaper ? 'Update workpaper' : 'Save workpaper'} <span>→</span></button>
+              <button type="button" className="primary-button" disabled={workpaperBusy} onClick={() => void saveWorkpaper()}>{selectedWorkpaper ? 'Update workpaper' : 'Save workpaper'} <span>→</span></button>
             </div>
           </div>
           <div className="accountant-sidebar">
@@ -526,7 +618,7 @@ export function AccountantTools({
             </div>
             <div className="audit-log-list">
               {workpapers.map((record) => (
-                <button className={`audit-log-row selectable ${selectedWorkpaperId === record.id ? 'selected' : ''}`} key={record.id} onClick={() => setSelectedWorkpaperId(record.id)}>
+                <button type="button" className={`audit-log-row selectable ${selectedWorkpaperId === record.id ? 'selected' : ''}`} key={record.id} onClick={() => guardWorkpaper(() => loadWorkpaper(record.id, workpaperToForm(record)))}>
                   <strong>{record.input.title}</strong>
                   <span>{record.input.period} · {record.input.reviewStatus}</span>
                   <span>{record.input.preparedBy}{record.input.reviewedBy ? ` / ${record.input.reviewedBy}` : ''}</span>
@@ -549,7 +641,7 @@ export function AccountantTools({
             )}
           </div>
         </div>
-      </section>
+      </Disclosure>
     </div>
   )
 }

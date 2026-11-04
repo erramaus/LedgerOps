@@ -9,7 +9,7 @@ export default defineConfig(({ mode }) => ({
   define: mode === 'render' ? { 'import.meta.env.VITE_API_BASE_URL': '""' } : {},
   server: {
     proxy: {
-      '/api': 'http://localhost:3001',
+      '/api': 'http://127.0.0.1:3001',
     },
   },
 }))

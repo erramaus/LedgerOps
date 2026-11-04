@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { demoReport } from '../shared/demoMonthEnd'
-import { completedQuickBooksReconciliation, FakeMonthEnd, FakeQuickBooks, FakeReconciliations, mockApp } from './support'
+import { completedQuickBooksReconciliation, confirmReview, FakeMonthEnd, FakeQuickBooks, FakeReconciliations, mockApp } from './support'
 
 const nav = (page: Page, name: RegExp) => page.locator('nav.main-nav').getByRole('button', { name })
 const group = (page: Page) => page.getByRole('group', { name: 'Accounting period' }).first()
@@ -36,8 +36,7 @@ const openMonthEnd = async (page: Page, month?: number) => {
 
 const signAll = async (page: Page) => {
   for (const name of ['Mark receivables reviewed', 'Mark payables reviewed', 'Mark statements reviewed']) {
-    await page.getByRole('button', { name }).click()
-    await expect(page.getByRole('button', { name })).toHaveCount(0)
+    await confirmReview(page, name)
   }
 }
 
@@ -125,13 +124,14 @@ test.describe('Month End: the four demo scenarios', () => {
     await openMonthEnd(page)
     await expect(status(page, 'reconcile-bank')).toHaveText('Not Started')
     await step(page, 'reconcile-bank').getByRole('button', { name: /Open Reconcile/ }).click()
-    await expect(page.getByTestId('storage-label')).toBeVisible()
+    await page.locator('label.client-switcher select').selectOption({ label: 'ABC Plumbing' })
     await page.getByRole('button', { name: 'Start reconciliation for Chase Business Checking' }).click()
-    await expect(page.getByLabel('Beginning balance', { exact: true })).toHaveValue('47000.00')
+    await expect(page.getByLabel('Beginning balance', { exact: true })).toHaveValue('$47,000.00')
     await expect(page.getByLabel('Statement end date')).toHaveValue('2026-08-31')
     await page.getByRole('button', { name: 'Load the demo statement transactions' }).click()
     await page.getByRole('button', { name: /Continue to matching/ }).click()
     await page.getByRole('button', { name: /Clear all suggested matches/ }).click()
+    await page.getByTestId('bulk-confirm').getByRole('button', { name: /^Confirm/ }).click()
     await expect(page.getByTestId('remaining-difference')).toHaveText('$0.00')
     await page.getByRole('navigation', { name: 'Reconciliation steps' }).getByRole('button', { name: '4. Review & complete' }).click()
     await page.getByRole('button', { name: /Complete reconciliation/ }).click()
@@ -144,7 +144,7 @@ test.describe('Month End: the four demo scenarios', () => {
     await expect(status(page, 'approval')).toHaveText('Blocked')
 
     await nav(page, /Reconcile/).click()
-    await page.getByTestId('saved-reconciliation').filter({ hasText: 'Chase Business Checking' }).filter({ hasText: '2026-08-31' }).getByRole('button', { name: /View reconciliation/ }).click()
+    await page.getByTestId('saved-reconciliation').filter({ hasText: 'Chase Business Checking' }).filter({ hasText: 'August 31, 2026' }).getByRole('button', { name: /View reconciliation/ }).click()
     await page.getByLabel('Reason for reopening').fill('Bank corrected the Shell charge')
     await page.getByRole('button', { name: 'Reopen', exact: true }).click()
     await expect(page.getByTestId('history')).toContainText('reopened')
@@ -247,6 +247,8 @@ test.describe('Month End: reopening and keeping the books verified', () => {
 test.describe('Reports: demo data', () => {
   const openReport = async (page: Page, id: string) => {
     await nav(page, /Reports/).click()
+    const gate = page.getByRole('button', { name: 'Open reports for ABC Plumbing' })
+    if (await gate.isVisible()) await gate.click()
     const back = page.getByRole('button', { name: '← All reports' })
     if (await back.isVisible()) await back.click()
     await page.getByTestId(`open-${id}`).click()

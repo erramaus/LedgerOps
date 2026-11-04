@@ -1,0 +1,97 @@
+import { expect, test, type Page } from '@playwright/test'
+import { FakeReconciliations, mockApp } from './support'
+
+const open = async (page: Page, account = 'Chase Business Checking') => {
+  await page.goto('./')
+  await expect(page.getByRole('heading', { name: /get to work/i })).toBeVisible()
+  await page.locator('nav.main-nav').getByRole('button', { name: /Reconcile/ }).click()
+  await page.locator('label.client-switcher select').selectOption({ label: 'ABC Plumbing' })
+  await page.getByRole('button', { name: `Start reconciliation for ${account}` }).click()
+}
+const end = (page: Page) => page.getByLabel('Statement end date')
+const stmtDate = (page: Page) => page.getByLabel('Statement date', { exact: true })
+const beginning = (page: Page) => page.getByLabel('Beginning balance', { exact: true })
+const ending = (page: Page) => page.getByLabel('Ending balance', { exact: true })
+const next = (page: Page) => page.getByRole('button', { name: /Continue to matching/ })
+
+test.describe('Reconcile: Statement step', () => {
+  test('statement date follows the end date but keeps a deliberate override', async ({ page }) => {
+    await mockApp(page, { reconciliations: new FakeReconciliations() })
+    await open(page)
+    await end(page).fill('2026-08-30')
+    await expect(stmtDate(page)).toHaveValue('2026-08-30')
+    await stmtDate(page).fill('2026-09-02')
+    await end(page).fill('2026-08-29')
+    await expect(stmtDate(page)).toHaveValue('2026-09-02')
+  })
+
+  test('shows currency formatting when not editing and raw cents-precise text while editing', async ({ page }) => {
+    await mockApp(page, { reconciliations: new FakeReconciliations() })
+    await open(page)
+    await beginning(page).fill('1234567.8')
+    await ending(page).focus()
+    await expect(beginning(page)).toHaveValue('$1,234,567.80')
+    await beginning(page).focus()
+    await expect(beginning(page)).toHaveValue('1234567.8')
+  })
+
+  test('summary shows period, balances and net change (ending minus beginning)', async ({ page }) => {
+    await mockApp(page, { reconciliations: new FakeReconciliations() })
+    await open(page)
+    await beginning(page).fill('100.10')
+    await ending(page).fill('40.05')
+    const summary = page.getByTestId('statement-summary')
+    await expect(summary).toContainText('Statement period')
+    await expect(summary).toContainText('$100.10')
+    await expect(summary).toContainText('$40.05')
+    await expect(page.getByTestId('net-change')).toHaveText('-$60.05')
+  })
+
+  test('invalid dates and balances stop the user from continuing', async ({ page }) => {
+    await mockApp(page, { reconciliations: new FakeReconciliations() })
+    await open(page)
+    await page.getByLabel(/This is the first reconciliation here/).check()
+    await beginning(page).fill('0')
+    await ending(page).fill('abc')
+    await next(page).click()
+    await expect(page.getByText(/Enter the beginning and ending balances as numbers/)).toBeVisible()
+    await ending(page).fill('0')
+    await page.getByLabel('Statement start date').fill('2026-09-30')
+    await next(page).click()
+    await expect(page.getByText(/start date is after the end date/)).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Match transactions to the statement' })).toHaveCount(0)
+  })
+
+  test('demo statement is the primary action, CSV is secondary and nothing is created in QuickBooks', async ({ page }) => {
+    await mockApp(page, { reconciliations: new FakeReconciliations() })
+    await open(page)
+    await expect(page.getByRole('button', { name: 'Load the demo statement transactions' })).toHaveClass(/primary-button/)
+    await expect(page.getByText(/does not create any transactions in QuickBooks/)).toBeVisible()
+    await expect(page.getByLabel('Statement CSV file')).toBeVisible()
+    await page.getByRole('button', { name: 'Load the demo statement transactions' }).click()
+    await expect(page.getByRole('status').filter({ hasText: 'statement lines will be matched' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Load the demo statement transactions' })).toHaveCount(0)
+  })
+
+  test('a previous completed reconciliation fixes the beginning balance until deliberately unlocked, and a mismatch blocks continuing', async ({ page }) => {
+    await mockApp(page, { reconciliations: new FakeReconciliations() })
+    await open(page)
+    await page.getByRole('button', { name: 'Load the demo statement transactions' }).click()
+    await page.getByLabel(/This is the first reconciliation here/).check()
+    await next(page).click()
+    await page.getByRole('button', { name: /Clear all suggested matches/ }).click()
+    await page.getByTestId('bulk-confirm').getByRole('button', { name: /^Confirm/ }).click()
+    await page.getByRole('navigation', { name: 'Reconciliation steps' }).getByRole('button', { name: '4. Review & complete' }).click()
+    await page.getByRole('button', { name: /Complete reconciliation/ }).click()
+    await expect(page.getByTestId('completed-banner')).toBeVisible()
+    await page.getByRole('navigation', { name: 'Reconciliation steps' }).getByRole('button', { name: '1. Account' }).click()
+    await page.getByRole('button', { name: 'Start reconciliation for Chase Business Checking' }).click()
+    await expect(page.getByTestId('beginning-source')).toContainText('reconciliation completed through')
+    await expect(beginning(page)).toHaveAttribute('readonly', '')
+    await expect(page.getByLabel(/This is the first reconciliation here/)).toHaveCount(0)
+    await page.getByRole('button', { name: /Edit the beginning balance/ }).click()
+    await beginning(page).fill('1.00')
+    await expect(page.getByTestId('beginning-mismatch')).toContainText('does not agree')
+    await expect(next(page)).toBeDisabled()
+  })
+})

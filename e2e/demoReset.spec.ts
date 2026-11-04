@@ -3,7 +3,7 @@ import { createRecord } from '../shared/demoEntries'
 import { DEMO_CLIENT_ID } from '../shared/demoBooks'
 import { buildDemoMonthEndRecords } from '../shared/demoMonthEnd'
 import { DEMO_RESET_CLIENTS } from '../shared/demoReset'
-import { FakeMonthEnd, FakeReconciliations, mockApp } from './support'
+import { confirmReview, FakeMonthEnd, FakeReconciliations, mockApp } from './support'
 
 const nav = (page: Page, name: RegExp) => page.locator('nav.main-nav').getByRole('button', { name })
 const choosePeriod = async (page: Page, month: number) => {
@@ -36,6 +36,7 @@ async function recordPartialInvoicePayment(page: Page) {
 
 async function addMissingCharge(page: Page) {
   await nav(page, /Reconcile/).click()
+  await page.locator('label.client-switcher select').selectOption({ label: 'ABC Plumbing' })
   await page.getByRole('button', { name: 'Start reconciliation for Chase Business Credit Card' }).click()
   await page.getByRole('button', { name: 'Load the demo statement transactions' }).click()
   const firstTime = page.getByLabel(/This is the first reconciliation here/)
@@ -65,7 +66,7 @@ async function closeJuly(page: Page) {
   await choosePeriod(page, 7)
   await expect(page.getByTestId('month-summary')).toBeVisible()
   for (const name of ['Mark receivables reviewed', 'Mark payables reviewed', 'Mark statements reviewed']) {
-    await page.getByRole('button', { name }).click()
+    await confirmReview(page, name)
   }
   await page.getByRole('button', { name: /Approve and close July 2026/ }).click()
   await expect(page.getByTestId('status-approval')).toHaveText('Complete')

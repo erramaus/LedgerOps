@@ -55,6 +55,9 @@ const demoResetRepository = loaded.databaseUrl
   : new MemoryDemoResetRepository({ entries: demoEntryStore, journals: demoJournalStore, payments: demoPaymentStore, workpapers: demoWorkpaperStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
 const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore, demoEntryStore, demoJournalStore, demoPaymentStore, demoWorkpaperStore, demoResetRepository })
 
-app.listen(port, () => {
-  console.log(`LedgerOps backend listening on port ${port}`)
-})
+if (loaded.devBypassRefusal) console.error(`LEDGEROPS_DEV_BYPASS_AUTH was REFUSED and sign-in stays required: ${loaded.devBypassRefusal}.`)
+if (loaded.app.devBypassAuth) console.warn('*** LOCAL DEVELOPMENT AUTH BYPASS IS ACTIVE: demo routes need no sign-in; QuickBooks routes still require real sign-in. Listening on 127.0.0.1 only. ***')
+
+const listening = () => console.log(`LedgerOps backend listening on port ${port}`)
+if (loaded.app.devBypassAuth) app.listen(port, '127.0.0.1', listening)
+else app.listen(port, listening)

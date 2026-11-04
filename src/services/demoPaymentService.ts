@@ -57,7 +57,7 @@ export function billsWithPayments(bills: Bill[], books: DemoPaymentBook[], clien
     const amountPaid = (Math.round(bill.amountPaid * 100) + (added.get(bill.id) ?? 0)) / 100
     const remainingCents = Math.round(bill.amount * 100) - Math.round(amountPaid * 100)
     const status = remainingCents <= 0 ? 'Paid' as const : amountPaid > 0 ? 'Partially Paid' as const : bill.status
-    return { ...bill, amountPaid, status }
+    return { ...bill, amountPaid, status, needsReview: bill.needsReview ?? bill.status === 'Needs Review' }
   })
 }
 

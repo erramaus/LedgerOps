@@ -80,7 +80,7 @@ export function demoTransactionFacts(period: Period, ledger: DemoLedger = demoLe
   }
 }
 
-export function demoOpenItems(kind: 'ar' | 'ap', period: Period, ledgerSource: DemoLedger = demoLedger) {
+export function demoOpenItems(kind: 'ar' | 'ap', period: Period, ledgerSource: DemoLedger = demoLedger, today?: string) {
   const { accounts, entries } = ledgerSource
   const items = kind === 'ar' ? ledgerSource.receivableItems ?? demoReceivableItems() : ledgerSource.payableItems ?? demoPayableItems()
   const end = periodEnd(period)
@@ -89,7 +89,16 @@ export function demoOpenItems(kind: 'ar' | 'ap', period: Period, ledgerSource: D
   const overdue = open.filter((entry) => entry.item.dueDate < end)
   const ledger = balanceAt(accounts, entries, kind, end)
   const control = ledger === result.totalCents ? [] : [`The ${kind === 'ar' ? 'receivables' : 'payables'} aging does not agree with the ledger balance.`]
-  return openItemFacts(result.table, { totalCents: result.totalCents, itemCount: open.length, overdueCount: overdue.length, overdueCents: overdue.reduce((total, entry) => total + entry.cents, 0) }, control)
+  const month = openItemFacts(result.table, { totalCents: result.totalCents, itemCount: open.length, overdueCount: overdue.length, overdueCents: overdue.reduce((total, entry) => total + entry.cents, 0) }, control)
+  if (!month.facts) return month
+  // Today's balances use the same rule (a balance is overdue when its due date is before the as-of day), at today's date.
+  let todayFacts: NonNullable<typeof month.facts>['today']
+  if (today) {
+    const now = items.map((item) => ({ item, cents: openBalanceCents(item, today) })).filter((entry) => entry.cents > 0)
+    const late = now.filter((entry) => entry.item.dueDate < today)
+    todayFacts = { date: today, totalCents: now.reduce((total, entry) => total + entry.cents, 0), itemCount: now.length, overdueCount: late.length, overdueCents: late.reduce((total, entry) => total + entry.cents, 0) }
+  }
+  return { facts: { ...month.facts, asOf: end, ...(todayFacts ? { today: todayFacts } : {}) } }
 }
 
 export function demoUnusual(period: Period, ledger: DemoLedger = demoLedger) {
@@ -114,7 +123,7 @@ export function demoStatementFacts(period: Period, ledger: DemoLedger = demoLedg
 }
 
 /** Inputs for the demo client's month. `liveTransactions` replaces the scenario figures for the month that uses live demo transactions. */
-export function demoMonthEndInputs(period: Period, options: { records: ReconRecordLike[]; signoffs: MonthEndRecord['signoffs']; closing?: MonthEndRecord['closing']; liveTransactions?: TransactionFacts | null; ledger?: DemoLedger; clientId?: string }): MonthEndInputs {
+export function demoMonthEndInputs(period: Period, options: { records: ReconRecordLike[]; signoffs: MonthEndRecord['signoffs']; closing?: MonthEndRecord['closing']; liveTransactions?: TransactionFacts | null; ledger?: DemoLedger; clientId?: string; today?: string }): MonthEndInputs {
   const key = periodKey(period)
   const ledger: DemoLedger = options.ledger ?? demoLedger
   const clientId = options.clientId ?? ledger.clientId ?? DEMO_CLIENT_ID
@@ -126,7 +135,7 @@ export function demoMonthEndInputs(period: Period, options: { records: ReconReco
   const reconAccounts = ledger.reconAccounts ?? DEMO_RECONCILIATION_ACCOUNTS
   const accountsFor = (kind: 'bank' | 'credit_card') => reconFactsFor(reconAccounts.filter((account) => account.kind === kind), options.records, key)
   const open = (kind: 'ar' | 'ap'): Availability<OpenItemFacts> => {
-    const result = demoOpenItems(kind, period, ledger)
+    const result = demoOpenItems(kind, period, ledger, options.today)
     return result.facts ? known(result.facts) : unknown(result.reason ?? 'Not available.')
   }
   return {

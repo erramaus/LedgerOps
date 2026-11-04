@@ -4,6 +4,7 @@ import App from './App'
 import { demoDataService } from './services/demoDataService'
 import { companyRequests } from './services/demoCompanyData'
 import { buildWorkTasks, summarizeTasks, type ClientRecords } from './services/workQueue'
+import { localIsoDate } from './services/inboxView'
 import { buildAutomationTasks } from './services/automationReminders'
 import { demoRecurringHistory } from './services/automationDemoData'
 import { historyFromTransactions, recurringFromHistory } from './services/recurringTransactions'
@@ -25,6 +26,7 @@ const records: ClientRecords = {
   transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts,
   requests: allDemoRequests,
   monthEnd: monthEndItems,
+  today: localIsoDate(new Date()),
 }
 const visibleRecurringHistory = historyFromTransactions(demoClient.id, 'demo', transactions)
 const visibleRecurringKeys = new Set(visibleRecurringHistory.map((entry) => `${entry.payee}|${entry.date}|${entry.amountCents}`))

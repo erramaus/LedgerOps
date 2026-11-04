@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { PeriodPicker } from "./PeriodPicker";
 import { monthLabel, type Period } from "../shared/period";
-import type { ChecklistItem, MonthEndEvent, MonthEndRecord, Source, StepStatus, StepView } from "../shared/monthEnd";
+import { progressCounts, type ChecklistItem, type MonthEndEvent, type MonthEndRecord, type Source, type StepStatus, type StepView } from "../shared/monthEnd";
 import type { MonthEndView } from "./useMonthEnd";
 
 const STATUS_CLASS: Record<StepStatus, string> = { "Not Started": "not-started", "In Progress": "in-progress", Blocked: "blocked", Complete: "complete" };
@@ -9,15 +9,45 @@ const EVENT_TEXT: Record<MonthEndEvent["action"], string> = { signed_off: "Revie
 
 const when = (iso: string) => iso.replace("T", " ").slice(0, 16);
 
-function Step({ item, view, onNavigate, locked }: { item: ChecklistItem; view: MonthEndView; onNavigate: (destination: StepView) => void; locked: boolean }) {
+function ReviewConfirmation({ item, view, clientName, periodLabel, onDone }: { item: ChecklistItem; view: MonthEndView; clientName: string; periodLabel: string; onDone: () => void }) {
   const [note, setNote] = useState("");
+  const signoff = item.signoff!;
+  const noteOk = !signoff.noteRequired || note.trim().length >= 5;
+  return (
+    <div className="me-confirm" role="group" aria-label={`Confirm review: ${item.title}`} data-testid={`confirm-${item.id}`}>
+      <strong>Confirm your review before it is recorded</strong>
+      <dl>
+        <div><dt>Client</dt><dd>{clientName}</dd></div>
+        <div><dt>Period</dt><dd>{periodLabel}</dd></div>
+        <div><dt>{signoff.asOf ? `Figures as of ${signoff.asOf}` : "Figures"}</dt><dd data-testid={`confirm-figures-${item.id}`}>{signoff.figures}</dd></div>
+        <div>
+          <dt>Exceptions you are accepting</dt>
+          <dd data-testid={`confirm-exceptions-${item.id}`}>{signoff.exceptions.length > 0 ? <ul>{signoff.exceptions.map((line) => <li key={line}>{line}</li>)}</ul> : "None"}</dd>
+        </div>
+      </dl>
+      <p className="muted me-hint">Your name and the time are recorded with this review. It does not complete any reconciliation or other required check, and it stops counting if these figures change.</p>
+      {signoff.noteRequired && (
+        <label className="me-note">
+          Note (required, because you are accepting an exception)
+          <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Why is this acceptable?" aria-label={`Note for ${item.title}`} />
+        </label>
+      )}
+      <div className="me-actions">
+        <button className="primary-button" disabled={view.busy || !noteOk} onClick={() => void view.signOff(item.id, note.trim(), { fingerprint: signoff.fingerprint, figures: signoff.figures, exceptions: signoff.exceptions, asOf: signoff.asOf }).then(onDone)}>Confirm review</button>
+        <button className="text-button" disabled={view.busy} onClick={onDone}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function Step({ item, view, onNavigate, locked, clientName, periodLabel }: { item: ChecklistItem; view: MonthEndView; onNavigate: (destination: StepView) => void; locked: boolean; clientName: string; periodLabel: string }) {
+  const [confirming, setConfirming] = useState(false);
   const signoff = item.signoff;
   const canSign = Boolean(signoff?.allowed) && !locked && item.status !== "Complete";
-  const noteOk = !signoff?.noteRequired || note.trim().length >= 5;
   return (
     <li className={`me-step ${STATUS_CLASS[item.status]}`} data-testid={`step-${item.id}`}>
       <div className="me-step-head">
-        <span className="me-step-number" aria-hidden="true">{item.status === "Complete" ? "✓" : item.number}</span>
+        <span className="me-step-number" aria-hidden="true">{item.status === "Complete" ? "?" : item.number}</span>
         <h3>{item.number}. {item.title}</h3>
         <span className={`me-status ${STATUS_CLASS[item.status]}`} data-testid={`status-${item.id}`}>{item.status}</span>
       </div>
@@ -30,20 +60,11 @@ function Step({ item, view, onNavigate, locked }: { item: ChecklistItem; view: M
         </div>
       )}
       <div className="me-actions">
-        {item.action && <button className="secondary-button me-open" onClick={() => onNavigate(item.action!.view)}>{item.action.label} <span>→</span></button>}
-        {canSign && signoff && (
-          <>
-            {signoff.noteRequired && (
-              <label className="me-note">
-                Note (required)
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Why is this acceptable?" aria-label={`Note for ${item.title}`} />
-              </label>
-            )}
-            <button className="primary-button" disabled={view.busy || !noteOk} onClick={() => void view.signOff(item.id, note.trim(), signoff.fingerprint, signoff.figures).then(() => setNote(""))}>{signoff.label}</button>
-          </>
-        )}
+        {item.action && <button className="secondary-button me-open" onClick={() => onNavigate(item.action!.view)}>{item.action.label} <span>?</span></button>}
+        {canSign && signoff && !confirming && <button className="primary-button" disabled={view.busy} onClick={() => setConfirming(true)}>{signoff.label}</button>}
         {signoff?.current && !signoff.stale && item.status === "Complete" && !locked && <button className="text-button" disabled={view.busy} onClick={() => void view.withdraw(item.id)}>Withdraw this review</button>}
       </div>
+      {canSign && signoff && confirming && <ReviewConfirmation item={item} view={view} clientName={clientName} periodLabel={periodLabel} onDone={() => setConfirming(false)} />}
       {signoff && !signoff.allowed && item.status !== "Complete" && <p className="muted me-hint">This cannot be accepted as an exception. Fix it first.</p>}
     </li>
   );
@@ -54,18 +75,29 @@ function HistoryList({ record }: { record: MonthEndRecord }) {
   return (
     <div className="panel recon-table" data-testid="month-history">
       <div className="recon-row heading history"><span>When</span><span>Who</span><span>What</span><span>Detail</span></div>
-      {record.history.map((event, index) => (
-        <div className="recon-row history" key={`${index}-${event.at}-${event.action}`}>
-          <span>{when(event.at)}</span>
-          <span>{event.by}</span>
-          <span>{EVENT_TEXT[event.action]}{event.step ? ` (${event.step})` : ""}</span>
-          <span>{event.reason ?? event.note ?? "—"}</span>
-        </div>
-      ))}
+      {record.history.map((event, index) => {
+        const lines = [
+          event.figures ? `Figures: ${event.figures}` : null,
+          event.reason ? `Reason: ${event.reason}` : null,
+          event.note ? `Note: ${event.note}` : null,
+        ].filter((line): line is string => line !== null);
+        return (
+          <div className="recon-row history" key={`${index}-${event.at}-${event.action}`}>
+            <span>{when(event.at)}</span>
+            <span>{event.by}</span>
+            <span>{EVENT_TEXT[event.action]}{event.step ? ` (${event.step})` : ""}</span>
+            <span>
+              {lines.length === 0 && !event.exceptions?.length ? "No further detail recorded" : lines.map((line) => <span className="history-line" key={line}>{line}</span>)}
+              {event.exceptions && event.exceptions.length > 0 && (
+                <span className="history-line">Exceptions recorded: <ul className="history-exceptions">{event.exceptions.map((line) => <li key={line}>{line}</li>)}</ul></span>
+              )}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
-
 export function MonthEnd({
   source,
   clientName,
@@ -86,10 +118,12 @@ export function MonthEnd({
   sourceSwitch: ReactNode;
 }) {
   const [reason, setReason] = useState("");
+  const [unfinishedOnly, setUnfinishedOnly] = useState(false);
   const { checklist, record, status } = view;
   const closed = Boolean(checklist?.closed);
   const done = checklist ? checklist.items.filter((item) => item.id !== "approval" && item.status === "Complete").length : 0;
   const percent = Math.round((done / 9) * 100);
+  const counts = checklist ? progressCounts(checklist) : null;
   const closedWhileChanged = Boolean(record?.closing) && Boolean(checklist) && !checklist!.closed;
 
   return (
@@ -123,6 +157,17 @@ export function MonthEnd({
               <strong>{closed ? `${monthLabel(period)} is closed` : checklist.readyToClose ? "Everything checks out. Ready for your approval." : `${9 - done} of 9 checks still need work`}</strong>
               <span>{done} of 9 checks complete</span>
             </div>
+            <p className="muted me-progress-note" data-testid="progress-note">Steps 1–9 are the required checks. Step 10 is the final approval, and it opens only when all nine are complete.</p>
+            {counts && (
+              <ul className="me-counts" data-testid="progress-counts" aria-label="Required checks by status">
+                {(["Complete", "In Progress", "Not Started", "Blocked"] as const).map((label) => <li key={label} className={STATUS_CLASS[label]} data-testid={`count-${STATUS_CLASS[label]}`}>{label}: <strong>{counts[label]}</strong></li>)}
+              </ul>
+            )}
+            <label className="me-filter">
+              <input type="checkbox" checked={unfinishedOnly} onChange={(event) => setUnfinishedOnly(event.target.checked)} />
+              Show unfinished checks
+              <span className="muted" data-testid="filter-count"> (showing {unfinishedOnly ? 9 - done : 9} of 9)</span>
+            </label>
             <div className="large-progress" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100} aria-label="Month-end progress"><span style={{ width: `${percent}%` }} /></div>
           </section>
           {closedWhileChanged && (
@@ -131,8 +176,9 @@ export function MonthEnd({
             </div>
           )}
           <ol className="me-steps">
-            {checklist.items.filter((item) => item.id !== "approval").map((item) => <Step key={`${item.id}-${item.signoff?.fingerprint ?? ""}`} item={item} view={view} onNavigate={onNavigate} locked={closed} />)}
+            {checklist.items.filter((item) => item.id !== "approval" && (!unfinishedOnly || item.status !== "Complete")).map((item) => <Step key={`${item.id}-${item.signoff?.fingerprint ?? ""}`} item={item} view={view} onNavigate={onNavigate} locked={closed} clientName={clientName} periodLabel={monthLabel(period)} />)}
           </ol>
+          {unfinishedOnly && done === 9 && <p className="muted" data-testid="filter-empty">All 9 required checks are complete.</p>}
 
           {checklist.items.filter((item) => item.id === "approval").map((item) => (
             <section className={`me-step approval ${STATUS_CLASS[item.status]}`} key={item.id} data-testid="step-approval">
@@ -142,6 +188,7 @@ export function MonthEnd({
                 <span className={`me-status ${STATUS_CLASS[item.status]}`} data-testid="status-approval">{item.status}</span>
               </div>
               <p className="me-attention">{item.attention}</p>
+              {!closed && !checklist.readyToClose && <p className="me-blocked" data-testid="approval-blocked">Approval is blocked: every one of the nine required checks must be Complete first. Reviewing figures here never overrides an unfinished reconciliation or a missing check.</p>}
               {item.details.length > 0 && <ul className="me-details">{item.details.map((detail) => <li key={detail}>{detail}</li>)}</ul>}
               {(checklist.readyToClose || closed) && (
                 <div className="me-evidence">

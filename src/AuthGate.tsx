@@ -7,7 +7,7 @@ type GateState =
   | { status: 'loading' }
   | { status: 'unreachable' }
   | { status: 'signed-out'; configured: boolean; notice?: string }
-  | { status: 'signed-in'; user: AuthUser }
+  | { status: 'signed-in'; user: AuthUser; devBypass: boolean }
 
 const errorMessages: Record<string, string> = {
   not_authorized: 'That account is not authorized to use LedgerOps. Ask your administrator for access.',
@@ -32,7 +32,7 @@ export default function AuthGate() {
     try {
       const session = await authService.getSession()
       setState(session.authenticated && session.user
-        ? { status: 'signed-in', user: session.user }
+        ? { status: 'signed-in', user: session.user, devBypass: session.devBypass === true }
         : { status: 'signed-out', configured: session.configured, notice })
     } catch {
       setState({ status: 'unreachable' })
@@ -42,13 +42,15 @@ export default function AuthGate() {
   useEffect(() => {
     void loadSession(consumeSignInError())
     return onUnauthorized(() => {
-      setState((current) => current.status === 'signed-in'
+      // QuickBooks routes still need a real sign-in, so their 401s must not eject a bypass session.
+      setState((current) => current.status === 'signed-in' && !current.devBypass
         ? { status: 'signed-out', configured: true, notice: 'Your session has ended. Please sign in again.' }
         : current)
     })
   }, [loadSession])
 
   const signOut = async () => {
+    if (state.status === 'signed-in' && state.devBypass) return
     try {
       await authService.signOut()
     } finally {

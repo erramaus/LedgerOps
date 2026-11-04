@@ -37,7 +37,7 @@ export type MonthEndView = {
   busy: boolean;
   actionError: string | null;
   clearActionError: () => void;
-  signOff: (step: string, note: string, fingerprint: string, figures: string) => Promise<void>;
+  signOff: (step: string, note: string, review: { fingerprint: string; figures: string; exceptions?: string[]; asOf?: string }) => Promise<void>;
   withdraw: (step: string) => Promise<void>;
   close: () => Promise<void>;
   reopen: (reason: string) => Promise<void>;
@@ -89,7 +89,7 @@ export function useMonthEnd(args: Args): MonthEndView {
       if (source === "demo") {
         if (client.id === DEMO_CLIENT_ID || ledger?.clientId === client.id) {
           const live = transactionFacts(period, demoTransactions, requests);
-          inputs = demoMonthEndInputs(period, { records: reconciliationRecords, signoffs: context.signoffs, closing: context.closing, liveTransactions: live.facts.total > 0 && live.undated === 0 ? live.facts : null, ledger, clientId: client.id });
+          inputs = demoMonthEndInputs(period, { records: reconciliationRecords, signoffs: context.signoffs, closing: context.closing, liveTransactions: live.facts.total > 0 && live.undated === 0 ? live.facts : null, ledger, clientId: client.id, today });
         } else {
           inputs = allUnavailable(key, `Detailed demo records are not set up for ${client.name}.`, context.signoffs, context.closing);
         }
@@ -136,7 +136,7 @@ export function useMonthEnd(args: Args): MonthEndView {
       latest.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, source, client.id, key, reloadCount, refreshToken, demoTransactions, requests, quickBooksData, ledger]);
+  }, [enabled, source, client.id, key, today, reloadCount, refreshToken, demoTransactions, requests, quickBooksData, ledger]);
 
   const inputs = useMemo(() => (base ? { ...base, signoffs: record?.signoffs ?? {}, closing: record?.closing } : null), [base, record]);
   const checklist = useMemo(() => (inputs ? buildChecklist(inputs) : null), [inputs]);
@@ -160,7 +160,7 @@ export function useMonthEnd(args: Args): MonthEndView {
   return {
     status, error, checklist, record, history, storage, busy, actionError,
     clearActionError: () => setActionError(null),
-    signOff: (step, note, fingerprint, figures) => run(() => monthEndService.signOff(recordId, { step, note, fingerprint, figures, clientName: client.name, expectedVersion: record?.version ?? 0 })),
+    signOff: (step, note, review) => run(() => monthEndService.signOff(recordId, { step, note, ...review, clientName: client.name, expectedVersion: record?.version ?? 0 })),
     withdraw: (step) => run(() => monthEndService.clearSignOff(recordId, step, record?.version ?? 0)),
     close: () =>
       run(async () => {

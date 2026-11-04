@@ -83,6 +83,9 @@ export function createApp(dependencies: AppDependencies) {
   const authReady = Boolean(authProvider && sessionStore && config.sessionSecret)
   const cookieName = config.production ? '__Host-ledgerops.sid' : 'ledgerops.sid'
   const cookieOptions = { httpOnly: true, secure: config.production, sameSite: 'lax' as const, path: '/' }
+  const devBypass =
+    config.devBypassAuth === true && !config.production && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(config.appOrigin)
+  const bypassSecret = config.sessionSecret ?? crypto.randomBytes(32).toString('hex')
   const app = express()
 
   app.disable('x-powered-by')
@@ -96,12 +99,12 @@ export function createApp(dependencies: AppDependencies) {
     next()
   })
 
-  if (authReady) {
+  if (authReady || devBypass) {
     app.use(
       session({
         name: cookieName,
-        secret: config.sessionSecret!,
-        store: sessionStore,
+        secret: authReady ? config.sessionSecret! : bypassSecret,
+        store: authReady ? sessionStore : (sessionStore ?? new session.MemoryStore()),
         resave: false,
         saveUninitialized: false,
         rolling: true,
@@ -110,13 +113,36 @@ export function createApp(dependencies: AppDependencies) {
     )
   }
 
+  const hasRealSession = (request: Request) => {
+    const current = request.session
+    return Boolean(current?.user && current.authenticatedAt && now() - current.authenticatedAt < SESSION_ABSOLUTE_MS)
+  }
+
+  /** Re-verified on every request: the bypass only serves connections that originate on this machine, addressed to it. */
+  const isLocalRequest = (request: Request) => {
+    const address = request.socket.remoteAddress ?? ''
+    const loopback = address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+    const host = (request.get('host') ?? '').replace(/:\d+$/, '')
+    return loopback && ['localhost', '127.0.0.1', '[::1]'].includes(host) && !request.get('x-forwarded-for')
+  }
+  const bypassActive = (request: Request) => devBypass && Boolean(request.session) && isLocalRequest(request) && !hasRealSession(request)
+
   const requireAuth: RequestHandler = (request, response, next) => {
     const current = request.session
-    const valid = Boolean(current?.user && current.authenticatedAt && now() - current.authenticatedAt < SESSION_ABSOLUTE_MS)
+    const valid = hasRealSession(request)
     if (valid) return next()
     const finish = () => response.status(401).json({ error: 'Authentication required.' })
     if (current?.user) destroySession(request).then(finish, finish)
     else finish()
+  }
+
+  /** Demo-only routes: a real session, or (local development only) the bypass. Never used for QuickBooks. */
+  const requireDemoAuth: RequestHandler = (request, response, next) => {
+    if (bypassActive(request)) {
+      request.session.csrfToken ??= crypto.randomBytes(32).toString('hex')
+      return next()
+    }
+    requireAuth(request, response, next)
   }
 
   const requireCsrf: RequestHandler = (request, response, next) => {
@@ -138,9 +164,19 @@ export function createApp(dependencies: AppDependencies) {
   })
 
   app.get('/api/auth/session', (request, response) => {
+    if (bypassActive(request)) {
+      request.session.csrfToken ??= crypto.randomBytes(32).toString('hex')
+      return response.json({
+        configured: true,
+        authenticated: true,
+        devBypass: true,
+        user: { sub: 'dev-bypass', email: 'dev-bypass@localhost', name: 'Local development (auth bypass)' },
+        csrfToken: request.session.csrfToken,
+      })
+    }
     if (!authReady) return response.json({ configured: false, authenticated: false })
     const current = request.session
-    const valid = Boolean(current.user && current.authenticatedAt && now() - current.authenticatedAt < SESSION_ABSOLUTE_MS)
+    const valid = hasRealSession(request)
     if (!valid) return response.json({ configured: true, authenticated: false })
     response.json({ configured: true, authenticated: true, user: current.user, csrfToken: current.csrfToken })
   })
@@ -213,20 +249,34 @@ export function createApp(dependencies: AppDependencies) {
 
   const router = express.Router()
   app.use('/api/quickbooks', requireAuth, requireCsrf, router)
+  // Bypass sessions never receive QuickBooks access: these routers get a gateway that refuses every call.
+  const blockedQuickBooks = new Proxy({}, {
+    get: () => async () => {
+      throw new Error('QuickBooks requires a real signed-in session; the local development bypass does not grant it.')
+    },
+  }) as QuickBooksGateway
+  const bypassSwitch = (real: RequestHandler, bypassed: RequestHandler): RequestHandler =>
+    (request, response, next) => (bypassActive(request) ? bypassed : real)(request, response, next)
   const reconciliationStore = dependencies.reconciliationStore ?? new MemoryReconciliationStore()
-  app.use('/api/reconciliations', requireAuth, requireCsrf, createReconciliationRouter({ store: reconciliationStore, quickbooks, now }))
   const monthEndStore = dependencies.monthEndStore ?? new MemoryMonthEndStore()
-  app.use('/api/month-end', requireAuth, requireCsrf, createMonthEndRouter({ store: monthEndStore, reconciliations: reconciliationStore, quickbooks, now }))
+  app.use('/api/reconciliations', requireDemoAuth, requireCsrf, bypassSwitch(
+    createReconciliationRouter({ store: reconciliationStore, quickbooks, now }),
+    createReconciliationRouter({ store: reconciliationStore, quickbooks: blockedQuickBooks, now }),
+  ))
+  app.use('/api/month-end', requireDemoAuth, requireCsrf, bypassSwitch(
+    createMonthEndRouter({ store: monthEndStore, reconciliations: reconciliationStore, quickbooks, now }),
+    createMonthEndRouter({ store: monthEndStore, reconciliations: reconciliationStore, quickbooks: blockedQuickBooks, now }),
+  ))
   const demoEntryStore = dependencies.demoEntryStore ?? new MemoryDemoEntryStore()
   const demoJournalStore = dependencies.demoJournalStore ?? new MemoryDemoJournalStore()
   const demoPaymentStore = dependencies.demoPaymentStore ?? new MemoryDemoPaymentStore()
   const demoWorkpaperStore = dependencies.demoWorkpaperStore ?? new MemoryDemoWorkpaperStore()
-  app.use('/api/demo-entries', requireAuth, requireCsrf, createDemoEntryRouter({ store: demoEntryStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
-  app.use('/api/demo-journals', requireAuth, requireCsrf, createDemoJournalRouter({ store: demoJournalStore, monthEnd: monthEndStore, now }))
-  app.use('/api/demo-payments', requireAuth, requireCsrf, createDemoPaymentRouter({ store: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
-  app.use('/api/demo-workpapers', requireAuth, requireCsrf, createDemoWorkpaperRouter({ store: demoWorkpaperStore, now }))
+  app.use('/api/demo-entries', requireDemoAuth, requireCsrf, createDemoEntryRouter({ store: demoEntryStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
+  app.use('/api/demo-journals', requireDemoAuth, requireCsrf, createDemoJournalRouter({ store: demoJournalStore, monthEnd: monthEndStore, now }))
+  app.use('/api/demo-payments', requireDemoAuth, requireCsrf, createDemoPaymentRouter({ store: demoPaymentStore, reconciliations: reconciliationStore, monthEnd: monthEndStore, now }))
+  app.use('/api/demo-workpapers', requireDemoAuth, requireCsrf, createDemoWorkpaperRouter({ store: demoWorkpaperStore, now }))
   const demoResetRepository = dependencies.demoResetRepository ?? new MemoryDemoResetRepository({ entries: demoEntryStore, journals: demoJournalStore, payments: demoPaymentStore, workpapers: demoWorkpaperStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
-  app.use('/api/demo-reset', requireAuth, requireCsrf, createDemoResetRouter(demoResetRepository))
+  app.use('/api/demo-reset', requireDemoAuth, requireCsrf, createDemoResetRouter(demoResetRepository))
 
   const fail = (response: Response, error: unknown, fallback: string) =>
     response.status(400).json({ error: error instanceof Error ? error.message : fallback })

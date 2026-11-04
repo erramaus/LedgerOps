@@ -34,7 +34,7 @@ export const monthEndService = {
     if (result.status === 404) return null
     return ok(result, 'Unable to load the month-end record.').record
   },
-  signOff: async (id: string, input: { step: string; note: string; fingerprint: string; figures: string; clientName: string; expectedVersion: number }) =>
+  signOff: async (id: string, input: { step: string; note: string; fingerprint: string; figures: string; exceptions?: string[]; asOf?: string; clientName: string; expectedVersion: number }) =>
     ok(await call<{ record: MonthEndRecord }>(`/api/month-end/${encode(id)}/signoff`, json(input)), 'Unable to record the review.').record,
   clearSignOff: async (id: string, step: string, expectedVersion: number) =>
     ok(await call<{ record: MonthEndRecord }>(`/api/month-end/${encode(id)}/clear-signoff`, json({ step, expectedVersion })), 'Unable to withdraw the review.').record,

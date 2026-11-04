@@ -191,6 +191,8 @@ export type Bill = {
   amountPaid: number
   category: string
   status: BillStatus
+  /** Review flag kept apart from payment: a bill can need review whether or not it is partly paid or late. */
+  needsReview?: boolean
 }
 
 // Calculated from the demo ledger so the dashboard can never disagree with the reports.

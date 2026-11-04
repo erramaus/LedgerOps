@@ -90,10 +90,12 @@ export function createMonthEndRouter(deps: { store: MonthEndStore; reconciliatio
 
   router.post('/:id/signoff', guard(async (request, response) => {
     const id = String(request.params.id)
-    const { step, note, fingerprint, figures, clientName, expectedVersion } = (request.body ?? {}) as Record<string, unknown>
+    const { step, note, fingerprint, figures, clientName, expectedVersion, exceptions: rawExceptions, asOf: rawAsOf } = (request.body ?? {}) as Record<string, unknown>
+    const exceptions = rawExceptions === undefined ? [] : Array.isArray(rawExceptions) && rawExceptions.length <= 20 && rawExceptions.every((line) => text(line, 500) !== null) ? (rawExceptions as string[]) : null
+    const asOf = rawAsOf === undefined ? undefined : typeof rawAsOf === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(rawAsOf) ? rawAsOf : null
     const cleanNote = text(note, 1000)?.trim() ?? null, cleanFingerprint = text(fingerprint, 300), cleanFigures = text(figures, 400), name = text(clientName, 200)
-    if (!isSignoffStep(step) || cleanNote === null || !cleanFingerprint || !cleanFigures || !name) return void send(response, problem(400, 'INVALID', 'The review details are not valid.'))
-    if (NOTE_REQUIRED_STEPS.includes(step) && cleanNote.length < 5) return void send(response, problem(400, 'NOTE_REQUIRED', 'Explain why this is acceptable. The note is kept with the month-end record.'))
+    if (!isSignoffStep(step) || cleanNote === null || !cleanFingerprint || !cleanFigures || !name || exceptions === null || asOf === null) return void send(response, problem(400, 'INVALID', 'The review details are not valid.'))
+    if ((NOTE_REQUIRED_STEPS.includes(step) || exceptions.length > 0) && cleanNote.length < 5) return void send(response, problem(400, 'NOTE_REQUIRED', 'Explain why this is acceptable. The note is kept with the month-end record.'))
     const loaded = await loadForUpdate(id, expectedVersion, name)
     if (isProblem(loaded)) return void send(response, loaded)
     const { record } = loaded
@@ -101,8 +103,8 @@ export function createMonthEndRouter(deps: { store: MonthEndStore; reconciliatio
     const at = iso(), by = actor(request)
     const next: MonthEndRecord = {
       ...record, version: record.version + 1, updatedAt: at,
-      signoffs: { ...record.signoffs, [step]: { by, at, note: cleanNote, fingerprint: cleanFingerprint, figures: cleanFigures } },
-      history: [...record.history, { at, by, action: 'signed_off', step, note: cleanNote || undefined }],
+      signoffs: { ...record.signoffs, [step]: { by, at, note: cleanNote, fingerprint: cleanFingerprint, figures: cleanFigures, ...(exceptions.length > 0 ? { exceptions } : {}), ...(asOf ? { asOf } : {}) } },
+      history: [...record.history, { at, by, action: 'signed_off', step, note: cleanNote || undefined, figures: cleanFigures, ...(exceptions.length > 0 ? { exceptions } : {}) }],
     }
     if (!(await store.put(next, record.version))) return void send(response, problem(409, 'CONFLICT', 'This month-end record changed elsewhere. Reload it before making changes.'))
     response.json({ durable: store.durable, record: next })
@@ -159,6 +161,11 @@ export function createMonthEndRouter(deps: { store: MonthEndStore; reconciliatio
     for (const step of ['receivables', 'payables', 'statements'] as const) {
       if (!record.signoffs[step]) return void send(response, problem(422, 'NOT_COMPLETABLE', `${STEP_TITLES[step]} must be reviewed and signed off.`))
     }
+    // Accepting an exception always needs a recorded explanation, whatever the browser claims.
+    for (const step of SIGNOFF_STEPS) {
+      const signed = record.signoffs[step]
+      if (signed?.exceptions?.length && signed.note.trim().length < 5) return void send(response, problem(422, 'NOT_COMPLETABLE', `${STEP_TITLES[step]} accepted an exception without a note.`))
+    }
     const exceptions = Array.isArray(body.exceptions) && body.exceptions.length <= 50 && body.exceptions.every((line) => text(line, 500) !== null) ? (body.exceptions as string[]) : null
     if (!exceptions) return void send(response, problem(400, 'INVALID', 'The remaining exceptions are not valid.'))
 
@@ -190,7 +197,7 @@ export function createMonthEndRouter(deps: { store: MonthEndStore; reconciliatio
     const next: MonthEndRecord = {
       ...record, status: 'closed', version: record.version + 1, updatedAt: at,
       closing: { closedAt: at, closedBy: actor(request), checklist, exceptions, reconciliations: relied },
-      history: [...record.history, { at, by: actor(request), action: 'closed' }],
+      history: [...record.history, { at, by: actor(request), action: 'closed', ...(exceptions.length > 0 ? { exceptions } : {}) }],
     }
     if (!(await store.put(next, record.version))) return void send(response, problem(409, 'CONFLICT', 'This month-end record changed elsewhere. Reload it before closing.'))
     response.json({ durable: store.durable, record: next })

@@ -38,15 +38,16 @@ test.describe('Phase 7: smart bookkeeping automation', () => {
 
   test('reviews recurring reminders without creating transactions automatically', async ({ page }) => {
     await openWorkspace(page)
-    await nav(page, /Bookkeeping Review/).click()
+    await nav(page, /Inbox/).click()
     await page.locator('.filter-row').getByRole('button', { name: /^Transactions/ }).click()
-    const reminder = page.locator('.review-card').filter({ hasText: 'Expected recurring transaction missing' }).filter({ hasText: 'Adobe' }).first()
+    const reminder = page.locator('.inbox-row').filter({ hasText: 'Adobe' }).first()
     await expect(reminder).toBeVisible()
-    await reminder.click()
+    await reminder.getByRole('button', { name: 'Review Reminder' }).click()
     await expect(page.getByRole('heading', { name: 'Adobe' })).toBeVisible()
     await expect(page.locator('.request-detail-layout')).toContainText('This is a reminder only. No transaction will be created or posted automatically.')
     await page.getByRole('button', { name: 'Confirm pattern' }).click()
-    await expect(page.locator('.review-card').filter({ hasText: 'Adobe' })).toHaveCount(0)
+    await nav(page, /Inbox/).click()
+    await expect(page.locator('.inbox-row').filter({ hasText: 'Adobe' })).toHaveCount(0)
 
     await nav(page, /Settings/).click()
     await expect(page.locator('.audit-log-row').filter({ hasText: 'Confirmed recurring reminder for Adobe.' })).toBeVisible()

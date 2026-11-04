@@ -205,6 +205,37 @@ describe('statement detail, missing transactions and discrepancies', () => {
     expect(codes(input)).toContain('amount_discrepancy')
   })
 
+  it('blocks a match whose direction is opposite, even when the amounts are equal', () => {
+    const input = csvInput({ statementLines: [line('l1', '2026-08-05', 'CUSTOMER PAYMENT', 500, 'decrease'), line('l2', '2026-08-10', 'SUPPLIER', 120, 'decrease')], endingCents: 100000 - 50000 - 12000 })
+    const result = computeReconciliation(input, { today: '2026-10-01' })
+    expect(result.issues.map((issue) => issue.code)).toContain('amount_discrepancy')
+    expect(result.canComplete).toBe(false)
+  })
+
+  it('blocks one statement line assigned to two book transactions', () => {
+    const input = csvInput({
+      transactions: [txn('d1', '2026-08-05', 'Customer', 500, 'increase'), txn('d2', '2026-08-05', 'Customer', 500, 'increase'), txn('w1', '2026-08-10', 'Supplier', 120, 'decrease')],
+      clearedIds: ['d1', 'd2', 'w1'], matches: [{ lineId: 'l1', txnId: 'd1' }, { lineId: 'l1', txnId: 'd2' }, { lineId: 'l2', txnId: 'w1' }],
+      endingCents: 100000 + 100000 - 12000,
+    })
+    const result = computeReconciliation(input, { today: '2026-10-01' })
+    expect(result.issues.map((issue) => issue.code)).toContain('statement_line_reused')
+    expect(result.canComplete).toBe(false)
+  })
+
+  it('blocks one book transaction matched to two statement lines', () => {
+    const input = csvInput({
+      statementLines: [line('l1', '2026-08-05', 'CUSTOMER PAYMENT', 500, 'increase'), line('l3', '2026-08-05', 'CUSTOMER PAYMENT', 500, 'increase'), line('l2', '2026-08-10', 'SUPPLIER', 120, 'decrease')],
+      matches: [{ lineId: 'l1', txnId: 'd1' }, { lineId: 'l3', txnId: 'd1' }, { lineId: 'l2', txnId: 'w1' }], endingCents: 100000 + 100000 - 12000,
+    })
+    expect(codes(input)).toContain('transaction_matched_twice')
+  })
+
+  it('does not report either problem for a valid one-to-one matching', () => {
+    expect(codes(csvInput())).not.toContain('statement_line_reused')
+    expect(codes(csvInput())).not.toContain('transaction_matched_twice')
+  })
+
   it('points out an uncleared near-match with a different amount', () => {
     const input = csvInput({
       clearedIds: ['w1'], matches: [{ lineId: 'l2', txnId: 'w1' }], statementLines: [line('l1', '2026-08-05', 'CUSTOMER PAYMENT', 550, 'increase'), line('l2', '2026-08-10', 'SUPPLIER', 120, 'decrease')],

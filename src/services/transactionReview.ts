@@ -35,7 +35,7 @@ export function categorySummary(lines: TransactionLine[]) {
 
 export function categoryLabel(transaction: Transaction) {
   const lines = getLines(transaction)
-  return lines.length > 1 ? `Split (${lines.length})` : lines[0].category
+  return lines.length > 1 ? `Split (${lines.length} lines)` : lines[0].category
 }
 
 export const uncategorizedLineCount = (transaction: Transaction) => getLines(transaction).filter((line) => isUncategorized(line.category)).length
@@ -97,9 +97,81 @@ export function matchesReviewFilter(transaction: Transaction, filter: ReviewFilt
   return parseAmount(transaction.amount) >= 1000
 }
 
+/** Categorization state only; a missing receipt is a separate requirement (see needsReceipt). */
+export type CategorizationStatus = 'Needs review' | 'Categorized' | 'Matched'
+export type StatusFilter = 'All' | CategorizationStatus
+export const statusFilters: StatusFilter[] = ['All', 'Needs review', 'Categorized', 'Matched']
+
+export function categorizationStatus(transaction: Transaction): CategorizationStatus {
+  if (needsCategory(transaction) || transaction.status === 'Needs Review') return 'Needs review'
+  return transaction.status === 'Matched' ? 'Matched' : 'Categorized'
+}
+export const needsReceipt = (transaction: Transaction) => transaction.status === 'Needs Receipt'
+export const needsAttention = (transaction: Transaction) => categorizationStatus(transaction) === 'Needs review' || needsReceipt(transaction)
+
+export type ReasonFilter = 'Any' | 'Missing category' | 'Missing payee' | 'Missing receipt' | 'Large transaction'
+export const reasonFilters: ReasonFilter[] = ['Any', 'Missing category', 'Missing payee', 'Missing receipt', 'Large transaction']
+
+export function matchesReason(transaction: Transaction, reason: ReasonFilter) {
+  if (reason === 'Any') return true
+  if (reason === 'Missing category') return needsCategory(transaction)
+  if (reason === 'Missing payee') return !transaction.payee || transaction.payee === 'Unknown'
+  if (reason === 'Missing receipt') return needsReceipt(transaction)
+  return parseAmount(transaction.amount) >= 1000
+}
+
+/** Plain-language reasons a transaction needs a bookkeeper's attention, independent of its status label. */
+export function reviewReasons(transaction: Transaction): string[] {
+  return reasonFilters.filter((reason) => reason !== 'Any' && matchesReason(transaction, reason))
+}
+
+const MONTH_NAMES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const validIso = (year: number, month: number, day: number) => {
+  const date = new Date(Date.UTC(year, month - 1, day))
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+/** Accepts "2026-08-29" or "Aug 29, 2026"; anything else is undated (null), never guessed. */
+export function transactionIsoDate(value: string | undefined): string | null {
+  if (!value) return null
+  const text = value.trim()
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(text)
+  if (iso) return validIso(Number(iso[1]), Number(iso[2]), Number(iso[3]))
+  const display = /^([A-Za-z]{3})[A-Za-z]*\.? (\d{1,2}),? (\d{4})$/.exec(text)
+  if (!display) return null
+  const month = MONTH_NAMES.indexOf(display[1].toLowerCase()) + 1
+  return month ? validIso(Number(display[3]), month, Number(display[2])) : null
+}
+
+export type DateRange = { from?: string; to?: string }
+export const monthRange = (period: { year: number; month: number }): DateRange => {
+  const last = new Date(Date.UTC(period.year, period.month, 0)).getUTCDate()
+  const prefix = `${String(period.year).padStart(4, '0')}-${String(period.month).padStart(2, '0')}`
+  return { from: `${prefix}-01`, to: `${prefix}-${String(last).padStart(2, '0')}` }
+}
+export const hasDateRange = (range?: DateRange) => Boolean(range?.from || range?.to)
+
+export function inDateRange(transaction: Transaction, range?: DateRange) {
+  if (!hasDateRange(range)) return true
+  const date = transactionIsoDate(transaction.date)
+  if (!date) return false
+  return (!range?.from || date >= range.from) && (!range?.to || date <= range.to)
+}
+
+const formatIso = (iso: string) => `${MONTH_NAMES[Number(iso.slice(5, 7)) - 1].replace(/^./, (char) => char.toUpperCase())} ${Number(iso.slice(8, 10))}, ${iso.slice(0, 4)}`
+export function describeDateRange(range?: DateRange) {
+  if (!range?.from && !range?.to) return 'All dates'
+  if (range.from && range.to) return `${formatIso(range.from)} – ${formatIso(range.to)}`
+  return range.from ? `From ${formatIso(range.from)}` : `Up to ${formatIso(range.to!)}`
+}
+
 export type TransactionFilters = {
   clientId?: string | null
   status?: TransactionStatus | 'All'
+  categorization?: StatusFilter
+  reason?: ReasonFilter
+  range?: DateRange
   category?: string
   search?: string
 }
@@ -109,13 +181,30 @@ export function filterTransactions<T extends Transaction>(transactions: T[], fil
   return transactions.filter((transaction) => {
     if (filters.clientId && transaction.clientId && transaction.clientId !== filters.clientId) return false
     if (filters.status && filters.status !== 'All' && transaction.status !== filters.status) return false
+    if (filters.categorization && filters.categorization !== 'All' && categorizationStatus(transaction) !== filters.categorization) return false
+    if (filters.reason && !matchesReason(transaction, filters.reason)) return false
+    if (!inDateRange(transaction, filters.range)) return false
     if (filters.category && filters.category !== 'All' && !getLines(transaction).some((line) => line.category === filters.category)) return false
     if (search) {
-      const haystack = [transaction.payee, transaction.description, ...getLines(transaction).map((line) => line.description)].join(' ').toLowerCase()
+      const haystack = [transaction.payee, transaction.description, transaction.amount, ...getLines(transaction).map((line) => line.description)].join(' ').toLowerCase()
       if (!haystack.includes(search)) return false
     }
     return true
   })
+}
+
+/** Distinct clients among the given rows; rows without a client id are not counted. */
+export const clientIdsIn = (transactions: Transaction[]) => [...new Set(transactions.flatMap((transaction) => transaction.clientId ? [transaction.clientId] : []))]
+
+/**
+ * The next transaction to review after `currentId`: the following queued item in display order, wrapping
+ * to the start. The current transaction is never returned, so a finished item is not reopened.
+ */
+export function nextActionable<T extends Transaction>(ordered: T[], queue: T[], currentId: string): T | undefined {
+  const forward = adjacentInQueue(ordered, queue, currentId, 'next')
+  if (forward) return forward
+  const inQueue = new Set(queue.map((transaction) => transaction.id))
+  return ordered.find((transaction) => transaction.id !== currentId && inQueue.has(transaction.id))
 }
 
 export function categoriesIn(transactions: Transaction[]) {

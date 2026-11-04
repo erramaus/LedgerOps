@@ -19,12 +19,12 @@ export const unknown = <T>(reason: string): Availability<T> => ({ available: fal
 export type TransactionFacts = { total: number; uncategorized: number; possibleDuplicates: number; missingReceipts: number; missingPayees: number; openClientRequests: number }
 export type ReconRecordFacts = { id: string; status: 'draft' | 'completed'; periodEnd: string; version: number; completedAt?: string; completedBy?: string; differenceCents?: number; reopenedAt?: string; reopenReason?: string }
 export type AccountRecon = { accountId: string; name: string; kind: 'bank' | 'credit_card'; record?: ReconRecordFacts }
-export type OpenItemFacts = { totalCents: number; itemCount: number; overdueCount: number; overdueCents: number; reportVerified: boolean; reportProblems: string[]; /** What one item is, when it is not an invoice or bill (for example a customer balance). */ unit?: string }
+export type OpenItemFacts = { totalCents: number; itemCount: number; overdueCount: number; overdueCents: number; reportVerified: boolean; reportProblems: string[]; /** The date these figures are calculated at (the month end), when known. */ asOf?: string; /** The same open items measured at today's date, for comparison with the Receivables and Payables tabs. Never used in the review fingerprint. */ today?: { date: string; totalCents: number; itemCount: number; overdueCount: number; overdueCents: number }; /** What one item is, when it is not an invoice or bill (for example a customer balance). */ unit?: string }
 export type UnusualFacts = { accountsChecked: number; findings: string[] }
 export type StatementFacts = { netIncomeCents: number | null; totalAssetsCents: number | null; failed: string[]; unavailable: string[] }
 
-export type Signoff = { by: string; at: string; note: string; fingerprint: string; figures: string }
-export type MonthEndEvent = { at: string; by: string; action: 'signed_off' | 'signoff_cleared' | 'closed' | 'reopened'; step?: SignoffStep; reason?: string; note?: string }
+export type Signoff = { by: string; at: string; note: string; fingerprint: string; figures: string; /** What the reviewer accepted as exceptions when they confirmed, and the date the figures were calculated at. */ exceptions?: string[]; asOf?: string }
+export type MonthEndEvent = { at: string; by: string; action: 'signed_off' | 'signoff_cleared' | 'closed' | 'reopened'; step?: SignoffStep; reason?: string; note?: string; figures?: string; exceptions?: string[] }
 export type ClosedItem = { id: StepId; number: number; title: string; status: StepStatus; evidence: string[] }
 export type ClosingRecord = {
   closedAt: string
@@ -64,7 +64,7 @@ export type MonthEndInputs = {
   closing?: ClosingRecord
 }
 
-export type SignoffInfo = { allowed: boolean; label: string; noteRequired: boolean; fingerprint: string; figures: string; current?: Signoff; stale: boolean }
+export type SignoffInfo = { allowed: boolean; label: string; noteRequired: boolean; fingerprint: string; figures: string; /** Exceptions the reviewer would be accepting; empty when there are none. */ exceptions: string[]; asOf?: string; current?: Signoff; stale: boolean }
 export type ChecklistItem = {
   id: StepId
   number: number
@@ -134,7 +134,7 @@ function transactionSteps(inputs: MonthEndInputs): Draft[] {
         attention: dupState.fresh ? 'Reviewed.' : `${plural(facts.possibleDuplicates, 'possible duplicate')} to compare. If they are genuine, confirm that below.`,
         details: dupState.stale ? ['The number of possible duplicates changed since you confirmed this.'] : [], evidence: dupState.fresh ? [signoffEvidence(dupState.current!)] : [],
         action: { view: 'Bookkeeping Review', label: 'Compare transactions' },
-        signoff: { allowed: true, label: 'Confirm these were reviewed', noteRequired: true, fingerprint: dupFingerprint, figures: plural(facts.possibleDuplicates, 'possible duplicate'), current: dupState.current, stale: dupState.stale },
+        signoff: { allowed: true, label: 'Confirm these were reviewed', noteRequired: true, fingerprint: dupFingerprint, figures: plural(facts.possibleDuplicates, 'possible duplicate'), exceptions: [plural(facts.possibleDuplicates, 'possible duplicate')], current: dupState.current, stale: dupState.stale },
       }
 
   const infoFingerprint = `rcpt:${facts.missingReceipts}`
@@ -144,13 +144,13 @@ function transactionSteps(inputs: MonthEndInputs): Draft[] {
   if (facts.openClientRequests > 0) mustFix.push(`${plural(facts.openClientRequests, 'client question')} ${facts.openClientRequests === 1 ? 'is' : 'are'} still open.`)
   const receiptsOpen = facts.missingReceipts > 0 && !infoState.fresh
   const missing: Draft = mustFix.length === 0 && !receiptsOpen
-    ? { id: 'missing-info', status: 'Complete', attention: 'Nothing needs attention.', details: [], evidence: facts.missingReceipts === 0 ? ['No missing payees, missing receipts or open client questions.'] : [signoffEvidence(infoState.current!)], action: { view: 'Client Requests', label: 'Open Client Requests' }, ...(facts.missingReceipts > 0 ? { signoff: { allowed: true, label: 'Confirm receipts', noteRequired: true, fingerprint: infoFingerprint, figures: plural(facts.missingReceipts, 'missing receipt'), current: infoState.current, stale: false } } : {}) }
+    ? { id: 'missing-info', status: 'Complete', attention: 'Nothing needs attention.', details: [], evidence: facts.missingReceipts === 0 ? ['No missing payees, missing receipts or open client questions.'] : [signoffEvidence(infoState.current!)], action: { view: 'Client Requests', label: 'Open Client Requests' }, ...(facts.missingReceipts > 0 ? { signoff: { allowed: true, label: 'Confirm receipts', noteRequired: true, fingerprint: infoFingerprint, figures: plural(facts.missingReceipts, 'missing receipt'), exceptions: [plural(facts.missingReceipts, 'missing receipt')], current: infoState.current, stale: false } } : {}) }
     : {
         id: 'missing-info', status: mustFix.length > 0 ? 'In Progress' : infoState.stale ? 'In Progress' : 'Not Started',
         attention: [...mustFix, ...(receiptsOpen ? [`${plural(facts.missingReceipts, 'receipt')} may be missing.`] : [])].join(' '),
         details: [...(receiptsOpen ? ['A receipt you cannot obtain can be accepted as an exception, with a note.'] : []), ...(infoState.stale ? ['The number of missing receipts changed since you confirmed this.'] : [])], evidence: [],
         action: { view: facts.openClientRequests > 0 ? 'Client Requests' : 'Bookkeeping Review', label: facts.openClientRequests > 0 ? 'Open Client Requests' : 'Open Bookkeeping Review' },
-        ...(facts.missingReceipts > 0 ? { signoff: { allowed: mustFix.length === 0, label: 'Accept missing receipts as an exception', noteRequired: true, fingerprint: infoFingerprint, figures: plural(facts.missingReceipts, 'missing receipt'), current: infoState.current, stale: infoState.stale } } : {}),
+        ...(facts.missingReceipts > 0 ? { signoff: { allowed: mustFix.length === 0, label: 'Accept missing receipts as an exception', noteRequired: true, fingerprint: infoFingerprint, figures: plural(facts.missingReceipts, 'missing receipt'), exceptions: [plural(facts.missingReceipts, 'missing receipt')], current: infoState.current, stale: infoState.stale } } : {}),
       }
   return [uncategorized, duplicates, missing]
 }
@@ -197,13 +197,20 @@ function openItemStep(id: 'receivables' | 'payables', facts: Availability<OpenIt
   if (!value.reportVerified) return { ...blocked(id, `The ${noun}s figures could not be verified.`, action), details: value.reportProblems }
   const fingerprint = `${id}:${value.totalCents}:${value.itemCount}:${value.overdueCount}`
   const state = signoffState(id, inputs, fingerprint)
-  const summary = `${plural(value.itemCount, `open ${value.unit ?? 'item'}`)} totalling ${formatCents(value.totalCents)}${value.overdueCount > 0 ? `, ${value.overdueCount} overdue (${formatCents(value.overdueCents)})` : ''}`
+  const asOfText = value.asOf ? ` as of ${value.asOf}` : ''
+  const summary = `${plural(value.itemCount, `open ${value.unit ?? 'item'}`)} totalling ${formatCents(value.totalCents)}${asOfText}${value.overdueCount > 0 ? `, ${value.overdueCount} overdue (${formatCents(value.overdueCents)})` : ''}`
+  const exceptions = value.overdueCount > 0 ? [`${plural(value.overdueCount, `overdue ${value.unit ?? 'item'}`)} totalling ${formatCents(value.overdueCents)}${asOfText}.`] : []
+  const details = value.overdueCount > 0 ? [`${plural(value.overdueCount, `overdue ${value.unit ?? 'item'}`)} will be recorded as a remaining exception.`] : []
+  // Month-end aging is a historical figure; today's balance is shown beside it, never in place of it.
+  if (value.today && value.today.date !== value.asOf) {
+    details.push(`Today (${value.today.date}) on the ${id === 'receivables' ? 'Receivables' : 'Payables'} tab: ${plural(value.today.itemCount, `open ${value.unit ?? 'item'}`)} totalling ${formatCents(value.today.totalCents)}, ${value.today.overdueCount} overdue (${formatCents(value.today.overdueCents)}). This review is of the balance${asOfText || ' at the month end'}.`)
+  }
   return {
     id, status: state.fresh ? 'Complete' : state.stale ? 'In Progress' : 'Not Started',
     attention: state.fresh ? 'Reviewed.' : state.stale ? 'The figures changed since you reviewed them. Review them again.' : `Review the aging and confirm: ${summary}.`,
-    details: value.overdueCount > 0 ? [`${plural(value.overdueCount, `overdue ${value.unit ?? 'item'}`)} will be recorded as a remaining exception.`] : [],
+    details,
     evidence: state.fresh ? [signoffEvidence(state.current!)] : [], action,
-    signoff: { allowed: true, label: `Mark ${noun}s reviewed`, noteRequired: false, fingerprint, figures: summary, current: state.current, stale: state.stale },
+    signoff: { allowed: true, label: `Mark ${noun}s reviewed`, noteRequired: exceptions.length > 0, fingerprint, figures: summary, exceptions, asOf: value.asOf, current: state.current, stale: state.stale },
   }
 }
 
@@ -217,7 +224,7 @@ function unusualStep(inputs: MonthEndInputs): Draft {
   return {
     id: 'unusual-balances', status: state.fresh ? 'Complete' : state.stale ? 'In Progress' : 'Not Started',
     attention: state.fresh ? 'Reviewed.' : `${plural(findings.length, 'balance')} look unusual. Check them, then confirm.`, details: findings, evidence: state.fresh ? [signoffEvidence(state.current!)] : [], action,
-    signoff: { allowed: true, label: 'Confirm these balances are expected', noteRequired: true, fingerprint, figures: plural(findings.length, 'unusual balance'), current: state.current, stale: state.stale },
+    signoff: { allowed: true, label: 'Confirm these balances are expected', noteRequired: true, fingerprint, figures: plural(findings.length, 'unusual balance'), exceptions: findings, current: state.current, stale: state.stale },
   }
 }
 
@@ -234,7 +241,7 @@ function statementsStep(inputs: MonthEndInputs): Draft {
     id: 'statements', status: state.fresh ? 'Complete' : state.stale ? 'In Progress' : 'Not Started',
     attention: state.fresh ? 'Reviewed.' : state.stale ? 'The statements changed since you reviewed them. Review them again.' : `Review the Profit and Loss and Balance Sheet (${figures}), then confirm.`,
     details: [], evidence: state.fresh ? [signoffEvidence(state.current!)] : [], action,
-    signoff: { allowed: true, label: 'Mark statements reviewed', noteRequired: false, fingerprint, figures, current: state.current, stale: state.stale },
+    signoff: { allowed: true, label: 'Mark statements reviewed', noteRequired: false, fingerprint, figures, exceptions: [], current: state.current, stale: state.stale },
   }
 }
 
@@ -264,8 +271,8 @@ export function buildChecklist(inputs: MonthEndInputs): Checklist {
 
   const items: ChecklistItem[] = drafts.map((draft) => ({ ...draft, number: STEP_ORDER.indexOf(draft.id) + 1, title: STEP_TITLES[draft.id] }))
   const exceptions: string[] = []
-  if (inputs.receivables.available && inputs.receivables.value.overdueCount > 0) exceptions.push(`${plural(inputs.receivables.value.overdueCount, `overdue ${inputs.receivables.value.unit ?? 'invoice'}`)} totalling ${formatCents(inputs.receivables.value.overdueCents)}.`)
-  if (inputs.payables.available && inputs.payables.value.overdueCount > 0) exceptions.push(`${plural(inputs.payables.value.overdueCount, `overdue ${inputs.payables.value.unit ?? 'bill'}`)} totalling ${formatCents(inputs.payables.value.overdueCents)}.`)
+  if (inputs.receivables.available && inputs.receivables.value.overdueCount > 0) exceptions.push(`${plural(inputs.receivables.value.overdueCount, `overdue ${inputs.receivables.value.unit ?? 'invoice'}`)} totalling ${formatCents(inputs.receivables.value.overdueCents)}${inputs.receivables.value.asOf ? ` as of ${inputs.receivables.value.asOf}` : ''}.`)
+  if (inputs.payables.available && inputs.payables.value.overdueCount > 0) exceptions.push(`${plural(inputs.payables.value.overdueCount, `overdue ${inputs.payables.value.unit ?? 'bill'}`)} totalling ${formatCents(inputs.payables.value.overdueCents)}${inputs.payables.value.asOf ? ` as of ${inputs.payables.value.asOf}` : ''}.`)
   for (const step of SIGNOFF_STEPS) {
     const item = items.find((candidate) => candidate.id === step)
     const current = item?.signoff?.current
@@ -312,6 +319,18 @@ export const isSignoffStep = (value: unknown): value is SignoffStep => typeof va
 export const completionPercent = (checklist: Checklist) => Math.round((checklist.items.filter((item) => item.id !== 'approval' && item.status === 'Complete').length / 9) * 100)
 
 export type PeriodRef = Period
+
+export type ProgressCounts = Record<StepStatus, number> & { required: number }
+/** Counts of the nine required checks (steps 1 to 9) by status. Step 10 is the final approval and is not counted. */
+export function progressCounts(checklist: Checklist): ProgressCounts {
+  const counts: ProgressCounts = { Complete: 0, 'In Progress': 0, 'Not Started': 0, Blocked: 0, required: 0 }
+  for (const item of checklist.items) {
+    if (item.id === 'approval') continue
+    counts[item.status] += 1
+    counts.required += 1
+  }
+  return counts
+}
 
 /** Inputs for a client or month about which nothing is known: every step is Blocked and says why. */
 export function allUnavailable(period: string, reason: string, signoffs: MonthEndInputs['signoffs'] = {}, closing?: ClosingRecord): MonthEndInputs {

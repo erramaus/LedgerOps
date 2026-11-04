@@ -145,12 +145,54 @@ describe('completion rules enforced by the server', () => {
     expect(response.body.issues[0].message).toMatch(/difference is \$0\.01/)
   })
 
+  it('refuses a zero difference when a statement line is unmatched, and reports the blockers', async () => {
+    const { agent, csrf } = await signIn(build())
+    const saved = await save(agent, csrf, id('demo'), csv([{ lineId: 'l1', txnId: 'd1' }]))
+    const response = await complete(agent, csrf, id('demo'), saved.body.record.version)
+    expect(response.status).toBe(422)
+    const codes = response.body.issues.map((issue: { code: string }) => issue.code)
+    expect(codes).toContain('statement_lines_unmatched')
+    expect(codes).toContain('cleared_without_line')
+    expect(codes).not.toContain('not_balanced')
+  })
+
   it('refuses zero difference when the data is flagged incomplete', async () => {
     const { agent, csrf } = await signIn(build())
     const saved = await save(agent, csrf, id('demo'), editable({ completeness: { complete: false, reasons: ['cut off'] } }))
     const response = await complete(agent, csrf, id('demo'), saved.body.record.version)
     expect(response.status).toBe(422)
     expect(response.body.issues.map((issue: { code: string }) => issue.code)).toContain('data_incomplete')
+  })
+
+  const csv = (matches: { lineId: string; txnId: string }[], lines = [
+    { id: 'l1', date: '2026-08-05', description: 'CUSTOMER', amountCents: 50000, direction: 'increase' },
+    { id: 'l2', date: '2026-08-10', description: 'SUPPLIER', amountCents: 12000, direction: 'decrease' },
+  ]) => editable({ statementMode: 'csv', statementLines: lines, matches })
+
+  it('completes a valid one-to-one csv matching', async () => {
+    const { agent, csrf } = await signIn(build())
+    const saved = await save(agent, csrf, id('demo'), csv([{ lineId: 'l1', txnId: 'd1' }, { lineId: 'l2', txnId: 'w1' }]))
+    expect((await complete(agent, csrf, id('demo'), saved.body.record.version)).status).toBe(200)
+  })
+
+  it('refuses one statement line matched to two transactions', async () => {
+    const { agent, csrf } = await signIn(build())
+    const saved = await save(agent, csrf, id('demo'), csv([{ lineId: 'l1', txnId: 'd1' }, { lineId: 'l1', txnId: 'w1' }]))
+    const response = await complete(agent, csrf, id('demo'), saved.body.record.version)
+    expect(response.status).toBe(422)
+    expect(response.body.issues.map((issue: { code: string }) => issue.code)).toContain('statement_line_reused')
+  })
+
+  it('refuses a match with the wrong amount or opposite direction', async () => {
+    const { agent, csrf } = await signIn(build())
+    const lines = [
+      { id: 'l1', date: '2026-08-05', description: 'CUSTOMER', amountCents: 50000, direction: 'decrease' },
+      { id: 'l2', date: '2026-08-10', description: 'SUPPLIER', amountCents: 12500, direction: 'decrease' },
+    ]
+    const saved = await save(agent, csrf, id('demo'), csv([{ lineId: 'l1', txnId: 'd1' }, { lineId: 'l2', txnId: 'w1' }], lines))
+    const response = await complete(agent, csrf, id('demo'), saved.body.record.version)
+    expect(response.status).toBe(422)
+    expect(response.body.issues.map((issue: { code: string }) => issue.code)).toContain('amount_discrepancy')
   })
 
   it('refuses without a saved record, with a stale version, or twice', async () => {

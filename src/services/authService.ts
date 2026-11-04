@@ -6,6 +6,8 @@ export type SessionInfo = {
   configured: boolean
   authenticated: boolean
   user?: AuthUser
+  /** Reported by the server only; the browser never decides this. */
+  devBypass?: boolean
 }
 
 export const authService = {
@@ -14,7 +16,7 @@ export const authService = {
     if (!response.ok) throw new Error('Unable to check sign-in status.')
     const result = await response.json() as SessionInfo & { csrfToken?: string }
     setCsrfToken(result.csrfToken ?? null)
-    return { configured: result.configured, authenticated: result.authenticated, user: result.user }
+    return { configured: result.configured, authenticated: result.authenticated, user: result.user, devBypass: result.devBypass === true }
   },
   /** Full-page navigation: the identity provider redirects back to the app after sign-in. */
   signIn: () => {

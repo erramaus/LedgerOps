@@ -2,7 +2,7 @@
 import type { AccountClass, ReportTable } from '../../shared/accounting'
 import { known, unknown, type AccountRecon, type Availability, type Checklist, type MonthEndInputs, type MonthEndRecord, type OpenItemFacts, type TransactionFacts, type UnusualFacts, type StatementFacts } from '../../shared/monthEnd'
 import { figureFrom, openItemFacts, reconFactsFor, statementFacts, unusualBalances, type BalanceLine, type ReconRecordLike } from '../../shared/monthEndFacts'
-import { isInPeriod, normalizeDate, periodKey, type Period } from '../../shared/period'
+import { isInPeriod, normalizeDate, periodEnd, periodKey, type Period } from '../../shared/period'
 import { agingTotalCents } from '../../shared/qbReports'
 import { parseMoneyToCents } from '../../shared/reconciliation'
 import type { ClientRequest, LedgerAccount, LedgerTransaction, MonthEndItem, Transaction } from './bookkeepingTypes'
@@ -70,7 +70,7 @@ export function quickBooksUnusual(trialBalance: ReportTable, accounts: LedgerAcc
 }
 
 /** Open balances from a QuickBooks aging report. Rows are customers or vendors, not documents. */
-export function quickBooksOpenItems(table: ReportTable, unit: string): { facts: OpenItemFacts | null; reason?: string } {
+export function quickBooksOpenItems(table: ReportTable, unit: string, asOf?: string): { facts: OpenItemFacts | null; reason?: string } {
   const total = agingTotalCents(table)
   const grand = table.rows.find((row) => row.style === 'grand')
   const currentIndex = table.columns.findIndex((column) => column.label.trim().toLowerCase() === 'current')
@@ -81,7 +81,7 @@ export function quickBooksOpenItems(table: ReportTable, unit: string): { facts: 
   const open = rows.filter((row) => (row.cells[last] ?? 0) > 0)
   const overdue = open.filter((row) => (row.cells[last] ?? 0) - (row.cells[currentIndex] ?? 0) > 0)
   const result = openItemFacts(table, { totalCents: total, itemCount: open.length, overdueCount: overdue.length, overdueCents: total - current })
-  return result.facts ? { facts: { ...result.facts, unit } } : result
+  return result.facts ? { facts: { ...result.facts, unit, ...(asOf ? { asOf } : {}) } } : result
 }
 
 export type QuickBooksPeriodData = {
@@ -105,7 +105,7 @@ export function quickBooksInputs(period: Period, data: QuickBooksPeriodData, con
   }
   const open = (table: Loaded<ReportTable>, unit: string) => {
     if (!table.ok) return unknown<OpenItemFacts>(table.reason)
-    const result = quickBooksOpenItems(table.value, unit)
+    const result = quickBooksOpenItems(table.value, unit, periodEnd(period))
     return result.facts ? known(result.facts) : unknown<OpenItemFacts>(result.reason ?? 'Not available.')
   }
 

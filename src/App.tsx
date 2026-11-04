@@ -26,12 +26,14 @@ import {
   QUICKBOOKS_CLIENT_ID,
   buildReviewTasks,
   buildWorkTasks,
+  buildClientRequestTasks,
   countByClient,
   filterTasks,
   isReviewTask,
   scopeRequests,
   sortTasks,
   summarizeTasks,
+  taskButtonLabel,
   taskPriorities,
   taskStatuses,
   taskTypes,
@@ -41,21 +43,60 @@ import {
   type TaskType,
   type WorkTask,
 } from "./services/workQueue";
+import { describeDue } from "./services/dueDates";
+import {
+  ALL_CLIENTS,
+  REQUEST_TYPES,
+  draftIsDirty,
+  draftMessage,
+  emptyRequestDraft,
+  emptyRequestFilters,
+  filterRequests,
+  hasActiveRequestFilters,
+  nextStep,
+  requestCounts,
+  requestDocuments,
+  requestDue,
+  sortRequests,
+  suggestedMessage,
+  type RequestDraft,
+  type RequestFilters,
+  type RequestStatusFilter,
+} from "./services/requestsView";
+import { cleanDescription, dueLabel, filterByReadiness, isWaiting, localIsoDate, searchTasks, type Readiness } from "./services/inboxView";
+import {
+  buildFindingRows, decisionKey, explainFinding, filterFindingRows, findingTypeLabel, findingTypeOf, findingTypes, isAccountingFinding, isDismissalCurrent,
+  latestDecisions, readReviewDecisions, reviewStatuses, rowType, sourceFingerprint, summarizeFindings, writeReviewDecisions,
+  type FindingFilters, type FindingRow, type ReviewDecision,
+} from "./services/reviewFindings";
+import { attentionStatus, monthEndStatus, nextTaskFor, periodNotice } from "./services/clientStatus";
 import {
   DEMO_CATEGORIES,
   adjacentInQueue,
   applyLineChanges,
   categoriesIn,
   categoryLabel,
+  clientIdsIn,
+  describeDateRange,
   filterTransactions,
   getLines,
+  hasDateRange,
   isExpenseCategoryAccount,
   isUncategorized,
-  matchesReviewFilter,
-  reviewFilters,
+  matchesReason,
+  monthRange,
+  needsAttention,
+  needsReceipt,
+  nextActionable,
+  categorizationStatus,
+  reasonFilters,
+  statusFilters,
+  reviewReasons,
   validateLineChanges,
+  type DateRange,
   type LineChange,
-  type ReviewFilter,
+  type ReasonFilter,
+  type StatusFilter,
 } from "./services/transactionReview";
 import { suggestCategories } from "./services/categorySuggestions";
 import { bestRuleMatch, previewRule, seededRulesFor, validateRuleInput, type AutomationRule } from "./services/automationRules";
@@ -86,7 +127,7 @@ import {
   statusLabel,
   type PortalAuditEvent,
 } from "./services/clientPortal";
-import { ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
+import { ReconcileClientPicker, ReconcileWorkspace, type ReconAccount } from "./Reconciliation";
 import { AccountantTools } from "./AccountantTools";
 import { demoReconSources } from "./data/demoReconciliation";
 import { DEMO_RECONCILIATION_ACCOUNTS, demoEarlierRegister } from "../shared/demoBooks";
@@ -112,8 +153,10 @@ import { Reports } from "./Reports";
 import { useMonthEnd } from "./useMonthEnd";
 import { toMonthEndItems } from "./services/monthEndData";
 import { summarizeOpenItems } from "./services/openItems";
+import { agingFilters, emptyReceivableFilters, filterCounts, filterRows, formatLongDate, hasActiveFilters, invoiceDue, isOverdue, paymentFilters, paymentStatus, type AgingFilter, type ReceivableFilters, type ReceivableRow } from "./services/receivablesView";
+import { billDue, billFilterCounts, billPaymentFilters, dueFilters, emptyBillFilters, filterBills, hasActiveBillFilters, isDueSoon, needsReview as billNeedsReview, reviewFilters, type BillFilters, type BillRow, type DueFilter } from "./services/payablesView";
 import { completionPercent, type StepView } from "../shared/monthEnd";
-import { lastCompleteMonth, periodEnd, type Period } from "../shared/period";
+import { lastCompleteMonth, monthLabel, periodEnd, type Period } from "../shared/period";
 
 // The demo books run from May to August 2026; August is the month the live demo transactions belong to.
 const DEMO_DEFAULT_PERIOD: Period = { year: 2026, month: 8 };
@@ -208,6 +251,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [companyOpen, setCompanyOpen] = useState(false);
   const [ownTransactions, setTransactions] =
     useState<Transaction[]>(demoTransactions);
+  // Edits to the other demo companies' generated transactions, keyed by client and transaction id.
+  const [companyEdits, setCompanyEdits] = useState<Record<string, Transaction>>({});
   const [selectedTransaction, setSelectedTransaction] =
     useState<Transaction | null>(null);
   const [period, setPeriod] = useState<Period>(DEMO_DEFAULT_PERIOD);
@@ -225,6 +270,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [selectedRequest, setSelectedRequest] = useState<ClientRequest | null>(
     null,
   );
+  // Kept here, not in the Client Requests page, so an unsaved request survives opening a request or visiting another tab.
+  const [requestDraft, setRequestDraft] = useState<RequestDraft>(emptyRequestDraft);
   const [documents, setDocuments] = useState<ClientDocument[]>([
     ...clientDocumentsFor(demoClient.id, demoClient.name),
     ...baseClients.filter((client) => client.id !== demoClient.id).flatMap((client) => clientDocumentsFor(client.id, client.name)),
@@ -283,10 +330,13 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const [automationEvents, setAutomationEvents] = useState<AutomationAuditEvent[]>(() => readEvents());
   const [recurringDecisions, setRecurringDecisions] = useState<RecurringDecision[]>(() => readRecurringDecisions());
   const [selectedRecurring, setSelectedRecurring] = useState<RecurringPattern | null>(null);
+  const [reviewDecisions, setReviewDecisions] = useState<ReviewDecision[]>(() => readReviewDecisions());
+  const [reviewDecisionsSaved, setReviewDecisionsSaved] = useState(true);
   const [demoResetRevision, setDemoResetRevision] = useState(0);
   const resetDemoState = (clientIds: string[]) => {
     const targets = new Set(clientIds);
     if (targets.has(demoClient.id)) setTransactions(demoTransactions);
+    setCompanyEdits((current) => Object.fromEntries(Object.entries(current).filter(([, edited]) => !edited.clientId || !targets.has(edited.clientId))));
     setRequests((current) => [
       ...current.filter((request) => !request.clientId || !targets.has(request.clientId)),
       ...seededBaseRequests.filter((request) => request.clientId && targets.has(request.clientId)),
@@ -303,6 +353,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       }),
     ]);
     setPortalAudit((current) => current.filter((event) => !targets.has(event.clientId)));
+    setReviewDecisions((current) => current.filter((decision) => !(decision.source === "demo" && targets.has(decision.clientId))));
     setSelectedTransaction(null);
     setSelectedInvoice(null);
     setSelectedBill(null);
@@ -343,6 +394,10 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   useEffect(() => {
     writeRecurringDecisions(recurringDecisions);
   }, [recurringDecisions]);
+
+  useEffect(() => {
+    setReviewDecisionsSaved(writeReviewDecisions(reviewDecisions));
+  }, [reviewDecisions]);
 
   // Transactions entered by hand in Demo Mode. The ref always holds the latest list so a reload right after a save sees it.
   const [demoEntries, setDemoEntries] = useState<DemoEntryRecord[]>([]);
@@ -409,11 +464,40 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const journalLedger = useMemo(() => mergeDemoJournals(journalRecords, mergedEntries, activeDemoClientId), [journalRecords, mergedEntries, activeDemoClientId]);
   const ledger = useMemo(() => mergeDemoPayments(paymentBooks, journalLedger, activeDemoClientId), [paymentBooks, journalLedger, activeDemoClientId]);
   const invoices = useMemo(() => activeDemoCompany ? companyInvoices(activeDemoCompany, paymentBooks) : invoicesWithPayments(demoInvoices, paymentBooks), [activeDemoCompany, paymentBooks]);
+  // "All clients" lists every demo company's invoices, each tagged with its client so a payment is always recorded against the right books.
+  const allClientInvoiceRows = useMemo<ReceivableRow[]>(() => [
+    ...invoicesWithPayments(demoInvoices, paymentBooks).map((invoice) => ({ invoice, clientId: demoClient.id, clientName: demoClient.name })),
+    ...ADDITIONAL_DEMO_CLIENT_IDS.flatMap((id) => {
+      const company = getAdditionalDemoCompany(id);
+      return company ? companyInvoices(company, paymentBooks).map((invoice) => ({ invoice, clientId: id, clientName: company.clientName })) : [];
+    }),
+  ], [paymentBooks]);
   const bills = useMemo(() => activeDemoCompany ? companyBills(activeDemoCompany, paymentBooks) : billsWithPayments(demoBills, paymentBooks), [activeDemoCompany, paymentBooks]);
+  const allClientBillRows = useMemo<BillRow[]>(() => [
+    ...billsWithPayments(demoBills, paymentBooks).map((bill) => ({ bill, clientId: demoClient.id, clientName: demoClient.name })),
+    ...ADDITIONAL_DEMO_CLIENT_IDS.flatMap((id) => {
+      const company = getAdditionalDemoCompany(id);
+      return company ? companyBills(company, paymentBooks).map((bill) => ({ bill, clientId: id, clientName: company.clientName })) : [];
+    }),
+  ], [paymentBooks]);
+  const withCompanyEdits = (company: NonNullable<typeof activeDemoCompany>) => companyTransactions(company).map((transaction) => companyEdits[`${company.clientId}/${transaction.id}`] ?? transaction);
   const rawTransactions = useMemo(() => activeDemoCompany
-    ? [...companyTransactions(activeDemoCompany), ...entryTransactions(demoEntries, activeDemoClientId), ...paymentTransactions(paymentBooks, activeDemoClientId)]
+    ? [...withCompanyEdits(activeDemoCompany), ...entryTransactions(demoEntries, activeDemoClientId), ...paymentTransactions(paymentBooks, activeDemoClientId)]
     : [...ownTransactions, ...entryTransactions(demoEntries), ...paymentTransactions(paymentBooks)],
-    [activeDemoCompany, activeDemoClientId, ownTransactions, demoEntries, paymentBooks]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeDemoCompany, activeDemoClientId, ownTransactions, demoEntries, paymentBooks, companyEdits]);
+  // "All clients" lists every demo company that has detailed records, each row tagged with its client.
+  const allClientTransactions = useMemo(() => {
+    const entriesOf = (clientId: string) => demoEntries.filter((record) => (record.clientId ?? demoClient.id) === clientId);
+    return [
+      ...[...ownTransactions, ...entryTransactions(entriesOf(demoClient.id), demoClient.id), ...paymentTransactions(paymentBooks, demoClient.id)].map((transaction) => ({ ...transaction, clientId: transaction.clientId ?? demoClient.id })),
+      ...ADDITIONAL_DEMO_CLIENT_IDS.flatMap((clientId) => {
+        const company = getAdditionalDemoCompany(clientId);
+        return company ? [...withCompanyEdits(company), ...entryTransactions(entriesOf(clientId), clientId), ...paymentTransactions(paymentBooks, clientId)] : [];
+      }),
+    ];
+  }, // eslint-disable-next-line react-hooks/exhaustive-deps
+  [ownTransactions, demoEntries, paymentBooks, companyEdits]);
   // Dashboard figures for all five companies are derived from their own ledgers; ABC keeps its original scenario ledger.
   const clients = useMemo(() => {
     return baseClients.map((client) => {
@@ -595,24 +679,48 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     setSelectedRecurring(null);
     setView("Receivables");
   };
+  // Opening an invoice from All clients first selects its client, so the detail, payments and ledger use that client's books.
+  const openInvoiceRow = (row: ReceivableRow) => {
+    if (appDataSource === "demo" && !activeClient) {
+      const owner = clients.find((client) => client.id === row.clientId);
+      if (owner) selectClient(owner);
+    }
+    setSelectedInvoice(row.invoice);
+  };
   const openPayables = () => {
     setSelectedBill(null);
     setSelectedRecurring(null);
     setView("Payables");
+  };
+  // Opening a bill from All clients first selects its client, so the detail, payments and ledger use that client's books.
+  const openBillRow = (row: BillRow) => {
+    if (appDataSource === "demo" && !activeClient) {
+      const owner = clients.find((client) => client.id === row.clientId);
+      if (owner) selectClient(owner);
+    }
+    setSelectedBill(row.bill);
   };
   const openReports = () => {
     setSelectedRecurring(null);
     if (view === "Reports") setHomeSignal((count) => count + 1);
     setView("Reports");
   };
-  const openStepView = (destination: StepView) =>
-    destination === "Transactions" ? openTransactions()
+  // Month End shows one client's books even while "All clients" is selected. Opening a workflow from it must open that same client.
+  const keepMonthEndClient = () => {
+    if (appDataSource !== "demo" || activeClient) return;
+    const owner = clients.find((client) => client.id === monthEndClient.id);
+    if (owner) selectClient(owner);
+  };
+  const openStepView = (destination: StepView) => {
+    keepMonthEndClient();
+    return destination === "Transactions" ? openTransactions()
       : destination === "Bookkeeping Review" ? setView("Bookkeeping Review")
       : destination === "Reconcile" ? openReconcile()
       : destination === "Receivables" ? openReceivables()
       : destination === "Payables" ? openPayables()
       : destination === "Reports" ? openReports()
       : openRequests();
+  };
   const openSettings = () => { setSelectedRecurring(null); setView("Settings"); };
 
   const changeAppDataSource = async (source: AccountSource) => {
@@ -682,13 +790,18 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const demoCategoryOptions: CategoryOption[] = [...new Set([...DEMO_CATEGORIES, ...categoriesIn(rawTransactions).filter((name) => !isUncategorized(name) && name !== "Split")])].map((name) => ({ name }));
 
   const updateTransaction = (updatedTransaction: Transaction) => {
-    setTransactions((currentTransactions) =>
-      currentTransactions.map((transaction) =>
-        transaction.id === updatedTransaction.id
-          ? updatedTransaction
-          : transaction,
-      ),
-    );
+    const owner = updatedTransaction.clientId;
+    if (owner && owner !== demoClient.id && getAdditionalDemoCompany(owner)) {
+      setCompanyEdits((current) => ({ ...current, [`${owner}/${updatedTransaction.id}`]: updatedTransaction }));
+    } else {
+      setTransactions((currentTransactions) =>
+        currentTransactions.map((transaction) =>
+          transaction.id === updatedTransaction.id
+            ? updatedTransaction
+            : transaction,
+        ),
+      );
+    }
     setSelectedTransaction(updatedTransaction);
   };
 
@@ -826,6 +939,14 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       status: input.status,
     });
     saveRequest(request);
+    // Created from All clients: continue in that client's workspace so every tab stays on the same client.
+    if (!selectedClient) {
+      const owner = clients.find((client) => client.id === input.clientId);
+      if (owner) {
+        selectClient(owner);
+        setSelectedRequest(request);
+      }
+    }
     logPortal({
       at: new Date().toISOString(),
       actor: "Bookkeeper",
@@ -834,6 +955,37 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       kind: input.status === "Draft" ? "request-created" : "request-sent",
       source: "demo",
       summary: `${input.status === "Draft" ? "Saved" : "Sent"} ${input.requestType.toLowerCase()} request for ${clientName}.`,
+    });
+  };
+
+  // Opening a request from All clients first selects its client, so the detail, the other tabs and the books agree.
+  const openRequestRow = (request: ClientRequest) => {
+    if (source === "demo" && !selectedClient) {
+      const owner = clients.find((client) => client.id === request.clientId);
+      if (owner) {
+        selectClient(owner);
+        setSelectedRequest(request);
+        return;
+      }
+    }
+    setSelectedRequest(request);
+  };
+
+  // An empty message sends a saved draft as it is; otherwise the message is added to the thread.
+  const sendFollowUp = (request: ClientRequest, message: string) => {
+    const text = message.trim();
+    const next = text
+      ? appendMessage(request, "Bookkeeper", "LedgerOps Bookkeeper", text, new Date().toISOString(), undefined, "Waiting for Client")
+      : { ...request, status: "Waiting for Client" as const };
+    saveRequest(next);
+    logPortal({
+      at: new Date().toISOString(),
+      actor: "Bookkeeper",
+      clientId: request.clientId ?? demoClient.id,
+      requestId: request.id,
+      kind: "request-sent",
+      source: request.quickBooksId ? "quickbooks" : "demo",
+      summary: text ? `Sent a follow-up on the ${request.requestType.toLowerCase()} request.` : `Sent ${request.requestType.toLowerCase()} request for ${request.client}.`,
     });
   };
 
@@ -1091,7 +1243,9 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
 
   const source = appDataSource;
   const scopedRequests = useMemo(() => {
-    if (source !== "demo" || !activeDemoCompany) return scopeRequests(requests, source).map(normalizeRequest);
+    if (source !== "demo") return scopeRequests(requests, source).map(normalizeRequest);
+    // The ABC Plumbing books (also the working set behind All clients) only see ABC's own requests.
+    if (!activeDemoCompany) return scopeRequests(requests, source).filter((request) => request.clientId === demoClient.id).map(normalizeRequest);
     const saved = requests.filter((request) => request.clientId === activeDemoCompany.clientId);
     const byId = new Map(saved.map((request) => [request.id, request]));
     const scenarios = companyPortalRequests(activeDemoCompany).map((request) => byId.get(request.id) ?? request);
@@ -1110,13 +1264,20 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     }
     return documents;
   }, [activeDemoCompany, documents, source]);
+  // The Client Requests page: every demo company's requests under All clients, one company's when a client is selected.
+  const allDemoRequests = useMemo(() => scopeRequests(requests, "demo").map(normalizeRequest), [requests]);
   const transactions = useMemo(
     () => rawTransactions.map((transaction) => relevantTransactionStatus(transaction, scopedRequests)),
     [rawTransactions, scopedRequests],
   );
+  const tabTransactions = useMemo(
+    () => selectedClient ? transactions : allClientTransactions.map((transaction) => relevantTransactionStatus(transaction, requests)),
+    [selectedClient, transactions, allClientTransactions, requests],
+  );
+  const clientNameById = useMemo(() => Object.fromEntries(baseClients.map((client) => [client.id, client.name])), [baseClients]);
   // The client and month are chosen once here, so every workflow keeps showing the same ones.
   const monthEndClient = source === "demo" ? { id: (selectedClient ?? demoClient).id, name: (selectedClient ?? demoClient).name } : { id: QUICKBOOKS_CLIENT_ID, name: sandboxName };
-  const todayIso = currentDate.toISOString().slice(0, 10);
+  const todayIso = localIsoDate(currentDate);
   const monthEndView = useMonthEnd({
     enabled: view === "Month End" || (source === "demo" && (view === "Dashboard" || view === "Clients")),
     source,
@@ -1135,8 +1296,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
   const dataClient = activeDemoClient ?? demoClient;
   const records: ClientRecords =
     source === "demo"
-      ? { client: { id: dataClient.id, name: dataClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccountsNow, requests: scopedRequests, monthEnd: monthEndItemsNow }
-      : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: monthEndItemsNow };
+      ? { client: { id: dataClient.id, name: dataClient.name }, transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccountsNow, requests: scopedRequests, monthEnd: monthEndItemsNow, today: todayIso }
+      : { client: { id: QUICKBOOKS_CLIENT_ID, name: sandboxName }, transactions: reviewData?.transactions ?? [], invoices: reviewData?.invoices ?? [], bills: reviewData?.bills ?? [], accounts: reviewData?.accounts ?? [], reconciliations: [], requests: scopedRequests, monthEnd: monthEndItemsNow, today: todayIso };
   const recurringHistory = useMemo(() => {
     const visible = historyFromTransactions(records.client.id, automationSource, records.transactions);
     if (automationSource !== "demo") return visible;
@@ -1149,13 +1310,46 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
     [recurringHistory, scopedRecurringDecisions, todayIso],
   );
   const ruleSuggestionMap = useMemo(() => new Map(records.transactions.map((transaction) => [transaction.id, bestRuleMatch(scopedRules, transaction)]).filter((entry): entry is [string, NonNullable<ReturnType<typeof bestRuleMatch>>] => Boolean(entry[1]))), [records.transactions, scopedRules]);
-  const baseTasks = queueAvailable ? buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== records.client.id) : []).map((task) => {
+  const otherClientRequestTasks = source === "demo" && !selectedClient
+    ? clients.filter((client) => client.id !== records.client.id).flatMap((client) => buildClientRequestTasks({ id: client.id, name: client.name }, allDemoRequests.filter((request) => request.clientId === client.id)))
+    : [];
+  const baseTasks = queueAvailable ? [...buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== records.client.id) : []), ...otherClientRequestTasks].map((task) => {
     if (task.kind !== "uncategorized" || !task.recordId) return task;
     const match = ruleSuggestionMap.get(task.recordId);
     return match ? { ...task, priority: match.rule.reviewPriority, issue: "Uncategorized transaction with rule suggestion", description: `${task.description} Rule "${match.rule.name}" suggests ${match.rule.category}.`, automationId: match.rule.id, status: "Ready to review" as const } : task;
   }) : [];
   const automationTasks = queueAvailable ? buildAutomationTasks(records.client, ruleSuggestionMap, recurringPatterns) : [];
-  const allTasks = sortTasks([...baseTasks, ...automationTasks]);
+  const allTasksUnfiltered = sortTasks([...baseTasks, ...automationTasks]);
+  // A dismissed finding leaves every screen's queue until its source record changes.
+  const latestReviewDecisions = latestDecisions(reviewDecisions);
+  const sourceRecords = { transactions: records.transactions, invoices: records.invoices, bills: records.bills };
+  const isDismissedFinding = (task: WorkTask) =>
+    isAccountingFinding(task) && isDismissalCurrent(latestReviewDecisions.get(decisionKey(source, task.id)), sourceFingerprint(task, sourceRecords));
+  const allTasks = allTasksUnfiltered.filter((task) => !isDismissedFinding(task));
+  const dismissedFindings = filterTasks(allTasksUnfiltered.filter(isDismissedFinding), { clientId: source === "demo" && selectedClient ? selectedClient.id : null });
+  const recordReviewDecision = (task: WorkTask, status: ReviewDecision["status"], reason?: string) => {
+    const decision: ReviewDecision = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      source,
+      clientId: task.clientId,
+      clientName: task.client,
+      findingId: task.id,
+      findingType: findingTypeOf(task),
+      issue: task.issue,
+      description: task.description,
+      priority: task.priority,
+      status,
+      reason,
+      actor: "Bookkeeper",
+      at: new Date().toISOString(),
+      fingerprint: sourceFingerprint(task, sourceRecords),
+    };
+    setReviewDecisions((current) => [decision, ...current]);
+  };
+  const reviewFinding = (task: WorkTask) => {
+    if (latestReviewDecisions.get(decisionKey(source, task.id))?.status !== "reviewing" || isDismissedFinding(task)) recordReviewDecision(task, "reviewing");
+    openTask(task);
+  };
   const activeClient = source === "demo" && selectedClient ? clients.find((client) => client.id === selectedClient.id) ?? selectedClient : null;
   const visibleTasks = filterTasks(allTasks, { clientId: activeClient?.id });
   const hasDetail = !activeClient || activeClient.id === demoClient.id || ADDITIONAL_DEMO_CLIENT_IDS.includes(activeClient.id);
@@ -1198,7 +1392,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
       return;
     }
     if (task.requestId) {
-      setSelectedRequest(scopedRequests.find((item) => item.id === task.requestId) ?? null);
+      setSelectedRequest((source === "demo" ? allDemoRequests : scopedRequests).find((item) => item.id === task.requestId) ?? null);
       setView("Client Requests");
       return;
     }
@@ -1359,6 +1553,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onPayables={openPayables}
             onReports={openReports}
             documents={scopedDocuments}
+            today={todayIso}
           />
         ) : view === "Clients" ? (
           <Clients
@@ -1368,20 +1563,27 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             available={queueAvailable}
             companyName={sandboxName}
             connected={quickBooksStatus.connected}
+            period={period}
+            today={todayIso}
             monthEndFor={clientMonthEnd}
+            monthEndLive={(client) => selectedClient?.id === client.id && Boolean(monthEndView.checklist)}
             onOpen={openClient}
+            onOpenReconcile={(client) => { selectClient(client); setView("Reconcile"); }}
             onOpenCompany={openCompany}
           />
         ) : view === "Bookkeeping Review" ? (
-          <BookkeepingReview source={source} tasks={visibleTasks.filter(isReviewTask)} available={queueAvailable} loading={reviewLoading} error={reviewError} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onOpenTask={openTask} />
+          <BookkeepingReview source={source} rows={buildFindingRows({ source, live: visibleTasks.filter(isAccountingFinding), dismissed: dismissedFindings.filter(isAccountingFinding), decisions: reviewDecisions, records: sourceRecords, detailClientId: records.client.id })} history={reviewDecisions.filter((decision) => decision.source === source && (!activeClient || decision.clientId === activeClient.id))} decisionsSaved={reviewDecisionsSaved} available={queueAvailable} loading={reviewLoading} error={reviewError} today={localIsoDate(currentDate)} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onReview={reviewFinding} onDismiss={(task, reason) => recordReviewDecision(task, "dismissed", reason)} onReopen={(task) => recordReviewDecision(task, "reopened")} />
         ) : view === "Inbox" ? (
-          <Inbox tasks={visibleTasks} source={source} available={queueAvailable} loading={reviewLoading} error={reviewError} scopeLabel={activeClient?.name ?? (source === "demo" ? "All clients" : sandboxName)} onOpenTask={openTask} />
+          <Inbox tasks={visibleTasks} source={source} available={queueAvailable} loading={reviewLoading} error={reviewError} scopeLabel={activeClient?.name ?? (source === "demo" ? "All clients" : sandboxName)} today={localIsoDate(currentDate)} onOpenTask={openTask} />
         ) : view === "Transactions" ? (
           <Transactions
-            transactions={transactions}
+            transactions={tabTransactions}
             quickBooksTransactions={quickBooksTransactions}
             source={appDataSource}
             clientId={activeClient?.id ?? null}
+            scopeLabel={activeClient?.name ?? (appDataSource === "demo" ? "All clients" : sandboxName)}
+            clientNames={clientNameById}
+            period={period}
             categoryOptions={appDataSource === "demo" ? demoCategoryOptions : quickBooksCategoryOptions}
             isLoading={quickBooksTransactionsLoading}
             error={quickBooksTransactionsError}
@@ -1403,7 +1605,7 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             accounts={quickBooksAccounts}
             isLoading={quickBooksAccountsLoading}
             error={quickBooksAccountsError}
-            today={currentDate.toISOString().slice(0, 10)}
+            today={todayIso}
             period={period}
             homeSignal={homeSignal}
             entryTools={entryTools}
@@ -1411,6 +1613,9 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             paymentBooks={appDataSource === "demo" ? paymentBooks : []}
             onPeriodChange={setPeriod}
             onSourceChange={changeAppDataSource}
+            pickClient={appDataSource === "demo" && !activeClient}
+            clientChoices={clients}
+            onSelectClient={selectClient}
           />
         ) : view === "Receivables" ? (
           <Receivables
@@ -1423,7 +1628,9 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             selectedInvoice={selectedInvoice ? invoices.find((item) => item.id === selectedInvoice.id) ?? selectedInvoice : null}
             paymentBooks={appDataSource === "demo" ? paymentBooks : []}
             paymentDateDefault={periodEnd(period)}
-            onSelect={setSelectedInvoice}
+            allRows={appDataSource === "demo" && !activeClient ? allClientInvoiceRows : undefined}
+            today={todayIso}
+            onSelectRow={openInvoiceRow}
             onBack={() => setSelectedInvoice(null)}
             onRecordPayment={recordDocumentPayment}
             onReversePayment={reverseDocumentPayment}
@@ -1441,7 +1648,9 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             selectedBill={selectedBill ? bills.find((item) => item.id === selectedBill.id) ?? selectedBill : null}
             paymentBooks={appDataSource === "demo" ? paymentBooks : []}
             paymentDateDefault={periodEnd(period)}
-            onSelect={setSelectedBill}
+            allRows={appDataSource === "demo" && !activeClient ? allClientBillRows : undefined}
+            today={todayIso}
+            onSelectRow={openBillRow}
             onBack={() => setSelectedBill(null)}
             onRecordPayment={recordDocumentPayment}
             onReversePayment={reverseDocumentPayment}
@@ -1460,9 +1669,13 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             onPeriodChange={setPeriod}
             onOpenReconcile={openReconcile}
             homeSignal={homeSignal}
+            needsClient={appDataSource === "demo" && !activeClient}
+            clientChoices={clients.map((client) => ({ id: client.id, name: client.name }))}
+            onSelectClient={(id) => { const client = clients.find((item) => item.id === id); if (client) selectClient(client); }}
             ledger={source === "demo" ? ledger : undefined}
             accountantTools={
               <AccountantTools
+                key={`${appDataSource}:${activeDemoClientId}`}
                 source={appDataSource}
                 clientName={monthEndClient.name}
                 period={period}
@@ -1495,18 +1708,23 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             source={source}
             clients={baseClients}
             selectedClientId={activeClient?.id ?? demoClient.id}
-            requests={scopedRequests}
-            documents={scopedDocuments}
-            auditEvents={portalAudit.filter((event) => source === "quickbooks" ? event.source === "quickbooks" : event.source === "demo")}
+            clientSelected={source === "demo" ? Boolean(activeClient) : true}
+            today={todayIso}
+            requests={source === "demo" ? (activeClient ? allDemoRequests.filter((request) => request.clientId === activeClient.id) : allDemoRequests) : scopedRequests}
+            documents={source === "demo" && activeClient ? scopedDocuments.filter((document) => document.clientId === activeClient.id) : scopedDocuments}
+            auditEvents={portalAudit.filter((event) => (source === "quickbooks" ? event.source === "quickbooks" : event.source === "demo" && (!activeClient || event.clientId === activeClient.id)))}
             transactions={transactions}
             selectedRequest={selectedRequest}
-            onSelect={setSelectedRequest}
+            draft={requestDraft}
+            onDraftChange={setRequestDraft}
+            onSelect={openRequestRow}
             onBack={() => setSelectedRequest(null)}
             onUpdate={updateRequest}
             onApplyResponse={applyClientResponse}
             onCreateRequest={createManagedRequest}
             onCreateClientMessage={createClientMessageRequest}
             onSendClientMessage={sendClientMessage}
+            onSendFollowUp={sendFollowUp}
             onSubmitDocument={submitClientDocument}
             onApproveRequest={approveRequest}
             onRejectRequest={rejectRequest}
@@ -1549,23 +1767,31 @@ function formatDueDate(iso: string) {
 
 const taskSlug = (value: string) => value.toLowerCase().replaceAll(" ", "-");
 
-function TaskCardList({ tasks, showClient, onOpenTask }: { tasks: WorkTask[]; showClient: boolean; onOpenTask: (task: WorkTask) => void }) {
+function TaskCardList({ tasks, showClient, today, onOpenTask }: { tasks: WorkTask[]; showClient: boolean; today?: string; onOpenTask: (task: WorkTask) => void }) {
   return (
     <div className="review-card-list">
-      {tasks.map((task) => (
-        <button className="review-card" key={task.id} onClick={() => onOpenTask(task)}>
-          <div className="review-card-top">
-            <span className="review-type">{showClient ? `${task.client} · ` : ""}{task.issue}</span>
-            <span className={`priority-badge ${task.priority.toLowerCase()}`}>{task.priority}</span>
-          </div>
-          <p>{task.description}</p>
-          {task.amount !== undefined && <span className="review-amount">{formatMoney(task.amount)}</span>}
-          <div className="review-card-footer">
-            <span>{task.suspected ? "Possible issue · " : ""}{task.dueDate ? `Due ${formatDueDate(task.dueDate)} · ` : ""}Next: {task.action}</span>
-            <span className="row-arrow">→</span>
-          </div>
-        </button>
-      ))}
+      {tasks.map((task) => {
+        const due = task.dueDate && today ? describeDue(task.dueDate, today) : undefined;
+        return (
+          <button className="review-card" key={task.id} onClick={() => onOpenTask(task)}>
+            <div className="review-card-top">
+              <span className="review-type">{showClient ? `${task.client} · ` : ""}{task.issue}</span>
+              <span className={`priority-badge ${task.priority.toLowerCase()}`}>{task.priority}</span>
+            </div>
+            <p>{task.description}</p>
+            {task.amount !== undefined && <span className="review-amount">{formatMoney(task.amount)}</span>}
+            <div className="review-card-footer">
+              <span>
+                {task.suspected ? "Possible issue · " : ""}
+                {due && <strong className={`due-label ${due.tone}`}>{due.label}</strong>}
+                {due ? " · " : ""}
+                {task.dueDate ? `Due ${formatDueDate(task.dueDate)} · ` : ""}Next: {task.action}
+              </span>
+              <span className="task-action">{taskButtonLabel(task)} <span aria-hidden="true">→</span></span>
+            </div>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -1645,6 +1871,7 @@ function Dashboard({
   onPayables,
   onReports,
   documents,
+  today,
 }: {
   client: Client | null;
   companyOpen: boolean;
@@ -1675,10 +1902,12 @@ function Dashboard({
   onPayables: () => void;
   onReports: () => void;
   documents: ClientDocument[];
+  today: string;
 }) {
   if (client || companyOpen)
     return (
       <ClientDashboard
+        today={today}
         client={client}
         companyName={companyName}
         source={source}
@@ -1725,28 +1954,43 @@ function Dashboard({
       {loading && <div className="data-state-message">Loading QuickBooks Sandbox data...</div>}
       {error && <div className="data-state-message error">{error}</div>}
       {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded. Connect in Settings to see real figures.</div>}
-      <section className="metrics-grid" aria-label="Bookkeeping overview">
-        <MetricCard label="Clients" value={`${clientTotal}`} note={source === "demo" ? "Demo clients" : "Connected company"} tone="green" />
-        <MetricCard label="Clients needing attention" value={value(summary.clientsNeedingAttention)} note={available ? `of ${clientTotal}` : "Data not loaded"} tone="red" />
-        <MetricCard label="Transactions to review" value={value(summary.transactions)} note="Needs a look" tone="amber" />
-        <MetricCard label="Reconciliation issues" value={value(summary.reconciliation)} note="Accounts to check" tone="blue" />
-        <MetricCard label="Overdue invoices" value={value(summary.overdueInvoices)} note="Receivables" tone="red" />
-        <MetricCard label="Overdue bills" value={value(summary.overdueBills)} note="Payables" tone="red" />
-        <MetricCard label="Client questions" value={value(summary.clientQuestions)} note="Open requests" tone="purple" />
-        <MetricCard label="Month ends open" value={value(summary.clientsWithMonthEndOpen)} note="Clients not finished" tone="green" />
-        <MetricCard label="High priority" value={value(summary.high)} note="Do these first" tone="red" />
+      <section className="metrics-grid grouped" aria-label="Bookkeeping overview">
+        <div className="metric-group">
+          <h3 className="metric-group-title">Clients</h3>
+          <div className="metric-group-cards">
+            <MetricCard label="Clients" value={`${clientTotal}`} note={source === "demo" ? "Demo clients" : "Connected company"} tone="green" onClick={onViewClients} />
+            <MetricCard label="Clients needing attention" value={value(summary.clientsNeedingAttention)} note={available ? `of ${clientTotal}` : "Data not loaded"} tone="red" onClick={onOpenInbox} />
+            <MetricCard label="Month ends open" value={value(summary.clientsWithMonthEndOpen)} note="Clients not finished" tone="green" onClick={onMonthEnd} />
+          </div>
+        </div>
+        <div className="metric-group">
+          <h3 className="metric-group-title">Review work</h3>
+          <div className="metric-group-cards">
+            <MetricCard label="Transactions to review" value={value(summary.transactions)} note="Needs a look" tone="amber" onClick={onTransactions} />
+            <MetricCard label="Reconciliation issues" value={value(summary.reconciliation)} note="Accounts to check" tone="blue" onClick={onReconcile} />
+            <MetricCard label="Client questions" value={value(summary.clientQuestions)} note="Open requests" tone="purple" onClick={onOpenRequests} />
+          </div>
+        </div>
+        <div className="metric-group">
+          <h3 className="metric-group-title">Money and priorities</h3>
+          <div className="metric-group-cards">
+            <MetricCard label="Overdue invoices" value={value(summary.overdueInvoices)} note="Receivables" tone="red" onClick={onReceivables} />
+            <MetricCard label="Overdue bills" value={value(summary.overdueBills)} note="Payables" tone="red" onClick={onPayables} />
+            <MetricCard label="High priority" value={value(summary.high)} note="Do these first" tone="red" onClick={onOpenInbox} />
+          </div>
+        </div>
       </section>
       <section className="content-grid">
-        <div className="panel work-panel">
+        <div className="panel work-panel work-panel-primary">
           <div className="panel-heading">
             <div>
               <h2>Today's work</h2>
-              <p className="muted">Start with the most important items.</p>
+              <p className="muted">Most urgent first: high priority, then the earliest due date.</p>
             </div>
             <span className="count-pill">{available ? `${tasks.length} tasks` : NOT_AVAILABLE}</span>
           </div>
           {available && nextUp.length === 0 && <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">Nothing needs attention right now.</p></div>}
-          <TaskCardList tasks={nextUp} showClient={source === "demo"} onOpenTask={onOpenTask} />
+          <TaskCardList tasks={nextUp} showClient={source === "demo"} today={today} onOpenTask={onOpenTask} />
           {tasks.length > nextUp.length && (
             <button className="text-button" onClick={onOpenInbox}>
               See all {tasks.length} tasks in the Inbox <span>→</span>
@@ -1764,25 +2008,30 @@ function Dashboard({
             clients.map((item) => {
               const open = clientTaskCounts[item.id] ?? 0;
               return (
-                <button className="client-card" key={item.id} onClick={() => onOpen(item)}>
+                <button className="client-card" key={item.id} onClick={() => onOpen(item)} aria-label={`Open ${item.name}: ${open === 0 ? "all clear" : `${open} outstanding`}`}>
                   <div className="company-avatar">{item.initials}</div>
                   <div className="client-info">
                     <strong>{item.name}</strong>
-                    <span>{open === 0 ? "Nothing open" : `${open} open`}</span>
+                    <span>{open === 0 ? "No outstanding tasks" : `${open} outstanding ${open === 1 ? "task" : "tasks"}`}</span>
                   </div>
-                  <span className={`status-dot ${open === 0 ? "green-dot" : "amber-dot"}`} />{" "}
-                  <span className="arrow">→</span>
+                  <span className={`client-status ${open === 0 ? "clear" : "attention"}`}>{open === 0 ? "All clear" : "Needs attention"}</span>
+                  <span className="task-action">Open <span aria-hidden="true">→</span></span>
                 </button>
               );
             })
           ) : (
-            <button className="client-card" onClick={onOpenCompany}>
+            <button className="client-card" onClick={onOpenCompany} aria-label={`Open ${companyName}`}>
               <div className="company-avatar">QB</div>
               <div className="client-info">
                 <strong>{companyName}</strong>
-                <span>{available ? `${tasks.length} open` : NOT_AVAILABLE}</span>
+                <span>{available ? `${tasks.length} outstanding ${tasks.length === 1 ? "task" : "tasks"}` : NOT_AVAILABLE}</span>
               </div>
-              <span className="arrow">→</span>
+              {available ? (
+                <span className={`client-status ${tasks.length === 0 ? "clear" : "attention"}`}>{tasks.length === 0 ? "All clear" : "Needs attention"}</span>
+              ) : (
+                <span className="client-status unknown">Data not loaded</span>
+              )}
+              <span className="task-action">Open <span aria-hidden="true">→</span></span>
             </button>
           )}
           <button className="text-button" onClick={onViewClients}>
@@ -1802,8 +2051,12 @@ function Clients({
   available,
   companyName,
   connected,
+  period,
+  today,
   monthEndFor,
+  monthEndLive,
   onOpen,
+  onOpenReconcile,
   onOpenCompany,
 }: {
   source: AccountSource;
@@ -1812,12 +2065,18 @@ function Clients({
   available: boolean;
   companyName: string;
   connected: boolean;
+  period: Period;
+  today: string;
   monthEndFor: (client: Client) => number | null;
+  /** True when the month-end figure was calculated for the selected period rather than being the stored summary. */
+  monthEndLive: (client: Client) => boolean;
   onOpen: (client: Client) => void;
+  onOpenReconcile: (client: Client) => void;
   onOpenCompany: () => void;
 }) {
   const counts = countByClient(tasks);
   const companyTaskCount = tasks.reduce((total, task) => total + task.count, 0);
+  const qbPeriod = periodNotice(period, null, today);
   return (
     <div className="page-content">
       <section className="welcome-row">
@@ -1825,9 +2084,12 @@ function Clients({
           <h2>Clients</h2>
           <p className="muted">Keep every company moving forward.</p>
         </div>
-        <button className="primary-button" disabled>
-          Add client <span>+</span>
-        </button>
+        <div className="add-client">
+          <button className="primary-button" disabled aria-describedby="add-client-note">
+            Add client <span>+</span>
+          </button>
+          <small id="add-client-note" className="muted">Not available yet: adding clients has not been built.</small>
+        </div>
       </section>
       <div className="client-card-grid">
         {source === "quickbooks" ? (
@@ -1836,7 +2098,7 @@ function Clients({
               <span className="company-avatar">QB</span>
               <span className="client-card-title">
                 <strong>{companyName}</strong>
-                <span>QuickBooks Sandbox</span>
+                <span>QuickBooks Sandbox · Period: {qbPeriod.label}{qbPeriod.historical ? " (historical)" : ""}</span>
               </span>
               <span className={`status-badge ${connected ? "success" : "warning"}`}>
                 {connected ? "Connected" : "Not connected"}
@@ -1865,21 +2127,26 @@ function Clients({
           clients.map((client) => {
             const open = counts[client.id] ?? 0;
             const monthEnd = monthEndFor(client);
+            const notice = periodNotice(period, client.month, today);
+            const attention = attentionStatus(open);
+            // Stored summary figures only describe their own period; never present them for another one.
+            const monthEndShown = monthEnd !== null && (notice.figuresMatch || monthEndLive(client)) ? monthEnd : null;
+            const monthEndLabel = monthEndStatus(monthEndShown);
+            const next = nextTaskFor(tasks, client.id, today);
             return (
-              <button
-                className="full-client-card"
-                key={client.id}
-                onClick={() => onOpen(client)}
-              >
+              <article className="full-client-card" key={client.id} data-client-id={client.id}>
                 <div className="full-client-header">
                   <span className="company-avatar">{client.initials}</span>
                   <span className="client-card-title">
-                    <strong>{client.name}</strong>
-                    <span>{client.month}</span>
+                    <button className="card-link" onClick={() => onOpen(client)}>
+                      <strong>{client.name}</strong>
+                    </button>
+                    <span>
+                      Period: {notice.label}
+                      {notice.historical && <em className="period-tag"> · Historical period</em>}
+                    </span>
                   </span>
-                  <span className={`status-badge ${open === 0 ? "success" : "warning"}`}>
-                    {open === 0 ? "On track" : "Needs attention"}
-                  </span>
+                  <span className={`status-badge ${attention.tone === "success" ? "success" : "warning"}`}>{attention.label}</span>
                 </div>
                 <div className="client-card-details">
                   <span>
@@ -1888,24 +2155,26 @@ function Clients({
                   </span>
                   <span>
                     <small>Reconciliation</small>
-                    <strong>{client.reconciliation}</strong>
+                    <button className="card-action reconcile-link" onClick={() => onOpenReconcile(client)} aria-label={`Open Reconcile for ${client.name}`}>
+                      {notice.figuresMatch ? client.reconciliation : `Check ${notice.label}`} <span aria-hidden="true">→</span>
+                    </button>
                   </span>
                   <span>
-                    <small>QuickBooks</small>
-                    <strong>Not connected (demo client)</strong>
+                    <small>Next task</small>
+                    <strong className="next-task">{next ? `${next.text}${next.due ? ` · ${next.due}` : ""}` : "Nothing outstanding"}</strong>
                   </span>
                 </div>
                 <div className="client-card-progress">
                   <span>
-                    <small>Month-end progress</small>
-                    <strong>{monthEnd === null ? NOT_AVAILABLE : `${monthEnd}%`}</strong>
+                    <small>{monthEndLabel.label}</small>
+                    <strong>{monthEndShown === null ? (monthEnd === null ? NOT_AVAILABLE : `Not available for ${notice.label}`) : `${monthEndShown}%`}</strong>
                   </span>
                   <span className="progress-bar">
-                    <span style={{ width: `${monthEnd ?? 0}%` }} />
+                    <span style={{ width: `${monthEndShown ?? 0}%` }} />
                   </span>
-                  <span className="row-arrow">→</span>
+                  <span className="row-arrow" aria-hidden="true">→</span>
                 </div>
-              </button>
+              </article>
             );
           })
         )}
@@ -1916,28 +2185,42 @@ function Clients({
 
 function BookkeepingReview({
   source,
-  tasks,
+  rows,
+  history,
+  decisionsSaved,
   available,
   loading,
   error,
+  today,
   selectedRecurring,
   onBackRecurring,
   onResolveRecurring,
   onSourceChange,
-  onOpenTask,
+  onReview,
+  onDismiss,
+  onReopen,
 }: {
   source: ReviewSource;
-  tasks: WorkTask[];
+  rows: FindingRow[];
+  history: ReviewDecision[];
+  decisionsSaved: boolean;
   available: boolean;
   loading: boolean;
   error: string | null;
+  today: string;
   selectedRecurring: RecurringPattern | null;
   onBackRecurring: () => void;
   onResolveRecurring: (pattern: RecurringPattern, status: "confirmed" | "dismissed") => void;
   onSourceChange: (source: ReviewSource) => void;
-  onOpenTask: (task: WorkTask) => void;
+  onReview: (task: WorkTask) => void;
+  onDismiss: (task: WorkTask, reason: string) => void;
+  onReopen: (task: WorkTask) => void;
 }) {
-  const [filter, setFilter] = useState<"All" | TaskType>("All");
+  const [filters, setFilters] = useState<FindingFilters>({ client: "All", type: "All", priority: "All", status: "Active", query: "" });
+  const [dismissing, setDismissing] = useState<string | null>(null);
+  const [reason, setReason] = useState("");
+  const [showHistory, setShowHistory] = useState(false);
+  const setFilter = (patch: Partial<FindingFilters>) => setFilters((current) => ({ ...current, ...patch }));
   if (selectedRecurring) {
     return (
       <div className="page-content">
@@ -1972,41 +2255,155 @@ function BookkeepingReview({
       </div>
     );
   }
-  const visibleTasks = filterTasks(tasks, { type: filter });
-  const total = (list: WorkTask[]) => list.reduce((sum, task) => sum + task.count, 0);
-  const count = (priority: TaskPriority) => total(tasks.filter((task) => task.priority === priority));
+  const active = rows.filter((row) => row.status === "Open" || row.status === "Under review").map((row) => row.task);
+  const summary = summarizeFindings(active);
+  const visibleRows = filterFindingRows(rows, filters);
+  const clientOptions = [...new Map(rows.map((row) => [row.task.clientId, row.task.client])).entries()];
   const figure = (value: number) => (available ? `${value}` : NOT_AVAILABLE);
+  const filtersActive = filters.client !== "All" || filters.type !== "All" || filters.priority !== "All" || filters.status !== "Active" || filters.query.trim() !== "";
+  const submitDismiss = (task: WorkTask) => {
+    if (!reason.trim()) return;
+    onDismiss(task, reason.trim());
+    setDismissing(null);
+    setReason("");
+  };
   return (
     <div className="page-content">
       <section className="welcome-row">
         <div>
           <h2>Bookkeeping Review</h2>
-          <p className="muted">Checks that suggest items may need attention. Items marked "Possible issue" are suggestions, not confirmed errors.</p>
+          <p className="muted">Accounting quality checks. Findings marked "possible" are suggestions to look at, not confirmed errors. Reminders such as overdue invoices and bills are in the Inbox.</p>
         </div>
-        <span className="attention-summary"><strong>{figure(total(tasks))}</strong> items found</span>
+        <span className="attention-summary"><strong>{figure(summary.total)}</strong> review findings</span>
       </section>
       <AccountSourceSwitch source={source} onChange={onSourceChange} />
       {loading && <div className="data-state-message">Loading QuickBooks Sandbox review data...</div>}
       {error && <div className="data-state-message error">{error}</div>}
       {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded.</div>}
       <div className="review-summary-grid">
-        <SummaryCard value={figure(total(tasks))} label="Needs Attention" tone="red" />
-        <SummaryCard value={figure(count("High"))} label="High Priority" tone="red" />
-        <SummaryCard value={figure(count("Medium"))} label="Medium Priority" tone="amber" />
-        <SummaryCard value={figure(count("Low"))} label="Low Priority" tone="green" />
+        <SummaryCard value={figure(summary.total)} label="Total review findings" tone="red" />
+        <SummaryCard value={figure(summary.duplicates)} label="Possible duplicates" tone="amber" />
+        <SummaryCard value={figure(summary.categorization)} label="Categorization issues" tone="blue" />
+        <SummaryCard value={figure(summary.missingInfo)} label="Missing information" tone="purple" />
       </div>
-      <div className="filter-row">
-        {(["All", "Transactions", "Receivables", "Payables", "Reconciliation"] as const).map((option) => (
-          <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} onClick={() => setFilter(option)}>
-            {option}
-            <span>{total(filterTasks(tasks, { type: option }))}</span>
-          </button>
-        ))}
+      <div className="queue-filters review-filters">
+        <label>
+          Search
+          <input type="search" placeholder="Vendor, reference, client, amount…" value={filters.query} onChange={(event) => setFilter({ query: event.target.value })} />
+        </label>
+        {clientOptions.length > 1 && (
+          <label>
+            Review client
+            <select value={filters.client} onChange={(event) => setFilter({ client: event.target.value })}>
+              <option value="All">All clients</option>
+              {clientOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+            </select>
+          </label>
+        )}
+        <label>
+          Finding type
+          <select value={filters.type} onChange={(event) => setFilter({ type: event.target.value as FindingFilters["type"] })}>
+            <option value="All">All types</option>
+            {findingTypes.map((type) => <option key={type} value={type}>{findingTypeLabel[type]}</option>)}
+          </select>
+        </label>
+        <label>
+          Priority
+          <select value={filters.priority} onChange={(event) => setFilter({ priority: event.target.value as FindingFilters["priority"] })}>
+            <option value="All">All priorities</option>
+            {taskPriorities.map((option) => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+        <label>
+          Review status
+          <select value={filters.status} onChange={(event) => setFilter({ status: event.target.value as FindingFilters["status"] })}>
+            <option value="Active">Needs review (open)</option>
+            {reviewStatuses.map((option) => <option key={option} value={option}>{option}</option>)}
+            <option value="All">All statuses</option>
+          </select>
+        </label>
+        <button className="secondary-button" onClick={() => setShowHistory((current) => !current)} aria-expanded={showHistory}>
+          {showHistory ? "Hide review decisions" : "View review decisions"}
+        </button>
       </div>
-      {available && visibleTasks.length === 0 ? (
-        <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">No review items were found.</p></div>
+      <p className="muted decision-note">
+        {decisionsSaved ? "Review decisions are temporary development records, stored only in this browser." : "Review decisions could not be saved and will be lost when this page closes."}
+        {filtersActive && available ? ` Showing ${visibleRows.length} of ${rows.length} findings.` : ""}
+      </p>
+      {showHistory && (
+        <div className="panel decision-history" aria-label="Review decisions">
+          <h3>Previous review decisions</h3>
+          {history.length === 0 ? <p className="muted">No review decisions have been recorded yet.</p> : (
+            <ul>
+              {history.map((decision) => (
+                <li key={decision.id}>
+                  <strong>{decision.status === "dismissed" ? "Dismissed" : decision.status === "reopened" ? "Reopened" : "Review started"}</strong>
+                  {" · "}{decision.clientName} · {decision.issue}
+                  {decision.reason ? ` · Reason: ${decision.reason}` : ""}
+                  <small>{decision.actor ? `${decision.actor} · ` : ""}{new Date(decision.at).toLocaleString()}</small>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {available && visibleRows.length === 0 ? (
+        <div className="empty-state">
+          <span>✓</span>
+          <h2>{rows.length === 0 ? "No review findings." : "No findings match."}</h2>
+          <p className="muted">{rows.length === 0 ? "No accounting review findings were found." : "No findings match your search and filters."}</p>
+        </div>
       ) : (
-        <TaskCardList tasks={visibleTasks} showClient={source === "demo"} onOpenTask={onOpenTask} />
+        <div className="review-card-list">
+          {visibleRows.map((row) => {
+            const { task } = row;
+            const explanation = explainFinding(task);
+            const due = task.dueDate ? describeDue(task.dueDate, today) : undefined;
+            const resolved = row.status === "Resolved";
+            return (
+              <article className="review-card finding-card" key={row.key} data-finding-id={task.id}>
+                <div className="review-card-top">
+                  <span className="review-type">{source === "demo" ? `${task.client} · ` : ""}{task.issue} · {findingTypeLabel[rowType(row)]}</span>
+                  <span>
+                    <span className={`priority-badge ${task.priority.toLowerCase()}`}>{task.priority}</span>{" "}
+                    <span className={`inbox-status finding-status ${taskSlug(row.status)}`}>{row.status}</span>
+                  </span>
+                </div>
+                <dl className="finding-details">
+                  <div><dt>What was detected</dt><dd>{explanation.detected}{task.amount !== undefined && <> <strong className="review-amount">{formatMoney(task.amount)}</strong></>}</dd></div>
+                  {!resolved && <div><dt>Why it was flagged</dt><dd>{explanation.why}</dd></div>}
+                  {resolved && <div><dt>Result</dt><dd>Resolved: the source record no longer triggers this check.</dd></div>}
+                  <div><dt>Next action</dt><dd>{resolved ? "None." : explanation.next}{due && <> · <strong className={`due-label ${due.tone}`}>{due.label}</strong></>}</dd></div>
+                  {row.changedSinceDismissed && <div><dt>Note</dt><dd>Shown again because the source record changed after it was dismissed.</dd></div>}
+                  {row.status === "Dismissed" && row.decision && (
+                    <div><dt>Dismissed</dt><dd>Reason: {row.decision.reason} <small>({row.decision.actor ? `${row.decision.actor}, ` : ""}{new Date(row.decision.at).toLocaleString()})</small></dd></div>
+                  )}
+                </dl>
+                {!resolved && (
+                  <div className="finding-actions">
+                    {row.status === "Dismissed" ? (
+                      <button className="secondary-button" onClick={() => onReopen(task)}>Reopen finding</button>
+                    ) : dismissing === row.key ? (
+                      <form className="dismiss-form" onSubmit={(event) => { event.preventDefault(); submitDismiss(task); }}>
+                        <label>
+                          Reason for dismissing
+                          <input autoFocus required value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Why is this not a problem?" />
+                        </label>
+                        <button className="primary-button" type="submit" disabled={!reason.trim()}>Confirm dismiss</button>
+                        <button className="secondary-button" type="button" onClick={() => { setDismissing(null); setReason(""); }}>Cancel</button>
+                      </form>
+                    ) : (
+                      <>
+                        <button className="primary-button" onClick={() => onReview(task)}>Review finding</button>
+                        <button className="secondary-button" onClick={() => { setDismissing(row.key); setReason(""); }}>Dismiss finding</button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
       )}
     </div>
   );
@@ -2021,6 +2418,7 @@ function Inbox({
   loading,
   error,
   scopeLabel,
+  today,
   onOpenTask,
 }: {
   tasks: WorkTask[];
@@ -2029,15 +2427,25 @@ function Inbox({
   loading: boolean;
   error: string | null;
   scopeLabel: string;
+  today: string;
   onOpenTask: (task: WorkTask) => void;
 }) {
   const [type, setType] = useState<TaskType | "All">("All");
   const [priority, setPriority] = useState<TaskPriority | "All">("All");
   const [status, setStatus] = useState<TaskStatus | "All">("All");
-  const visibleTasks = filterTasks(tasks, { type, priority, status });
+  const [readiness, setReadiness] = useState<Readiness>("all");
+  const [query, setQuery] = useState("");
+  // Counts are item counts (a summary row can stand for several items), so they can exceed the number of rows.
   const total = (list: WorkTask[]) => list.reduce((sum, task) => sum + task.count, 0);
-  const typeCount = (option: TaskType) => total(filterTasks(tasks, { type: option, priority, status }));
+  const narrowed = (options: { type?: TaskType | "All"; readiness?: Readiness }) =>
+    searchTasks(filterByReadiness(filterTasks(tasks, { type: options.type ?? "All", priority, status }), options.readiness ?? readiness), query);
+  const visibleTasks = narrowed({ type });
+  const typeCount = (option: TaskType | "All") => total(narrowed({ type: option }));
   const figure = (value: number) => (available ? `${value}` : NOT_AVAILABLE);
+  const allItems = total(tasks);
+  const readyItems = total(filterByReadiness(tasks, "ready"));
+  const waitingItems = total(filterByReadiness(tasks, "waiting"));
+  const filtersActive = type !== "All" || priority !== "All" || status !== "All" || readiness !== "all" || query.trim() !== "";
 
   return (
     <div className="page-content">
@@ -2049,19 +2457,13 @@ function Inbox({
           </p>
         </div>
         <span className="attention-summary">
-          <strong>{figure(total(tasks))}</strong> items need attention
+          <strong>{figure(allItems)}</strong> items need attention
+          {available && <small className="muted"> {readyItems} ready for you · {waitingItems} waiting on others</small>}
         </span>
       </section>
       {loading && <div className="data-state-message">Loading QuickBooks Sandbox data...</div>}
       {error && <div className="data-state-message error">{error}</div>}
       {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded. Connect in Settings to see real tasks.</div>}
-      <div className="inbox-summary-grid">
-        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Transactions" })))} label="Transactions to review" tone="red" />
-        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Receivables" })))} label="Receivables to check" tone="amber" />
-        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Payables" })))} label="Payables to check" tone="purple" />
-        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Reconciliation" })))} label="Reconciliation issues" tone="blue" />
-        <SummaryCard value={figure(total(filterTasks(tasks, { type: "Client Requests" })))} label="Client questions" tone="red" />
-      </div>
       <div className="filter-row" aria-label="Inbox filters">
         {inboxTypeFilters.map((option) => (
           <button
@@ -2070,11 +2472,23 @@ function Inbox({
             onClick={() => setType(option)}
           >
             {option}
-            <span>{option === "All" ? total(filterTasks(tasks, { priority, status })) : typeCount(option)}</span>
+            <span>{typeCount(option)}</span>
           </button>
         ))}
       </div>
       <div className="queue-filters">
+        <label>
+          Search
+          <input type="search" className="inbox-search" placeholder="Client, vendor, invoice, amount…" value={query} onChange={(event) => setQuery(event.target.value)} />
+        </label>
+        <label>
+          Work
+          <select value={readiness} onChange={(event) => setReadiness(event.target.value as Readiness)}>
+            <option value="all">All tasks</option>
+            <option value="ready">Ready for me</option>
+            <option value="waiting">Waiting on client</option>
+          </select>
+        </label>
         <label>
           Priority
           <select value={priority} onChange={(event) => setPriority(event.target.value as TaskPriority | "All")}>
@@ -2090,12 +2504,17 @@ function Inbox({
           </select>
         </label>
       </div>
+      {available && filtersActive && (
+        <p className="muted inbox-count" role="status">
+          Showing {total(visibleTasks)} of {allItems} items
+        </p>
+      )}
       {visibleTasks.length === 0 ? (
         available ? (
           <div className="empty-state">
             <span>✓</span>
-            <h2>You're all caught up.</h2>
-            <p className="muted">{tasks.length === 0 ? "There is nothing waiting for your attention." : "No tasks match these filters."}</p>
+            <h2>{tasks.length === 0 ? "You're all caught up." : "No tasks match."}</h2>
+            <p className="muted">{tasks.length === 0 ? "There is nothing waiting for your attention." : "No tasks match your search and filters. Clear the search or change a filter to see more."}</p>
           </div>
         ) : null
       ) : (
@@ -2107,28 +2526,34 @@ function Inbox({
             <span>Priority</span>
             <span>Due</span>
             <span>Status</span>
-            <span />
+            <span>Action</span>
           </div>
-          {visibleTasks.map((task) => (
-            <button
-              className="inbox-row"
-              key={task.id}
-              onClick={() => onOpenTask(task)}
-              title={`Next: ${task.action}`}
-            >
-              <strong>{task.client}</strong>
-              <span className="inbox-type">{task.type}</span>
-              <span>{task.suspected ? "Possible issue: " : ""}{task.description}</span>
-              <span className={`priority-badge ${task.priority.toLowerCase()}`}>
-                {task.priority}
-              </span>
-              <span>{task.dueDate ? formatDueDate(task.dueDate) : "—"}</span>
-              <span className={`inbox-status ${taskSlug(task.status)}`}>
-                {task.status}
-              </span>
-              <span className="row-arrow">→</span>
-            </button>
-          ))}
+          {visibleTasks.map((task) => {
+            const due = dueLabel(task, today);
+            return (
+              <div className="inbox-row" key={task.id} title={`Next: ${task.action}`}>
+                <strong>{task.client}</strong>
+                <span className="inbox-type">{task.type}</span>
+                <span>{task.suspected ? "Possible issue: " : ""}{cleanDescription(task)}</span>
+                <span className={`priority-badge ${task.priority.toLowerCase()}`}>
+                  {task.priority}
+                </span>
+                <span className="inbox-due">
+                  {task.dueDate ? (
+                    <>
+                      {due && <strong className={`due-${due.tone}`}>{due.label}</strong>}
+                      <small>{formatDueDate(task.dueDate)}</small>
+                    </>
+                  ) : "—"}
+                </span>
+                <span className={`inbox-status ${taskSlug(task.status)}`}>
+                  {task.status}
+                  <small>{isWaiting(task) ? " · waiting on others" : " · ready for you"}</small>
+                </span>
+                <button className="card-link inbox-action" onClick={() => onOpenTask(task)}>{taskButtonLabel(task)}</button>
+              </div>
+            );
+          })}
         </div>
       )}
       {source === "demo" && available && <p className="muted">Items from demo clients without detailed records are summary counts only.</p>}
@@ -2157,11 +2582,15 @@ function ClientRequests({
   source,
   clients,
   selectedClientId,
+  clientSelected,
+  today,
   requests,
   documents,
   auditEvents,
   transactions,
   selectedRequest,
+  draft,
+  onDraftChange,
   onSelect,
   onBack,
   onUpdate,
@@ -2169,6 +2598,7 @@ function ClientRequests({
   onCreateRequest,
   onCreateClientMessage,
   onSendClientMessage,
+  onSendFollowUp,
   onSubmitDocument,
   onApproveRequest,
   onRejectRequest,
@@ -2177,11 +2607,16 @@ function ClientRequests({
   source: AccountSource;
   clients: Client[];
   selectedClientId: string;
+  /** False while All clients is selected: nothing can be created until one client is chosen. */
+  clientSelected: boolean;
+  today: string;
   requests: ClientRequest[];
   documents: ClientDocument[];
   auditEvents: PortalAuditEvent[];
   transactions: Transaction[];
   selectedRequest: ClientRequest | null;
+  draft: RequestDraft;
+  onDraftChange: (draft: RequestDraft) => void;
   onSelect: (request: ClientRequest) => void;
   onBack: () => void;
   onUpdate: (request: ClientRequest) => void;
@@ -2198,35 +2633,71 @@ function ClientRequests({
   }) => void;
   onCreateClientMessage: (clientId: string, subject: string, message: string) => void;
   onSendClientMessage: (request: ClientRequest, message: string) => void;
+  onSendFollowUp: (request: ClientRequest, message: string) => void;
   onSubmitDocument: (request: ClientRequest, fixtureId: string, note: string) => void;
   onApproveRequest: (request: ClientRequest, message: string) => void;
   onRejectRequest: (request: ClientRequest, message: string) => void;
   onMatchReceipt: (request: ClientRequest, documentId: string, transactionId: string) => void;
 }) {
-  const [filter, setFilter] = useState<ClientRequest["status"] | "All">("All");
+  const [filters, setFilters] = useState<RequestFilters>(emptyRequestFilters);
   const [mode, setMode] = useState<"bookkeeper" | "client">("bookkeeper");
   const [portalClientId, setPortalClientId] = useState(selectedClientId);
-  const [draftClientId, setDraftClientId] = useState(selectedClientId);
-  const [draftType, setDraftType] = useState<ClientRequestType>("Custom Question");
-  const [draftQuestion, setDraftQuestion] = useState("");
-  const [draftDueDate, setDraftDueDate] = useState(addDays(normalizeDisplayDate(new Date().toISOString().slice(0, 10)), 3));
-  const [draftRelatedTransaction, setDraftRelatedTransaction] = useState("");
-  const [draftRelatedAmount, setDraftRelatedAmount] = useState("");
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [openDocumentId, setOpenDocumentId] = useState<string | null>(null);
   const [portalSubject, setPortalSubject] = useState("");
   const [portalMessage, setPortalMessage] = useState("");
 
   useEffect(() => {
     setPortalClientId(selectedClientId);
-    setDraftClientId(selectedClientId);
+    setFilters((current) => (current.clientId === ALL_CLIENTS ? current : { ...current, clientId: ALL_CLIENTS }));
+    setOpenDocumentId(null);
   }, [selectedClientId]);
 
+  const clientNameOf = (request: ClientRequest) => clients.find((client) => client.id === request.clientId)?.name ?? request.client;
   const portalRequests = requests.filter((request) => requestMatchesClient(request, portalClientId));
   const portalDocuments = documents.filter((document) => document.clientId === portalClientId);
-  const visibleRequests = mode === "client"
-    ? portalRequests.filter((request) => filter === "All" ? true : request.status === filter)
-    : (filter === "All" ? requests : requests.filter((request) => request.status === filter));
-  const outstanding = portalRequests.filter((request) => openRequest(request)).length;
-  const completed = portalRequests.length - outstanding;
+  const portalCounts = requestCounts(portalRequests, today);
+  const outstanding = portalCounts.active;
+  const completed = portalCounts.completed;
+
+  // Bookkeeper view works over every request in scope; the simulated client sees only their own.
+  const baseRequests = mode === "client" ? portalRequests : requests;
+  const baseDocuments = mode === "client" ? portalDocuments : documents;
+  const scopeCounts = requestCounts(baseRequests, today);
+  const clientFilters = mode === "client" ? { ...filters, clientId: ALL_CLIENTS } : filters;
+  // Status counts ignore the status filter itself so each chip shows what it would show if chosen.
+  const searched = filterRequests(baseRequests, clientFilters, baseDocuments, clientNameOf, { ignoreStatus: true });
+  const searchedCounts = requestCounts(searched, today);
+  const visibleRequests = sortRequests(filterRequests(baseRequests, clientFilters, baseDocuments, clientNameOf));
+  const filtersActive = hasActiveRequestFilters(clientFilters);
+  const clientsWithRequests = clients.filter((client) => requests.some((request) => request.clientId === client.id));
+  const showClientFilter = mode === "bookkeeper" && !clientSelected && clientsWithRequests.length > 1;
+  const multiClient = new Set(visibleRequests.map((request) => request.clientId)).size > 1;
+  const visibleDocuments = baseDocuments.filter((document) => mode === "client" || filters.clientId === ALL_CLIENTS || document.clientId === filters.clientId);
+  const openDocument = visibleDocuments.find((document) => document.id === openDocumentId) ?? null;
+  const openDocumentRequest = openDocument ? requests.find((request) => request.id === openDocument.requestId) : undefined;
+
+  const effectiveClientId = clientSelected ? selectedClientId : draft.clientId;
+  const effectiveClientName = clients.find((client) => client.id === effectiveClientId)?.name;
+  const message = draftMessage(draft);
+  const canSubmit = Boolean(effectiveClientId && effectiveClientName && message.trim());
+  const dirty = draftIsDirty(draft);
+  const defaultDue = addDays(today, 3);
+  const updateDraft = (changes: Partial<RequestDraft>) => onDraftChange({ ...draft, ...changes });
+  const submitDraft = (status: ClientRequestStatus) => {
+    if (!canSubmit || !effectiveClientId) return;
+    onCreateRequest({
+      clientId: effectiveClientId,
+      requestType: draft.type,
+      question: message.trim(),
+      dueDate: draft.dueDate ?? defaultDue,
+      status,
+      relatedTransaction: draft.transaction.trim() || undefined,
+      relatedAmount: draft.amount.trim() || undefined,
+    });
+    onDraftChange(emptyRequestDraft);
+    setConfirmDiscard(false);
+  };
 
   if (selectedRequest)
     return (
@@ -2234,12 +2705,14 @@ function ClientRequests({
         source={source}
         role={mode}
         request={selectedRequest}
+        today={today}
         documents={documents.filter((document) => document.requestId === selectedRequest.id || requestDocumentIds(selectedRequest, documents).includes(document.id))}
         transactions={transactions}
         onBack={onBack}
         onUpdate={onUpdate}
         onApplyResponse={onApplyResponse}
         onSendClientMessage={onSendClientMessage}
+        onSendFollowUp={onSendFollowUp}
         onSubmitDocument={onSubmitDocument}
         onApproveRequest={onApproveRequest}
         onRejectRequest={onRejectRequest}
@@ -2257,8 +2730,8 @@ function ClientRequests({
               : "Demo-only simulated client portal. This is not a secure external login."}
           </p>
         </div>
-        <span className="attention-summary">
-          <strong>{mode === "client" ? outstanding : requests.filter((request) => openRequest(request)).length}</strong> active requests
+        <span className="attention-summary" data-testid="request-counts">
+          <strong>{scopeCounts.active}</strong> active of {scopeCounts.total} total requests
         </span>
       </section>
       {source === "demo" && (
@@ -2307,60 +2780,111 @@ function ClientRequests({
         </div>
       )}
       {mode === "bookkeeper" && source === "demo" && (
-        <div className="panel portal-panel">
+        <div className="panel portal-panel" data-testid="request-composer">
           <div className="panel-heading">
             <div>
-              <h2>Create request</h2>
-              <p className="muted">Reuse the existing request workflow for receipts, statements, invoices, and custom questions.</p>
+              <h2>New request</h2>
+              <p className="muted">Ask a client for a receipt, statement, invoice, or answer. Nothing is sent to a real client in demo mode.</p>
             </div>
+            {!draft.open && (
+              <button className="primary-button" onClick={() => updateDraft({ open: true })}>
+                {dirty ? "Resume Draft" : "New Request"}
+              </button>
+            )}
           </div>
-          <div className="queue-filters">
-            <label>
-              Client
-              <select value={draftClientId} onChange={(event) => setDraftClientId(event.target.value)}>
-                {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
-              </select>
-            </label>
-            <label>
-              Request type
-              <select value={draftType} onChange={(event) => setDraftType(event.target.value as ClientRequestType)}>
-                {(["Missing Receipt", "Transaction Question", "Statement Request", "Invoice Request", "Custom Question"] as const).map((option) => <option key={option} value={option}>{option}</option>)}
-              </select>
-            </label>
-            <label>
-              Due date
-              <input type="date" value={draftDueDate} onChange={(event) => setDraftDueDate(event.target.value)} />
-            </label>
-          </div>
-          <div className="queue-filters">
-            <label>
-              Related transaction or document
-              <input value={draftRelatedTransaction} onChange={(event) => setDraftRelatedTransaction(event.target.value)} placeholder="Home Depot" />
-            </label>
-            <label>
-              Amount
-              <input value={draftRelatedAmount} onChange={(event) => setDraftRelatedAmount(event.target.value)} placeholder="$341.22" />
-            </label>
-          </div>
-          <label className="portal-compose">
-            Request
-            <textarea value={draftQuestion} onChange={(event) => setDraftQuestion(event.target.value)} placeholder="Please upload the receipt for this purchase." />
-          </label>
-          <div className="reset-actions">
-            <button className="secondary-button" onClick={() => {
-              if (!draftQuestion.trim()) return;
-              onCreateRequest({ clientId: draftClientId, requestType: draftType, question: draftQuestion.trim(), dueDate: draftDueDate || undefined, status: "Draft", relatedTransaction: draftRelatedTransaction || undefined, relatedAmount: draftRelatedAmount || undefined });
-              setDraftQuestion("");
-            }}>Save draft</button>
-            <button className="primary-button" onClick={() => {
-              if (!draftQuestion.trim()) return;
-              onCreateRequest({ clientId: draftClientId, requestType: draftType, question: draftQuestion.trim(), dueDate: draftDueDate || undefined, status: "Waiting for Client", relatedTransaction: draftRelatedTransaction || undefined, relatedAmount: draftRelatedAmount || undefined });
-              setDraftQuestion("");
-            }}>Send request <span>→</span></button>
-          </div>
+          {!draft.open && dirty && <p className="muted" data-testid="draft-kept">An unsaved request draft is being kept. Resume it or discard it.</p>}
+          {draft.open && (
+            <>
+              <div className="queue-filters">
+                <label>
+                  Client
+                  {clientSelected ? (
+                    <input value={effectiveClientName ?? ""} readOnly aria-readonly="true" />
+                  ) : (
+                    <select value={draft.clientId} onChange={(event) => updateDraft({ clientId: event.target.value })}>
+                      <option value="">Select a client…</option>
+                      {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+                    </select>
+                  )}
+                </label>
+                <label>
+                  Request type
+                  <select value={draft.type} onChange={(event) => updateDraft({ type: event.target.value as ClientRequestType })}>
+                    {REQUEST_TYPES.map((option) => <option key={option} value={option}>{option}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Due date
+                  <input type="date" value={draft.dueDate ?? defaultDue} onChange={(event) => updateDraft({ dueDate: event.target.value })} />
+                </label>
+              </div>
+              <div className="queue-filters">
+                <label>
+                  Related transaction or document (optional)
+                  <input value={draft.transaction} onChange={(event) => updateDraft({ transaction: event.target.value })} placeholder="Home Depot" />
+                </label>
+                <label>
+                  Amount (optional)
+                  <input value={draft.amount} onChange={(event) => updateDraft({ amount: event.target.value })} placeholder="$341.22" />
+                </label>
+              </div>
+              <label className="portal-compose">
+                Request message (suggested text can be edited)
+                <textarea value={message} onChange={(event) => updateDraft({ message: event.target.value })} placeholder="Type the question for your client." />
+              </label>
+              {!effectiveClientId && <p className="muted" data-testid="draft-needs-client">Select a specific client before saving or sending a request.</p>}
+              {effectiveClientId && !message.trim() && <p className="muted">Add a request message to continue.</p>}
+              {confirmDiscard && (
+                <div className="me-confirm" role="alertdialog" aria-label="Discard request draft" data-testid="discard-confirm">
+                  <strong>Discard this unsaved request?</strong>
+                  <p className="muted">Your changes to this request will be lost.</p>
+                  <div className="reset-actions">
+                    <button className="secondary-button" onClick={() => setConfirmDiscard(false)}>Keep editing</button>
+                    <button className="secondary-button" onClick={() => { onDraftChange(emptyRequestDraft); setConfirmDiscard(false); }}>Discard changes</button>
+                  </div>
+                </div>
+              )}
+              <div className="reset-actions">
+                <button className="secondary-button" onClick={() => (dirty ? setConfirmDiscard(true) : onDraftChange(emptyRequestDraft))}>Discard draft</button>
+                <button className="secondary-button" onClick={() => updateDraft({ open: false })}>Close (keep draft)</button>
+                <button className="secondary-button" disabled={!canSubmit} onClick={() => submitDraft("Draft")}>Save Draft</button>
+                <button className="primary-button" disabled={!canSubmit} onClick={() => submitDraft("Waiting for Client")}>Send Request <span>→</span></button>
+              </div>
+            </>
+          )}
         </div>
       )}
-      <div className="filter-row">{(["All", "Draft", "Sent", "Waiting for Client", "Client Responded", "Needs Follow-Up", "Completed"] as const).map((option) => <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} onClick={() => setFilter(option)}>{option}<span>{option === "All" ? visibleRequests.length : (mode === "client" ? portalRequests : requests).filter((request) => request.status === option).length}</span></button>)}</div>
+      <div className="request-toolbar" role="search">
+        <label>
+          Search requests
+          <input
+            type="search"
+            value={filters.search}
+            onChange={(event) => setFilters({ ...filters, search: event.target.value })}
+            placeholder="Client, vendor, transaction, document, or request text"
+          />
+        </label>
+        {showClientFilter && (
+          <label>
+            Client
+            <select value={filters.clientId} onChange={(event) => setFilters({ ...filters, clientId: event.target.value })}>
+              <option value={ALL_CLIENTS}>All clients</option>
+              {clientsWithRequests.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+            </select>
+          </label>
+        )}
+        {filtersActive && <button className="secondary-button" onClick={() => setFilters(emptyRequestFilters)}>Reset Filters</button>}
+        {filtersActive && <span className="muted" data-testid="requests-showing">Showing {visibleRequests.length} of {scopeCounts.total}</span>}
+      </div>
+      <div className="filter-row" aria-label="Request status filters">
+        {([
+          ["All", "All requests", searchedCounts.total],
+          ["Active", "Active", searchedCounts.active],
+          ...(["Draft", "Sent", "Waiting for Client", "Client Responded", "Needs Follow-Up", "Completed"] as const).map((status) => [status, status, searchedCounts.byStatus[status] ?? 0] as const),
+        ] as ReadonlyArray<readonly [RequestStatusFilter, string, number]>).map(([option, label, count]) => (
+          <button className={`filter-button ${filters.status === option ? "active" : ""}`} key={option} onClick={() => setFilters({ ...filters, status: option })}>{label}<span>{count}</span></button>
+        ))}
+      </div>
       <div className="request-documents-grid">
         <section className="panel">
           <div className="panel-heading">
@@ -2370,15 +2894,36 @@ function ClientRequests({
             </div>
           </div>
           <div className="audit-log-list">
-            {(mode === "client" ? portalDocuments : documents).slice(0, 6).map((document) => (
-              <div className="audit-log-row" key={document.id}>
+            {visibleDocuments.slice(0, 6).map((document) => (
+              <div className="audit-log-row" key={document.id} data-testid="document-row">
                 <strong>{document.name}</strong>
                 <span>{document.type} · {document.date}</span>
                 <span>{document.reviewStatus}{document.matchStatus ? ` · ${document.matchStatus}` : ""}</span>
+                <button className="secondary-button" onClick={() => setOpenDocumentId(openDocumentId === document.id ? null : document.id)}>
+                  {openDocumentId === document.id ? "Hide Document" : "View Document"}
+                </button>
               </div>
             ))}
-            {(mode === "client" ? portalDocuments : documents).length === 0 && <p className="muted">No demo documents yet.</p>}
+            {visibleDocuments.length === 0 && <p className="muted">No demo documents yet.</p>}
           </div>
+          {openDocument && (
+            <div className="document-detail" data-testid="document-detail">
+              <h3>{openDocument.name}</h3>
+              <p className="muted"><strong>Demo metadata only</strong> — no file was uploaded or stored.</p>
+              <dl>
+                <dt>Type</dt><dd>{openDocument.type}</dd>
+                <dt>Date</dt><dd>{openDocument.date}</dd>
+                {openDocument.vendor && <><dt>Vendor</dt><dd>{openDocument.vendor}</dd></>}
+                {openDocument.amount && <><dt>Amount</dt><dd>{openDocument.amount}</dd></>}
+                <dt>Review</dt><dd>{openDocument.reviewStatus}{openDocument.matchStatus ? ` · ${openDocument.matchStatus}` : ""}</dd>
+                <dt>Uploaded by</dt><dd>{openDocument.uploadedBy}</dd>
+                {openDocument.notes && <><dt>Notes</dt><dd>{openDocument.notes}</dd></>}
+              </dl>
+              {openDocumentRequest
+                ? <button className="primary-button" onClick={() => onSelect(openDocumentRequest)}>Open Related Request</button>
+                : <p className="muted">No related request is on file for this document.</p>}
+            </div>
+          )}
         </section>
         <section className="panel">
           <div className="panel-heading">
@@ -2401,39 +2946,48 @@ function ClientRequests({
       </div>
       {visibleRequests.length === 0 ? (
         <div className="empty-state">
-          <span>✓</span>
-          <h2>You're all caught up.</h2>
-          <p className="muted">{mode === "client" ? "There are no requests for this simulated client right now." : "All client questions have been resolved."}</p>
+          <span>{filtersActive ? "?" : "✓"}</span>
+          <h2>{filtersActive ? "No requests match these filters." : "You're all caught up."}</h2>
+          <p className="muted">{filtersActive ? "Try a different search or reset the filters." : mode === "client" ? "There are no requests for this simulated client right now." : "All client questions have been resolved."}</p>
         </div>
       ) : (
         <div className="request-card-grid">
-          {visibleRequests.map((request) => (
-            <button
-              className="request-card"
-              key={request.id}
-              onClick={() => onSelect(request)}
-            >
-              <div className="request-card-top">
-                <span className="company-avatar">{request.client.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span>
-                <span>
-                  <strong>{request.client}</strong>
-                  <small>{request.requestType} · Created {request.dateCreated}</small>
-                </span>
-                <span
-                  className={`inbox-status ${statusLabel(request.status)}`}
-                >
-                  {request.status}
-                </span>
-              </div>
-              <div className="request-card-related">
-                <strong>{request.relatedTransaction}</strong>
-                <span>{request.relatedAmount}{request.dueDate ? ` · due ${formatDueDate(request.dueDate)}` : ""}</span>
-              </div>
-              <p>{request.question}</p>
-              <small className="muted">{requestHasResponse(request) ? "Client has responded." : "Waiting for a response."} {requestDocumentIds(request, documents).length > 0 ? `${requestDocumentIds(request, documents).length} document(s) attached.` : ""}</small>
-              <span className="row-arrow">→</span>
-            </button>
-          ))}
+          {visibleRequests.map((request) => {
+            const step = nextStep(request);
+            const due = requestDue(request, today);
+            const docCount = requestDocumentIds(request, documents).length;
+            return (
+              <article className={`request-card ${step.waiting ? "waiting" : ""}`} key={request.id} data-testid="request-card">
+                <div className="request-card-top">
+                  <span className="company-avatar">{clientNameOf(request).split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span>
+                  <span>
+                    <strong data-testid="request-client">{clientNameOf(request)}</strong>
+                    <small>{request.requestType} · Created {request.dateCreated}</small>
+                  </span>
+                  <span className={`inbox-status ${statusLabel(request.status)}`}>{request.status}</span>
+                </div>
+                <div className="request-card-related">
+                  <strong>{request.relatedTransaction || request.requestType}</strong>
+                  <span>
+                    {request.relatedAmount}
+                    {request.dueDate ? ` · due ${formatDueDate(request.dueDate)}` : ""}
+                    {due && <em className={`request-due due-${due.tone}`} data-testid="request-due"> · {due.label}</em>}
+                  </span>
+                </div>
+                <p>{request.question}</p>
+                <small className="muted">{requestHasResponse(request) ? "Client has responded." : "Waiting for a response."} {docCount > 0 ? `${docCount} document(s) attached.` : ""}</small>
+                <small className="request-next" data-testid="request-next">Next: {step.text}</small>
+                <div className="reset-actions">
+                  <button className={step.needsBookkeeper && mode === "bookkeeper" ? "primary-button" : "secondary-button"} onClick={() => onSelect(request)}>
+                    {mode === "client" ? "View Request" : step.action}
+                  </button>
+                  {mode === "bookkeeper" && step.action !== "View Request" && (
+                    <button className="secondary-button" onClick={() => onSelect(request)}>View Request</button>
+                  )}
+                </div>
+              </article>
+            );
+          })}
         </div>
       )}
     </div>
@@ -2444,12 +2998,14 @@ function ClientRequestDetail({
   source,
   role,
   request,
+  today,
   documents,
   transactions,
   onBack,
   onUpdate,
   onApplyResponse,
   onSendClientMessage,
+  onSendFollowUp,
   onSubmitDocument,
   onApproveRequest,
   onRejectRequest,
@@ -2458,12 +3014,14 @@ function ClientRequestDetail({
   source: AccountSource;
   role: "bookkeeper" | "client";
   request: ClientRequest;
+  today: string;
   documents: ClientDocument[];
   transactions: Transaction[];
   onBack: () => void;
   onUpdate: (request: ClientRequest) => void;
   onApplyResponse: (request: ClientRequest) => Promise<void>;
   onSendClientMessage: (request: ClientRequest, message: string) => void;
+  onSendFollowUp: (request: ClientRequest, message: string) => void;
   onSubmitDocument: (request: ClientRequest, fixtureId: string, note: string) => void;
   onApproveRequest: (request: ClientRequest, message: string) => void;
   onRejectRequest: (request: ClientRequest, message: string) => void;
@@ -2474,9 +3032,11 @@ function ClientRequestDetail({
   const [applyError, setApplyError] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   const [message, setMessage] = useState("");
+  const [followUp, setFollowUp] = useState("");
   const [reviewNote, setReviewNote] = useState("");
   const [fixtureId, setFixtureId] = useState(fixturesForRequest(request)[0]?.id ?? "fixture-other");
   const requestDocuments = documents;
+  const due = requestDue(request, today);
   const responseCategory = request.responseCategory || request.answer;
   const suggestedAccount = responseCategory === "Materials" ? "Job Materials" : responseCategory;
   const receiptDocuments = requestDocuments.filter(receiptReadyForMatch);
@@ -2488,9 +3048,9 @@ function ClientRequestDetail({
       <section className="review-header">
         <div>
           <p className="eyebrow">{role === "client" ? "SIMULATED CLIENT PORTAL" : "CLIENT REQUEST"} · <ClientName upper /></p>
-          <h2>{request.relatedTransaction}</h2>
+          <h2>{request.relatedTransaction || request.requestType}</h2>
           <p className="muted">
-            {request.requestType} · Created {request.dateCreated}{request.relatedAmount ? ` · ${request.relatedAmount}` : ""}{request.dueDate ? ` · due ${formatDueDate(request.dueDate)}` : ""}
+            {request.requestType} · Created {request.dateCreated}{request.relatedAmount ? ` · ${request.relatedAmount}` : ""}{request.dueDate ? ` · due ${formatDueDate(request.dueDate)}` : ""}{due ? ` (${due.label})` : ""}
           </p>
         </div>
         <span
@@ -2630,13 +3190,29 @@ function ClientRequestDetail({
           )}
           {role === "bookkeeper" && source === "demo" && request.status !== "Completed" && (
             <div className="portal-compose">
+              {request.status === "Draft" ? (
+                <div className="reset-actions">
+                  <p className="muted">This request is a saved draft and has not been sent to the client.</p>
+                  <button className="primary-button" onClick={() => onSendFollowUp(request, "")}>Send Request <span>→</span></button>
+                </div>
+              ) : (
+                <>
+                  <label>
+                    Follow-up message
+                    <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} placeholder="Gentle reminder: we still need this to finish the books." />
+                  </label>
+                  <div className="reset-actions">
+                    <button className="secondary-button" disabled={!followUp.trim()} onClick={() => { onSendFollowUp(request, followUp); setFollowUp(""); }}>Send Follow-Up</button>
+                  </div>
+                </>
+              )}
               <label>
                 Review note
                 <textarea value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="Approved — thanks." />
               </label>
               <div className="reset-actions">
                 <button className="secondary-button" onClick={() => onRejectRequest(request, reviewNote.trim())}>Needs follow-up</button>
-                <button className="primary-button" onClick={() => onApproveRequest(request, reviewNote.trim())}>Approve & complete <span>✓</span></button>
+                <button className="primary-button" onClick={() => onApproveRequest(request, reviewNote.trim())}>Complete Request <span>✓</span></button>
               </div>
             </div>
           )}
@@ -2649,17 +3225,6 @@ function ClientRequestDetail({
   );
 }
 
-const invoiceFilters = ["All", "Open", "Overdue", "Partially Paid", "Paid"] as const;
-const billFilters = [
-  "All",
-  "Open",
-  "Due Soon",
-  "Overdue",
-  "Partially Paid",
-  "Needs Review",
-  "Paid",
-] as const;
-
 function Receivables({
   source,
   clientId,
@@ -2670,7 +3235,9 @@ function Receivables({
   selectedInvoice,
   paymentBooks,
   paymentDateDefault,
-  onSelect,
+  allRows,
+  today,
+  onSelectRow,
   onBack,
   onRecordPayment,
   onReversePayment,
@@ -2686,15 +3253,21 @@ function Receivables({
   selectedInvoice: Invoice | null;
   paymentBooks: DemoPaymentBook[];
   paymentDateDefault: string;
-  onSelect: (invoice: Invoice) => void;
+  /** Every demo company's invoices, set only while All clients is selected. */
+  allRows?: ReceivableRow[];
+  today: string;
+  onSelectRow: (row: ReceivableRow) => void;
   onBack: () => void;
   onRecordPayment: (kind: DocumentPaymentKind, documentId: string, input: DemoPaymentInput) => Promise<void>;
   onReversePayment: (kind: DocumentPaymentKind, documentId: string, paymentId: string, reason: string) => Promise<void>;
   onAskClient: (question: string, transaction: string, amount: string) => void;
   onSourceChange: (source: AccountSource) => void;
 }) {
-  const [filter, setFilter] = useState<(typeof invoiceFilters)[number]>("All");
-  const displayedInvoices = source === "demo" ? invoices : quickBooksInvoices;
+  const [filters, setFilters] = useState<ReceivableFilters>(emptyReceivableFilters);
+  const displayedInvoices = source === "demo" ? (allRows ? allRows.map((row) => row.invoice) : invoices) : quickBooksInvoices;
+  const rows: ReceivableRow[] = source === "demo"
+    ? allRows ?? invoices.map((invoice) => ({ invoice, clientId, clientName: "" }))
+    : quickBooksInvoices.map((invoice) => ({ invoice, clientId: QUICKBOOKS_CLIENT_ID, clientName: "QuickBooks Sandbox" }));
   if (selectedInvoice)
     return (
       <InvoiceDetail
@@ -2704,17 +3277,25 @@ function Receivables({
         originalPaidCents={Math.round(selectedInvoice.amountPaid * 100) - activePaymentCents(bookForDocument(paymentBooks, 'invoice', selectedInvoice.id, clientId))}
         dateDefault={paymentDateDefault}
         readOnly={source === "quickbooks"}
+        today={today}
         onBack={onBack}
         onRecordPayment={(input) => onRecordPayment('invoice', selectedInvoice.id, input)}
         onReversePayment={(payment, reason) => onReversePayment('invoice', selectedInvoice.id, payment.id, reason)}
         onAskClient={onAskClient}
       />
     );
-  const aging = summarizeOpenItems(displayedInvoices, new Date().toISOString().slice(0, 10));
-  const filtered =
-    filter === "All"
-      ? displayedInvoices
-      : displayedInvoices.filter((invoice) => invoice.status === filter);
+  const aging = summarizeOpenItems(displayedInvoices, today);
+  const filtered = filterRows(rows, filters, today);
+  const counts = filterCounts(rows, filters, today);
+  const multiClient = new Set(filtered.map((row) => row.clientId)).size > 1 || (source === "demo" && Boolean(allRows));
+  const toggleAging = (option: AgingFilter) => setFilters((current) => ({ ...current, aging: current.aging === option ? "All" : option }));
+  const agingCards: { label: string; value: number; tone: string; option: AgingFilter }[] = [
+    { label: "Total Outstanding", value: aging.totalCents, tone: "red", option: "All" },
+    { label: "Current (not yet due)", value: aging.currentCents, tone: "green", option: "Current" },
+    { label: "1-30 Days Overdue", value: aging.days1to30Cents, tone: "amber", option: "1-30" },
+    { label: "31-60 Days Overdue", value: aging.days31to60Cents, tone: "blue", option: "31-60" },
+    { label: "60+ Days Overdue", value: aging.over60Cents, tone: "purple", option: "60+" },
+  ];
   return (
     <div className="page-content">
       <section className="welcome-row">
@@ -2732,49 +3313,53 @@ function Receivables({
       )}
       {error && <div className="data-state-message error">{error}</div>}
       <div className="finance-summary-grid">
-        <SummaryCard
-          value={formatMoney(aging.totalCents / 100)}
-          label="Total Outstanding"
-          tone="red"
-        />
-        <SummaryCard value={formatMoney(aging.currentCents / 100)} label="Current (not yet due)" tone="green" />
-        <SummaryCard
-          value={formatMoney(aging.days1to30Cents / 100)}
-          label="1-30 Days Overdue"
-          tone="amber"
-        />
-        <SummaryCard
-          value={formatMoney(aging.days31to60Cents / 100)}
-          label="31-60 Days Overdue"
-          tone="blue"
-        />
-        <SummaryCard
-          value={formatMoney(aging.over60Cents / 100)}
-          label="60+ Days Overdue"
-          tone="purple"
-        />
-      </div>
-      {aging.unreadable > 0 && <div className="data-state-message">{aging.unreadable} open invoice{aging.unreadable === 1 ? " has" : "s have"} no readable due date, so {aging.unreadable === 1 ? "it is" : "they are"} counted in the total but in no aging column.</div>}
-      <div className="filter-row">
-        {invoiceFilters.map((option) => (
+        {agingCards.map((card) => (
           <button
-            className={`filter-button ${filter === option ? "active" : ""}`}
-            key={option}
-            onClick={() => setFilter(option)}
+            type="button"
+            key={card.label}
+            className={`summary-card ${card.tone} summary-card-button${card.option !== "All" && filters.aging === card.option ? " active" : ""}`}
+            aria-pressed={card.option !== "All" && filters.aging === card.option}
+            onClick={() => (card.option === "All" ? setFilters((current) => ({ ...current, aging: "All" })) : toggleAging(card.option))}
           >
-            {option}
-            <span>
-              {option === "All"
-                ? displayedInvoices.length
-                : displayedInvoices.filter(
-                    (invoice) => invoice.status === option,
-                  ).length}
-            </span>
+            <strong>{formatMoney(card.value / 100)}</strong>
+            <span>{card.label}</span>
           </button>
         ))}
       </div>
-      <div className="panel finance-list-panel">
+      <p className="muted ar-as-of" data-testid="ar-as-of">Aging as of {formatLongDate(today)} (your local date). Paid invoices are not counted. Select a card to filter the invoices below.</p>
+      {aging.unreadable > 0 && <div className="data-state-message">{aging.unreadable} open invoice{aging.unreadable === 1 ? " has" : "s have"} no readable due date, so {aging.unreadable === 1 ? "it is" : "they are"} counted in the total but in no aging column.</div>}
+      <div className="ar-filters">
+        <label className="ar-search">
+          <input type="search" aria-label="Search invoices" placeholder="Search customer, invoice number or amount" value={filters.search} onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))} />
+        </label>
+        <div className="filter-group" role="group" aria-label="Payment status">
+          <small>Payment status</small>
+          <div className="filter-row">
+            {paymentFilters.map((option) => (
+              <button type="button" className={`filter-button ${filters.payment === option ? "active" : ""}`} key={option} aria-pressed={filters.payment === option} onClick={() => setFilters((current) => ({ ...current, payment: option }))}>
+                {option}
+                <span>{counts.payment[option]}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="filter-group" role="group" aria-label="Aging">
+          <small>Aging</small>
+          <div className="filter-row">
+            {agingFilters.map((option) => (
+              <button type="button" className={`filter-button ${filters.aging === option ? "active" : ""}`} key={option} aria-pressed={filters.aging === option} onClick={() => setFilters((current) => ({ ...current, aging: option }))}>
+                {option === "All" ? "Any aging" : option === "Overdue" ? "Overdue (any)" : option === "Current" ? "Current" : `${option} days`}
+                <span>{counts.aging[option]}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        {hasActiveFilters(filters) && <button type="button" className="secondary-button" onClick={() => setFilters(emptyReceivableFilters)}>Reset filters</button>}
+      </div>
+      <p className="muted" data-testid="ar-showing">Showing {filtered.length} of {rows.length} invoices.</p>
+      <div className={`panel finance-list-panel ar-list${multiClient ? " with-client" : ""}`}>
         <div className="finance-list-heading">
+          {multiClient && <span>Client</span>}
           <span>Customer</span>
           <span>Invoice</span>
           <span>Invoice date</span>
@@ -2784,26 +3369,28 @@ function Receivables({
           <span>Status</span>
           <span />
         </div>
-        {filtered.map((invoice) => (
-          <button
-            className="finance-list-row"
-            key={invoice.id}
-            onClick={() => onSelect(invoice)}
-          >
-            <strong>{invoice.customer}</strong>
-            <span>{invoice.number}</span>
-            <span>{invoice.invoiceDate}</span>
-            <span>{invoice.dueDate}</span>
-            <span>{formatMoney(invoice.amount)}</span>
-            <strong>{formatMoney(invoice.amount - invoice.amountPaid)}</strong>
-            <span
-              className={`inbox-status ${invoice.status.toLowerCase().replaceAll(" ", "-")}`}
-            >
-              {invoice.status}
-            </span>
-            <span className="row-arrow">→</span>
-          </button>
-        ))}
+        {filtered.length === 0 && <p className="muted ar-empty">No invoices match these filters.</p>}
+        {filtered.map((row) => {
+          const { invoice } = row;
+          const due = invoiceDue(invoice, today);
+          const pay = paymentStatus(invoice);
+          return (
+            <button className="finance-list-row" key={`${row.clientId}/${invoice.id}`} onClick={() => onSelectRow(row)}>
+              {multiClient && <span>{row.clientName}</span>}
+              <strong>{invoice.customer}</strong>
+              <span>{invoice.number}</span>
+              <span>{invoice.invoiceDate}</span>
+              <span className="inbox-due">{invoice.dueDate}{due && <small className={`due-${due.tone}`}>{due.label}</small>}</span>
+              <span>{formatMoney(invoice.amount)}</span>
+              <strong>{formatMoney(invoice.amount - invoice.amountPaid)}</strong>
+              <span className="ar-badges">
+                <span className={`inbox-status ${pay.toLowerCase().replaceAll(" ", "-")}`}>{pay}</span>
+                {isOverdue(invoice, today) && <span className="inbox-status overdue">Overdue</span>}
+              </span>
+              <span className="row-action">View Invoice</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -2816,11 +3403,13 @@ function InvoiceDetail({
   originalPaidCents,
   dateDefault,
   readOnly,
+  today,
   onBack,
   onRecordPayment,
   onReversePayment,
   onAskClient,
 }: {
+  today: string;
   clientId: string;
   invoice: Invoice;
   book: DemoPaymentBook | undefined;
@@ -2833,6 +3422,9 @@ function InvoiceDetail({
   onAskClient: (question: string, transaction: string, amount: string) => void;
 }) {
   const remaining = invoice.amount - invoice.amountPaid;
+  const pay = paymentStatus(invoice);
+  const due = invoiceDue(invoice, today);
+  const late = isOverdue(invoice, today);
   return (
     <div className="page-content">
       <button className="back-button" onClick={onBack}>
@@ -2843,13 +3435,12 @@ function InvoiceDetail({
           <p className="eyebrow">ACCOUNTS RECEIVABLE · <ClientName upper /></p>
           <h2>{invoice.customer}</h2>
           <p className="muted">
-            {invoice.number} · Due {invoice.dueDate}
+            {invoice.number} · Due {invoice.dueDate}{due ? ` · ${due.label}` : ""}
           </p>
         </div>
-        <span
-          className={`inbox-status ${invoice.status.toLowerCase().replaceAll(" ", "-")}`}
-        >
-          {invoice.status}
+        <span className="ar-badges">
+          <span className={`inbox-status ${pay.toLowerCase().replaceAll(" ", "-")}`}>{pay}</span>
+          {late && <span className="inbox-status overdue">Overdue</span>}
         </span>
       </section>
       <section className="finance-detail-layout">
@@ -2886,7 +3477,7 @@ function InvoiceDetail({
             </span>
             <span>
               <small>Status</small>
-              <strong>{invoice.status}</strong>
+              <strong>{late ? `${pay}, overdue` : pay}</strong>
             </span>
           </div>
         </div>
@@ -2922,7 +3513,9 @@ function Payables({
   selectedBill,
   paymentBooks,
   paymentDateDefault,
-  onSelect,
+  allRows,
+  today,
+  onSelectRow,
   onBack,
   onRecordPayment,
   onReversePayment,
@@ -2938,15 +3531,21 @@ function Payables({
   selectedBill: Bill | null;
   paymentBooks: DemoPaymentBook[];
   paymentDateDefault: string;
-  onSelect: (bill: Bill) => void;
+  /** Every demo company's bills, set only while All clients is selected. */
+  allRows?: BillRow[];
+  today: string;
+  onSelectRow: (row: BillRow) => void;
   onBack: () => void;
   onRecordPayment: (kind: DocumentPaymentKind, documentId: string, input: DemoPaymentInput) => Promise<void>;
   onReversePayment: (kind: DocumentPaymentKind, documentId: string, paymentId: string, reason: string) => Promise<void>;
   onAskClient: (question: string, transaction: string, amount: string) => void;
   onSourceChange: (source: AccountSource) => void;
 }) {
-  const [filter, setFilter] = useState<(typeof billFilters)[number]>("All");
-  const displayedBills = source === "demo" ? bills : quickBooksBills;
+  const [filters, setFilters] = useState<BillFilters>(emptyBillFilters);
+  const rows: BillRow[] = source === "demo"
+    ? allRows ?? bills.map((bill) => ({ bill, clientId, clientName: "" }))
+    : quickBooksBills.map((bill) => ({ bill, clientId: QUICKBOOKS_CLIENT_ID, clientName: "QuickBooks Sandbox" }));
+  const displayedBills = rows.map((row) => row.bill);
   if (selectedBill)
     return (
       <BillDetail
@@ -2956,17 +3555,24 @@ function Payables({
         originalPaidCents={Math.round(selectedBill.amountPaid * 100) - activePaymentCents(bookForDocument(paymentBooks, 'bill', selectedBill.id, clientId))}
         dateDefault={paymentDateDefault}
         readOnly={source === "quickbooks"}
+        today={today}
         onBack={onBack}
         onRecordPayment={(input) => onRecordPayment('bill', selectedBill.id, input)}
         onReversePayment={(payment, reason) => onReversePayment('bill', selectedBill.id, payment.id, reason)}
         onAskClient={onAskClient}
       />
     );
-  const aging = summarizeOpenItems(displayedBills, new Date().toISOString().slice(0, 10));
-  const filtered =
-    filter === "All"
-      ? displayedBills
-      : displayedBills.filter((bill) => bill.status === filter);
+  const aging = summarizeOpenItems(displayedBills, today);
+  const filtered = filterBills(rows, filters, today);
+  const counts = billFilterCounts(rows, filters, today);
+  const multiClient = new Set(filtered.map((row) => row.clientId)).size > 1 || (source === "demo" && Boolean(allRows));
+  const toggleDue = (option: DueFilter) => setFilters((current) => ({ ...current, due: current.due === option ? "All" : option }));
+  const cards: { label: string; value: number; tone: string; active: boolean; onClick: () => void }[] = [
+    { label: "Total Bills Due", value: aging.totalCents, tone: "red", active: false, onClick: () => setFilters((current) => ({ ...current, due: "All", payment: "All" })) },
+    { label: "Due Within 7 Days", value: aging.dueWithin7DaysCents, tone: "amber", active: filters.due === "Due soon", onClick: () => toggleDue("Due soon") },
+    { label: "Overdue", value: aging.days1to30Cents + aging.days31to60Cents + aging.over60Cents, tone: "purple", active: filters.due === "Overdue", onClick: () => toggleDue("Overdue") },
+    { label: "Paid So Far", value: aging.paidCents, tone: "green", active: filters.payment === "Paid", onClick: () => setFilters((current) => ({ ...current, payment: current.payment === "Paid" ? "All" : "Paid" })) },
+  ];
   return (
     <div className="page-content">
       <section className="welcome-row">
@@ -2986,43 +3592,58 @@ function Payables({
       )}
       {error && <div className="data-state-message error">{error}</div>}
       <div className="finance-summary-grid">
-        <SummaryCard
-          value={formatMoney(aging.totalCents / 100)}
-          label="Total Bills Due"
-          tone="red"
-        />
-        <SummaryCard
-          value={formatMoney(aging.dueWithin7DaysCents / 100)}
-          label="Due Within 7 Days"
-          tone="amber"
-        />
-        <SummaryCard value={formatMoney((aging.days1to30Cents + aging.days31to60Cents + aging.over60Cents) / 100)} label="Overdue" tone="purple" />
-        <SummaryCard
-          value={formatMoney(aging.paidCents / 100)}
-          label="Paid So Far"
-          tone="green"
-        />
-      </div>
-      {aging.unreadable > 0 && <div className="data-state-message">{aging.unreadable} open bill{aging.unreadable === 1 ? " has" : "s have"} no readable due date, so {aging.unreadable === 1 ? "it is" : "they are"} counted in the total but not in the overdue or due-soon figures.</div>}
-      <div className="filter-row">
-        {billFilters.map((option) => (
-          <button
-            className={`filter-button ${filter === option ? "active" : ""}`}
-            key={option}
-            onClick={() => setFilter(option)}
-          >
-            {option}
-            <span>
-              {option === "All"
-                ? displayedBills.length
-                : displayedBills.filter((bill) => bill.status === option)
-                    .length}
-            </span>
+        {cards.map((card) => (
+          <button type="button" key={card.label} className={`summary-card ${card.tone} summary-card-button${card.active ? " active" : ""}`} aria-pressed={card.active} onClick={card.onClick}>
+            <strong>{formatMoney(card.value / 100)}</strong>
+            <span>{card.label}</span>
           </button>
         ))}
       </div>
-      <div className="panel finance-list-panel">
+      <p className="muted ar-as-of" data-testid="ap-as-of">Balances as of {formatLongDate(today)} (your local date). Total Bills Due, Due Within 7 Days and Overdue count only unpaid balances. Paid So Far is every payment recorded on the bills listed here, all time, not just this month. Select a card to filter the bills below.</p>
+      {aging.unreadable > 0 && <div className="data-state-message">{aging.unreadable} open bill{aging.unreadable === 1 ? " has" : "s have"} no readable due date, so {aging.unreadable === 1 ? "it is" : "they are"} counted in the total but not in the overdue or due-soon figures.</div>}
+      <div className="ar-filters">
+        <label className="ar-search">
+          <input type="search" aria-label="Search bills" placeholder="Search vendor, bill number, client, date or amount" value={filters.search} onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))} />
+        </label>
+        <div className="filter-group" role="group" aria-label="Payment status">
+          <small>Payment status</small>
+          <div className="filter-row">
+            {billPaymentFilters.map((option) => (
+              <button type="button" className={`filter-button ${filters.payment === option ? "active" : ""}`} key={option} aria-pressed={filters.payment === option} onClick={() => setFilters((current) => ({ ...current, payment: option }))}>
+                {option}
+                <span>{counts.payment[option]}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="filter-group" role="group" aria-label="Review status">
+          <small>Review status</small>
+          <div className="filter-row">
+            {reviewFilters.map((option) => (
+              <button type="button" className={`filter-button ${filters.review === option ? "active" : ""}`} key={option} aria-pressed={filters.review === option} onClick={() => setFilters((current) => ({ ...current, review: option }))}>
+                {option === "All" ? "Any review status" : option}
+                <span>{counts.review[option]}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="filter-group" role="group" aria-label="Due date">
+          <small>Due date</small>
+          <div className="filter-row">
+            {dueFilters.map((option) => (
+              <button type="button" className={`filter-button ${filters.due === option ? "active" : ""}`} key={option} aria-pressed={filters.due === option} onClick={() => setFilters((current) => ({ ...current, due: option }))}>
+                {option === "All" ? "Any due date" : option === "Overdue" ? "Overdue (any)" : option === "Due soon" ? "Due within 7 days" : option === "Current" ? "Not yet due" : `${option} days overdue`}
+                <span>{counts.due[option]}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        {hasActiveBillFilters(filters) && <button type="button" className="secondary-button" onClick={() => setFilters(emptyBillFilters)}>Reset filters</button>}
+      </div>
+      <p className="muted" data-testid="ap-showing">Showing {filtered.length} of {rows.length} bills.</p>
+      <div className={`panel finance-list-panel ar-list${multiClient ? " with-client" : ""}`}>
         <div className="finance-list-heading">
+          {multiClient && <span>Client</span>}
           <span>Vendor</span>
           <span>Bill</span>
           <span>Bill date</span>
@@ -3032,26 +3653,29 @@ function Payables({
           <span>Status</span>
           <span />
         </div>
-        {filtered.map((bill) => (
-          <button
-            className="finance-list-row"
-            key={bill.id}
-            onClick={() => onSelect(bill)}
-          >
-            <strong>{bill.vendor}</strong>
-            <span>{bill.number}</span>
-            <span>{bill.billDate}</span>
-            <span>{bill.dueDate}</span>
-            <span>{formatMoney(bill.amount)}</span>
-            <strong>{formatMoney(bill.amount - bill.amountPaid)}</strong>
-            <span
-              className={`inbox-status ${bill.status.toLowerCase().replaceAll(" ", "-")}`}
-            >
-              {bill.status}
-            </span>
-            <span className="row-arrow">→</span>
-          </button>
-        ))}
+        {filtered.length === 0 && <p className="muted ar-empty">No bills match these filters.</p>}
+        {filtered.map((row) => {
+          const { bill } = row;
+          const due = billDue(bill, today);
+          const pay = paymentStatus(bill);
+          return (
+            <button className="finance-list-row" key={`${row.clientId}/${bill.id}`} onClick={() => onSelectRow(row)}>
+              {multiClient && <span>{row.clientName}</span>}
+              <strong>{bill.vendor}</strong>
+              <span>{bill.number}</span>
+              <span>{bill.billDate}</span>
+              <span className="inbox-due">{bill.dueDate}{due && <small className={`due-${due.tone}`}>{due.label}</small>}</span>
+              <span>{formatMoney(bill.amount)}</span>
+              <strong>{formatMoney(bill.amount - bill.amountPaid)}</strong>
+              <span className="ar-badges">
+                <span className={`inbox-status ${pay.toLowerCase().replaceAll(" ", "-")}`}>{pay}</span>
+                {isOverdue(bill, today) ? <span className="inbox-status overdue">Overdue</span> : isDueSoon(bill, today) && <span className="inbox-status due-soon">Due soon</span>}
+                {billNeedsReview(bill) && <span className="inbox-status needs-review">Needs Review</span>}
+              </span>
+              <span className="row-action">View Bill</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -3064,11 +3688,13 @@ function BillDetail({
   originalPaidCents,
   dateDefault,
   readOnly,
+  today,
   onBack,
   onRecordPayment,
   onReversePayment,
   onAskClient,
 }: {
+  today: string;
   clientId: string;
   bill: Bill;
   book: DemoPaymentBook | undefined;
@@ -3081,6 +3707,10 @@ function BillDetail({
   onAskClient: (question: string, transaction: string, amount: string) => void;
 }) {
   const remaining = bill.amount - bill.amountPaid;
+  const pay = paymentStatus(bill);
+  const due = billDue(bill, today);
+  const late = isOverdue(bill, today);
+  const review = billNeedsReview(bill);
   return (
     <div className="page-content">
       <button className="back-button" onClick={onBack}>
@@ -3091,13 +3721,13 @@ function BillDetail({
           <p className="eyebrow">ACCOUNTS PAYABLE · <ClientName upper /></p>
           <h2>{bill.vendor}</h2>
           <p className="muted">
-            {bill.number} · Due {bill.dueDate}
+            {bill.number} · Due {bill.dueDate}{due ? ` · ${due.label}` : ""}
           </p>
         </div>
-        <span
-          className={`inbox-status ${bill.status.toLowerCase().replaceAll(" ", "-")}`}
-        >
-          {bill.status}
+        <span className="ar-badges">
+          <span className={`inbox-status ${pay.toLowerCase().replaceAll(" ", "-")}`}>{pay}</span>
+          {late && <span className="inbox-status overdue">Overdue</span>}
+          {review && <span className="inbox-status needs-review">Needs Review</span>}
         </span>
       </section>
       <section className="finance-detail-layout">
@@ -3138,7 +3768,7 @@ function BillDetail({
             </span>
             <span>
               <small>Status</small>
-              <strong>{bill.status}</strong>
+              <strong>{[pay, late ? "overdue" : "", review ? "needs review" : ""].filter(Boolean).join(", ")}</strong>
             </span>
           </div>
         </div>
@@ -3164,13 +3794,6 @@ function BillDetail({
   );
 }
 
-const transactionFilters = [
-  "All",
-  "Needs Review",
-  "Categorized",
-  "Matched",
-  "Needs Receipt",
-] as const;
 type CategoryOption = { id?: string; name: string };
 
 function Transactions({
@@ -3178,6 +3801,9 @@ function Transactions({
   quickBooksTransactions,
   source,
   clientId,
+  scopeLabel,
+  clientNames,
+  period,
   categoryOptions,
   isLoading,
   error,
@@ -3196,6 +3822,9 @@ function Transactions({
   quickBooksTransactions: LedgerTransaction[];
   source: TransactionSource;
   clientId: string | null;
+  scopeLabel: string;
+  clientNames: Record<string, string>;
+  period: Period;
   categoryOptions: CategoryOption[];
   isLoading: boolean;
   error: string | null;
@@ -3210,17 +3839,33 @@ function Transactions({
   onCreateQuickBooksRequest: (transaction: LedgerTransaction, question: string) => void;
   onLogSuggestion: (event: Omit<AutomationAuditEvent, "id" | "at" | "source" | "clientId">) => void;
 }) {
-  const [filter, setFilter] =
-    useState<(typeof transactionFilters)[number]>("All");
-  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("Needs Review");
+  const [filter, setFilter] = useState<StatusFilter>("All");
+  const [reason, setReason] = useState<ReasonFilter>("Any");
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All");
+  const [dateMode, setDateMode] = useState<"all" | "month" | "custom">("all");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const range: DateRange = dateMode === "month" ? monthRange(period) : dateMode === "custom" ? { from: customFrom || undefined, to: customTo || undefined } : {};
+  const rangeInvalid = Boolean(range.from && range.to && range.from > range.to);
 
   const everything = source === "demo" ? transactions : quickBooksTransactions;
-  // Search, category and client narrow both the list and the review queue; status only narrows the list.
-  const scoped = filterTransactions(everything, { clientId, category, search });
-  const reviewQueue = scoped.filter((transaction) => matchesReviewFilter(transaction, reviewFilter));
-
+  // Client, date, search and category scope every count; status and reason then narrow the list.
+  const scoped = filterTransactions(everything, { clientId, category, search, range: rangeInvalid ? {} : range });
+  const reasonScoped = scoped.filter((transaction) => matchesReason(transaction, reason));
+  const reviewQueue = reasonScoped.filter(needsAttention);
+  const filteredTransactions = reasonScoped.filter((transaction) => filter === "All" || categorizationStatus(transaction) === filter);
+  const filtersActive = filter !== "All" || reason !== "Any" || search.trim() !== "" || category !== "All" || dateMode !== "all";
+  const resetFilters = () => {
+    setFilter("All");
+    setReason("Any");
+    setSearch("");
+    setCategory("All");
+    setDateMode("all");
+    setCustomFrom("");
+    setCustomTo("");
+  };
+  const showClient = clientIdsIn(filteredTransactions).length > 1;
   if (selectedTransaction) {
     const current = everything.find((item) => item.id === selectedTransaction.id) ?? selectedTransaction;
     return (
@@ -3244,23 +3889,17 @@ function Transactions({
     );
   }
 
-  const filteredTransactions = filterTransactions(scoped, { status: filter });
-  const attentionCount = scoped.filter(
-    (transaction) =>
-      transaction.status === "Needs Review" ||
-      transaction.status === "Needs Receipt",
-  ).length;
+  const attentionCount = scoped.filter(needsAttention).length;
+  const scopeSentence = clientId || source === "quickbooks" ? `Review ${scopeLabel}'s transactions one item at a time.` : "Review transactions across every client with detailed records, one item at a time.";
 
   return (
     <div className="page-content">
       <section className="welcome-row">
         <div>
           <h2>Transactions</h2>
-          <p className="muted">
-            Review <ClientName />'s recent activity one item at a time.
-          </p>
+          <p className="muted">{scopeSentence}</p>
         </div>
-        <span className="attention-summary">
+        <span className="attention-summary" title="Transactions in the selected client and date range that need categorizing or a receipt">
           <strong>{attentionCount}</strong> need attention
         </span>
       </section>
@@ -3301,28 +3940,52 @@ function Transactions({
           Review next ({reviewQueue.length}) <span>→</span>
         </button>
       </div>
-      <div className="filter-row" aria-label="Transaction filters">
-        {transactionFilters.map((filterOption) => (
-          <button
-            className={`filter-button ${filter === filterOption ? "active" : ""}`}
-            key={filterOption}
-            onClick={() => setFilter(filterOption)}
-          >
-            {filterOption}
-            <span>{filterTransactions(scoped, { status: filterOption }).length}</span>
-          </button>
-        ))}
+      <div className="date-filter" aria-label="Date filter">
+        <label>
+          Dates
+          <select value={dateMode} aria-label="Date range type" onChange={(event) => setDateMode(event.target.value as "all" | "month" | "custom")}>
+            <option value="all">All dates</option>
+            <option value="month">Selected month ({monthLabel(period)})</option>
+            <option value="custom">Custom range</option>
+          </select>
+        </label>
+        {dateMode === "custom" && (
+          <>
+            <label>From<input type="date" value={customFrom} aria-label="From date" onChange={(event) => setCustomFrom(event.target.value)} /></label>
+            <label>To<input type="date" value={customTo} aria-label="To date" onChange={(event) => setCustomTo(event.target.value)} /></label>
+          </>
+        )}
+        <span className="active-range" role="status">Showing: {rangeInvalid ? "start date is after end date, so dates are not filtered" : describeDateRange(range)}</span>
       </div>
-      <div className="filter-row" aria-label="Review queue filters">
-        {reviewFilters.map((option) => (
-          <button className={`filter-button ${reviewFilter === option ? "active" : ""}`} key={option} onClick={() => setReviewFilter(option)}>
-            {option}
-            <span>{scoped.filter((transaction) => matchesReviewFilter(transaction, option)).length}</span>
-          </button>
-        ))}
+      <div className="filter-group">
+        <strong>Status</strong>
+        <div className="filter-row" aria-label="Status filters">
+          {statusFilters.map((option) => (
+            <button className={`filter-button ${filter === option ? "active" : ""}`} key={option} aria-pressed={filter === option} onClick={() => setFilter(option)}>
+              {option}
+              <span>{reasonScoped.filter((transaction) => option === "All" || categorizationStatus(transaction) === option).length}</span>
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="panel transaction-panel">
+      <div className="filter-group">
+        <strong>Needs</strong>
+        <div className="filter-row" aria-label="Review reason filters">
+          {reasonFilters.map((option) => (
+            <button className={`filter-button ${reason === option ? "active" : ""}`} key={option} aria-pressed={reason === option} onClick={() => setReason(option)}>
+              {option === "Any" ? "Any reason" : option}
+              <span>{scoped.filter((transaction) => matchesReason(transaction, option)).length}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="list-summary">
+        <span role="status">Showing {filteredTransactions.length} of {scoped.length} transactions{everything.length !== scoped.length ? ` (${everything.length} in this data source)` : ""}</span>
+        {filtersActive && <button className="text-button" onClick={resetFilters}>Reset filters</button>}
+      </div>
+      <div className={`panel transaction-panel ${showClient ? "with-client" : ""}`}>
         <div className="transaction-heading">
+          {showClient && <span>Client</span>}
           <span>Date</span>
           <span>Payee</span>
           <span>Description</span>
@@ -3331,26 +3994,36 @@ function Transactions({
           <span>Status</span>
           <span />
         </div>
-        {filteredTransactions.length === 0 && <p className="muted">No transactions match these filters.</p>}
-        {filteredTransactions.map((transaction) => (
-          <button
-            className="transaction-row"
-            key={transaction.id}
-            onClick={() => onSelect(transaction)}
-          >
-            <span>{transaction.date}</span>
-            <strong>{transaction.payee}</strong>
-            <span>{transaction.description}</span>
-            <strong>{transaction.amount}</strong>
-            <span>{categoryLabel(transaction)}</span>
-            <span
-              className={`transaction-status ${statusClass(transaction.status)}`}
+        {filteredTransactions.length === 0 && (
+          <p className="muted empty-state">
+            {everything.length === 0 ? "No transactions are available for this data source." : "No transactions match these filters."}
+            {filtersActive && <> <button className="text-button" onClick={resetFilters}>Reset filters</button></>}
+          </p>
+        )}
+        {filteredTransactions.map((transaction) => {
+          const actionable = needsAttention(transaction);
+          const extra = reviewReasons(transaction);
+          return (
+            <button
+              className="transaction-row"
+              key={`${transaction.clientId ?? ""}/${transaction.id}`}
+              onClick={() => onSelect(transaction)}
             >
-              {transaction.status}
-            </span>
-            <span className="row-arrow">→</span>
-          </button>
-        ))}
+              {showClient && <span className="tx-client">{(transaction.clientId && clientNames[transaction.clientId]) || NOT_AVAILABLE}</span>}
+              <span>{transaction.date}</span>
+              <strong>{transaction.payee}</strong>
+              <span className="tx-desc">{transaction.description}</span>
+              <strong>{transaction.amount}</strong>
+              <span className="tx-category">{categoryLabel(transaction)}</span>
+              <span className="tx-status">
+                <span className={`transaction-status ${statusClass(categorizationStatus(transaction))}`}>{categorizationStatus(transaction)}</span>
+                {needsReceipt(transaction) && <span className="transaction-status needs-receipt">Receipt missing</span>}
+                {extra.filter((item) => item !== "Missing receipt" && item !== "Missing category").map((item) => <span key={item} className="reason-tag">{item}</span>)}
+              </span>
+              <span className="row-action">{actionable ? "Review" : "View details"}</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -3408,7 +4081,7 @@ function TransactionReview({
     return name && name !== line.category ? [{ lineId: line.id, category: name, categoryId: optionFor(name)?.id }] : [];
   });
   const validation = changes.length > 0 ? validateLineChanges(transaction, changes) : null;
-  const next = adjacentInQueue(ordered, queue, transaction.id, "next");
+  const next = nextActionable(ordered, queue, transaction.id);
   const previous = adjacentInQueue(ordered, queue, transaction.id, "previous");
   const completedCount = Math.max(0, ordered.length - queue.length);
   const usable = lines.filter((line) => suggestions[line.id] && !staged[line.id] && optionFor(suggestions[line.id].category));
@@ -3494,7 +4167,7 @@ function TransactionReview({
           {transaction.status}
         </span>
       </section>
-      <div className="review-progress-bar"><strong>{queue.length} transactions need review</strong><span>Progress: {completedCount} of {ordered.length} completed</span><div><span style={{ width: `${ordered.length ? (completedCount / ordered.length) * 100 : 0}%` }} /></div></div>
+      <div className="review-progress-bar"><strong>{queue.length} {queue.length === 1 ? "transaction needs" : "transactions need"} review</strong><span>Progress: {completedCount} of {ordered.length} completed</span><div><span style={{ width: `${ordered.length ? (completedCount / ordered.length) * 100 : 0}%` }} /></div></div>
       <div className="review-navigation">
         <button className="secondary-button" disabled={!previous} onClick={() => previous && onSelect(previous)}>Previous</button>
         <button className="secondary-button" disabled={!next} onClick={() => next && onSelect(next)}>Next</button>
@@ -3643,6 +4316,7 @@ function TransactionReview({
             </>
           )}
           {savedCount > 0 && next && <button className="primary-button" onClick={() => onSelect(next)}>Open next transaction needing review <span>→</span></button>}
+          {savedCount > 0 && !next && queue.every((item) => item.id === transaction.id) && !needsAttention(transaction) && <div className="data-state-message" role="status">No more transactions need review in this view.</div>}
           {showRequestComposer && <div className="confirmation-box"><strong>Ask the client</strong><textarea value={question} onChange={(event) => setQuestion(event.target.value)} /><div><button className="secondary-button" onClick={() => setShowRequestComposer(false)}>Cancel</button><button className="primary-button" onClick={() => { onCreateQuickBooksRequest(transaction, question); setShowRequestComposer(false); }}>Save Request</button></div></div>}
           <button className="secondary-button" onClick={requestInformation}>
             Request More Information <span>→</span>
@@ -3653,7 +4327,7 @@ function TransactionReview({
   );
 }
 
-function statusClass(status: Transaction["status"]) {
+function statusClass(status: string) {
   return status.toLowerCase().replaceAll(" ", "-");
 }
 
@@ -4078,9 +4752,15 @@ function Reconcile({
   paymentBooks,
   onPeriodChange,
   onSourceChange,
+  pickClient,
+  clientChoices,
+  onSelectClient,
 }: {
   source: AccountSource;
   clientRef: { id: string; name: string };
+  pickClient: boolean;
+  clientChoices: Client[];
+  onSelectClient: (client: Client) => void;
   accounts: LedgerAccount[];
   isLoading: boolean;
   error: string | null;
@@ -4147,7 +4827,20 @@ function Reconcile({
         </div>
       )}
       {error && <div className="data-state-message error">{error}</div>}
-      <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} period={period} homeSignal={homeSignal} entryTools={entryTools} />
+      {source === "demo" && pickClient ? (
+        <ReconcileClientPicker
+          clients={[demoClient.id, ...ADDITIONAL_DEMO_CLIENT_IDS].map((id) => ({
+            id,
+            name: clientChoices.find((client) => client.id === id)?.name ?? (id === demoClient.id ? demoClient.name : getAdditionalDemoCompany(id)?.clientName ?? id),
+            accountIds: id === demoClient.id ? demoReconSources.map((item) => item.id) : getAdditionalDemoCompany(id)?.reconciliationAccounts.map((account) => account.id) ?? [],
+          }))}
+          period={period}
+          source="demo"
+          onOpen={(id) => { const client = clientChoices.find((item) => item.id === id); if (client) onSelectClient(client); }}
+        />
+      ) : (
+        <ReconcileWorkspace key={`${source}:${clientRef.id}`} source={source} client={clientRef} accounts={options} loadAccountData={loadAccountData} today={today} period={period} homeSignal={homeSignal} entryTools={entryTools} />
+      )}
     </div>
   );
 }
@@ -4213,6 +4906,7 @@ function ClientDashboard({
   onPayables,
   onReports,
   documents,
+  today,
 }: {
   client: Client | null;
   companyName: string;
@@ -4235,6 +4929,7 @@ function ClientDashboard({
   onPayables: () => void;
   onReports: () => void;
   documents: ClientDocument[];
+  today: string;
 }) {
   const isDemo = source === "demo";
   // Demo clients other than the one with full records only have summary counts.
@@ -4329,7 +5024,7 @@ function ClientDashboard({
             <span className="count-pill">{available ? `${tasks.length} tasks` : NOT_AVAILABLE}</span>
           </div>
           {available && tasks.length === 0 && <div className="empty-state"><span>✓</span><h2>You're all caught up.</h2><p className="muted">Nothing needs attention for this client.</p></div>}
-          <TaskCardList tasks={tasks.slice(0, 5)} showClient={false} onOpenTask={onOpenTask} />
+          <TaskCardList tasks={tasks.slice(0, 5)} showClient={false} today={today} onOpenTask={onOpenTask} />
           {tasks.length > 5 && (
             <button className="text-button" onClick={onOpenInbox}>
               See all {tasks.length} tasks in the Inbox <span>→</span>
@@ -4400,19 +5095,28 @@ function MetricCard({
   value,
   note,
   tone,
+  onClick,
 }: {
   label: string;
   value: string;
   note: string;
   tone: string;
+  onClick?: () => void;
 }) {
-  return (
-    <div className={`metric-card ${tone}`}>
+  const body = (
+    <>
       <span className="metric-label">{label}</span>
       <strong>{value}</strong>
       <span className="metric-note">{note}</span>
-    </div>
+    </>
   );
+  if (onClick)
+    return (
+      <button type="button" className={`metric-card clickable ${tone}`} onClick={onClick}>
+        {body}
+      </button>
+    );
+  return <div className={`metric-card ${tone}`}>{body}</div>;
 }
 function StatusRow({
   label,

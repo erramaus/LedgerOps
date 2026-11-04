@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { FakeMonthEnd, FakeReconciliations, mockApp } from './support'
+import { confirmReview, FakeMonthEnd, FakeReconciliations, mockApp } from './support'
 
 /**
  * A professional bookkeeper's working day in Demo Data, using only the visible interface.
@@ -8,7 +8,8 @@ import { FakeMonthEnd, FakeReconciliations, mockApp } from './support'
  */
 const nav = (page: Page, name: RegExp) => page.locator('nav.main-nav').getByRole('button', { name })
 const metric = (page: Page, label: string) => page.locator('.metric-card').filter({ has: page.locator('.metric-label', { hasText: new RegExp(`^${label}$`) }) }).locator('strong')
-const inboxCard = (page: Page, label: string) => page.locator('.summary-card').filter({ hasText: label }).locator('strong')
+const inboxCard = (page: Page, label: string) =>
+  page.locator('.filter-row .filter-button').filter({ hasText: new RegExp(`^${label === 'Client questions' ? 'Client Requests' : 'Transactions'}`) }).locator('span')
 const number = async (locator: ReturnType<Page['locator']>) => Number((await locator.innerText()).replace(/[^0-9]/g, ''))
 const clicks = (page: Page) => page.evaluate(() => (window as unknown as { __clicks: number }).__clicks)
 const resetClicks = (page: Page) => page.evaluate(() => { (window as unknown as { __clicks: number }).__clicks = 0 })
@@ -46,7 +47,7 @@ test.describe('a bookkeeper works through the whole month in Demo Data', () => {
       expect(await number(metric(page, 'Transactions to review'))).toBeGreaterThan(0)
       const work = page.locator('.work-panel')
       await expect(work).toContainText('ABC Plumbing')
-      await expect(work).toContainText('Uncategorized transaction')
+      await expect(work).toContainText('Overdue invoice')
       for (const name of ['ABC Plumbing', 'Green Leaf Landscaping', 'Smith Construction', 'Johnson Dental', 'Acme Consulting']) {
         await expect(page.locator('.client-card').filter({ hasText: name })).toBeVisible()
       }
@@ -150,6 +151,7 @@ test.describe('a bookkeeper works through the whole month in Demo Data', () => {
       await page.getByRole('button', { name: 'Load the demo statement transactions' }).click()
       await page.getByRole('button', { name: /Continue to matching/ }).click()
       await page.getByRole('button', { name: /Clear all suggested matches/ }).click()
+      await page.getByTestId('bulk-confirm').getByRole('button', { name: /^Confirm/ }).click()
       await expect(page.getByTestId('remaining-difference')).toHaveText('$0.00')
       // Leave the deposit uncleared: it becomes a deposit in transit and the difference is exactly its amount.
       await page.getByRole('button', { name: /Mark uncleared: ABC Plumbing Customer/ }).click()
@@ -171,6 +173,7 @@ test.describe('a bookkeeper works through the whole month in Demo Data', () => {
       await page.getByRole('button', { name: 'Load the demo statement transactions' }).click()
       await page.getByRole('button', { name: /Continue to matching/ }).click()
       await page.getByRole('button', { name: /Clear all suggested matches/ }).click()
+      await page.getByTestId('bulk-confirm').getByRole('button', { name: /^Confirm/ }).click()
       await expect(page.getByTestId('remaining-difference')).toHaveText('$224.20')
       await page.getByRole('navigation', { name: 'Reconciliation steps' }).getByRole('button', { name: '4. Review & complete' }).click()
       await expect(page.getByTestId('explanations')).toContainText('HOME DEPOT')
@@ -209,7 +212,7 @@ test.describe('a bookkeeper works through the whole month in Demo Data', () => {
       await nav(page, /Month End/).click()
       await choosePeriod(page, 7)
       await expect(page.getByTestId('month-summary')).toBeVisible()
-      for (const name of ['Mark receivables reviewed', 'Mark payables reviewed', 'Mark statements reviewed']) await page.getByRole('button', { name }).click()
+      for (const name of ['Mark receivables reviewed', 'Mark payables reviewed', 'Mark statements reviewed']) await confirmReview(page, name)
       await expect(page.getByTestId('month-summary')).toContainText('Ready for your approval')
       await page.getByRole('button', { name: /Approve and close July 2026/ }).click()
       await expect(page.getByTestId('status-approval')).toHaveText('Complete')

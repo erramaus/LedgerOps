@@ -9,6 +9,8 @@ import type {
   Transaction,
 } from './bookkeepingTypes'
 import { openRequest, requestTaskPriority, requestTaskStatus, summarizeRequest } from './clientPortal'
+import { isDueSoon, needsReview } from './payablesView'
+import { isOverdue, paymentStatus } from './receivablesView'
 import { getLines, needsCategory, uncategorizedLineCount } from './transactionReview'
 
 export type DataSource = 'demo' | 'quickbooks'
@@ -78,6 +80,8 @@ export type ClientRecords = {
   reconciliations: ReconciliationAccount[]
   requests: ClientRequest[]
   monthEnd: MonthEndItem[]
+  /** The user's local calendar date. When given, invoice overdue status comes from balance and due date, not the stored status. */
+  today?: string
 }
 
 export const QUICKBOOKS_CLIENT_ID = 'quickbooks-sandbox'
@@ -142,11 +146,15 @@ export function buildReviewTasks(records: ClientRecords): WorkTask[] {
   records.invoices.forEach((invoice) => {
     const amount = invoice.amount - invoice.amountPaid
     const dueDate = toIsoDate(invoice.dueDate)
-    if (invoice.status === 'Overdue') {
-      add({ id: `${invoice.id}-overdue`, type: 'Receivables', kind: 'overdue-invoice', issue: 'Overdue invoice', description: `${invoice.customer} invoice ${invoice.number} is overdue.`, amount, dueDate, priority: amount >= 1000 ? 'High' : 'Medium', destination: 'Receivables', action: 'Review invoice' })
-    } else if (invoice.status === 'Partially Paid' && amount > 0) {
+    // With a local date, overdue and partially paid are judged separately from the balance and due date; one task covers both.
+    const dated = records.today !== undefined
+    const overdue = dated ? isOverdue(invoice, records.today!) : invoice.status === 'Overdue'
+    const partial = dated ? paymentStatus(invoice) === 'Partially Paid' : invoice.status === 'Partially Paid' && amount > 0
+    if (overdue) {
+      add({ id: `${invoice.id}-overdue`, type: 'Receivables', kind: 'overdue-invoice', issue: 'Overdue invoice', description: `${invoice.customer} invoice ${invoice.number} is overdue${partial ? ' and partially paid' : ''}.`, amount, dueDate, priority: amount >= 1000 ? 'High' : 'Medium', destination: 'Receivables', action: 'Review invoice' })
+    } else if (partial) {
       add({ id: `${invoice.id}-partial`, type: 'Receivables', kind: 'partially-paid-invoice', issue: 'Invoice partially paid', description: `${invoice.customer} still has a balance on partially paid invoice ${invoice.number}.`, amount, dueDate, priority: amount >= 1000 ? 'High' : 'Medium', destination: 'Receivables', action: 'Review invoice' })
-    } else if (amount >= 1000 && invoice.status !== 'Paid') {
+    } else if (amount >= 1000 && (dated ? paymentStatus(invoice) !== 'Paid' : invoice.status !== 'Paid')) {
       add({ id: `${invoice.id}-large`, type: 'Receivables', kind: 'large-unpaid-invoice', issue: 'Large unpaid invoice', description: `${invoice.customer} still owes a large balance on ${invoice.number}.`, amount, dueDate, priority: 'Medium', destination: 'Receivables', action: 'Review invoice' })
     }
   })
@@ -154,6 +162,22 @@ export function buildReviewTasks(records: ClientRecords): WorkTask[] {
   records.bills.forEach((bill) => {
     const amount = bill.amount - bill.amountPaid
     const dueDate = toIsoDate(bill.dueDate)
+    if (records.today !== undefined) {
+      // Payment/due status and the review flag are separate facts: a bill can need payment attention and review at once, as two tasks.
+      const today = records.today
+      const partial = paymentStatus(bill) === 'Partially Paid'
+      if (isOverdue(bill, today)) {
+        add({ id: `${bill.id}-overdue`, type: 'Payables', kind: 'overdue-bill', issue: 'Overdue bill', description: `${bill.vendor} bill ${bill.number} is overdue${partial ? ' and partially paid' : ''}.`, amount, dueDate, priority: 'High', destination: 'Payables', action: 'Review bill', recordId: bill.id })
+      } else if (partial) {
+        add({ id: `${bill.id}-partial`, type: 'Payables', kind: 'partially-paid-bill', issue: 'Bill partially paid', description: `${bill.vendor} still has a balance on partially paid bill ${bill.number}.`, amount, dueDate, priority: 'Medium', destination: 'Payables', action: 'Review bill', recordId: bill.id })
+      } else if (isDueSoon(bill, today)) {
+        add({ id: `${bill.id}-soon`, type: 'Payables', kind: 'bill-due-soon', issue: 'Bill due soon', description: `${bill.vendor} bill ${bill.number} is due soon.`, amount, dueDate, priority: 'Medium', destination: 'Payables', action: 'Review bill', recordId: bill.id })
+      }
+      if (needsReview(bill)) {
+        add({ id: `${bill.id}-review`, type: 'Payables', kind: 'bill-needs-review', issue: 'Bill needs review', description: `${bill.vendor} bill ${bill.number} needs review.`, amount, dueDate, priority: 'High', destination: 'Payables', action: 'Review bill', recordId: bill.id })
+      }
+      return
+    }
     if (bill.status === 'Overdue') {
       add({ id: `${bill.id}-overdue`, type: 'Payables', kind: 'overdue-bill', issue: 'Overdue bill', description: `${bill.vendor} bill ${bill.number} is overdue.`, amount, dueDate, priority: 'High', destination: 'Payables', action: 'Review bill' })
     } else if (bill.status === 'Partially Paid' && amount > 0) {
@@ -208,9 +232,14 @@ export function buildSummaryTasks(clients: Client[]): WorkTask[] {
 }
 
 function buildRequestTasks(records: ClientRecords): WorkTask[] {
+  return buildClientRequestTasks(records.client, records.requests)
+}
+
+/** One task per open request, always tagged with the client the request belongs to. */
+export function buildClientRequestTasks(client: ClientRef, requests: ClientRequest[]): WorkTask[] {
   const tasks: WorkTask[] = []
-  const add = taskFactory(records.client, tasks)
-  records.requests
+  const add = taskFactory(client, tasks)
+  requests
     .filter((request) => openRequest(request))
     .forEach((request) => {
       const related = request.relatedTransaction ? ` (${[request.relatedTransaction, request.relatedAmount].filter(Boolean).join(', ')})` : ''
@@ -250,6 +279,24 @@ export function sortTasks(tasks: WorkTask[]): WorkTask[] {
       left.client.localeCompare(right.client) ||
       left.id.localeCompare(right.id),
   )
+}
+
+/** A descriptive button label for a task, so the action is clear without reading the card. */
+export function taskButtonLabel(task: WorkTask): string {
+  const many = task.count > 1
+  if (task.requestId || task.kind === 'client-question') {
+    return task.action.replace(/\b\w/g, (letter) => letter.toUpperCase()) || 'Open Request'
+  }
+  if (task.kind === 'missing-recurring') return 'Review Reminder'
+  if (task.kind.startsWith('summary-')) return 'Open Client'
+  switch (task.destination) {
+    case 'Transactions': return many ? 'Review Transactions' : 'Review Transaction'
+    case 'Receivables': return many ? 'Review Invoices' : 'Review Invoice'
+    case 'Payables': return many ? 'Review Bills' : 'Review Bill'
+    case 'Reconcile': return 'Open Reconciliation'
+    case 'Month End': return 'Finish Month End'
+    case 'Client Requests': return 'Open Request'
+  }
 }
 
 /** The single source for the Dashboard, Inbox and Bookkeeping Review. */
