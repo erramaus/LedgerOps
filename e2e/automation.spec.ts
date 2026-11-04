@@ -13,6 +13,7 @@ test.describe('Phase 7: smart bookkeeping automation', () => {
   test('creates a client-scoped rule, previews its matches, and applies the approved suggestion', async ({ page }) => {
     await openWorkspace(page)
     await nav(page, /Settings/).click()
+    await page.getByRole('tab', { name: 'Automation Rules' }).click()
 
     await page.getByLabel('Rule name').fill('Cafe meals rule')
     await page.getByLabel('Vendor / payee contains').fill('Corner Cafe')
@@ -33,6 +34,7 @@ test.describe('Phase 7: smart bookkeeping automation', () => {
     await expect(page.locator('.review-details')).toContainText('Categorized')
 
     await nav(page, /Settings/).click()
+    await page.getByRole('tab', { name: 'Activity & History' }).click()
     await expect(page.locator('.audit-log-row').filter({ hasText: 'Accepted rule suggestion' })).toBeVisible()
   })
 
@@ -50,6 +52,7 @@ test.describe('Phase 7: smart bookkeeping automation', () => {
     await expect(page.locator('.inbox-row').filter({ hasText: 'Adobe' })).toHaveCount(0)
 
     await nav(page, /Settings/).click()
+    await page.getByRole('tab', { name: 'Activity & History' }).click()
     await expect(page.locator('.audit-log-row').filter({ hasText: 'Confirmed recurring reminder for Adobe.' })).toBeVisible()
   })
 })

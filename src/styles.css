@@ -542,3 +542,38 @@ article.full-client-card { position: relative; }
 .inbox-status.due-soon { background: var(--amber-pale); color: var(--amber); } .inbox-status.needs-review { background: var(--blue-pale); color: var(--blue); }
 
 .request-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin-bottom: 12px; } .request-toolbar label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); } .request-toolbar input[type=search] { min-width: 280px; } .request-card.waiting { background: #fafbfa; } .request-card .request-next { display: block; margin: 8px 0; font-weight: 700; } .request-due.due-overdue { color: #b42318; font-weight: 700; } .request-due.due-soon { color: #b54708; font-weight: 700; } .request-due { font-style: normal; } .document-detail { margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdfb; } .document-detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0 12px; } .document-detail dt { color: var(--muted); }
+
+/* Settings organization */
+.settings-page { max-width: 1180px; }
+.settings-sections { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 18px; border-bottom: 1px solid var(--line); }
+.settings-section-tab { display: inline-flex; align-items: center; gap: 8px; padding: 11px 16px; border: 0; border-bottom: 3px solid transparent; background: transparent; color: var(--muted); font: inherit; font-weight: 800; cursor: pointer; }
+.settings-section-tab:hover { color: var(--green); }
+.settings-section-tab.active { color: var(--green); border-bottom-color: var(--green); }
+.settings-section-tab:focus-visible { outline: 2px solid #3366ff; outline-offset: 2px; }
+.settings-unsaved { padding: 2px 8px; border-radius: 10px; background: #fff3d6; color: #8a5a00; font-size: 10px; font-weight: 800; }
+.settings-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.settings-panel[hidden] { display: none; }
+.settings-panel > .panel { margin-top: 0; }
+.settings-panel > .automation-rules-card, .settings-panel > .automation-preview-panel, .settings-panel > .audit-log-card, .settings-panel > .history-grid { grid-column: 1 / -1; }
+.settings-fieldset { margin: 0 0 14px; padding: 14px; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+.settings-fieldset legend { padding: 0 6px; color: var(--green); font-weight: 800; }
+.settings-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.settings-fields label { display: grid; gap: 5px; min-width: 0; font-weight: 700; }
+.settings-fields input, .settings-fields select { width: 100%; box-sizing: border-box; }
+.checkbox-field { display: flex !important; align-items: center; gap: 8px; }
+.checkbox-field input { width: auto; }
+.rule-groups { display: grid; gap: 0; }
+.settings-note { margin: 10px 0; padding: 10px 12px; border-radius: 6px; background: #f1f6f3; color: var(--muted); font-size: 13px; }
+.dev-bypass-note { background: #fff3d6; color: #6b4600; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.settings-actions button { width: auto; }
+.reset-zone { border: 2px solid #c0392b; background: #fff8f7; }
+.reset-scope { margin: 8px 0 12px; padding-left: 18px; font-size: 13px; color: var(--muted); }
+.history-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.history-grid .audit-log-list { max-height: 360px; overflow-y: auto; }
+.history-count { margin-left: 6px; color: var(--muted); font-weight: 700; }
+.history-badge { display: inline-block; margin: 4px 0; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 800; }
+.history-badge.temporary { background: #fff3d6; color: #8a5a00; }
+.history-badge.browser { background: #e5eefc; color: #1f4aa8; }
+.history-badge.derived { background: #e6f2ea; color: var(--green); }
+@media (max-width: 900px) { .settings-panel { grid-template-columns: minmax(0, 1fr); } .settings-sections { overflow-x: auto; flex-wrap: nowrap; } .settings-section-tab { white-space: nowrap; } }

@@ -71,3 +71,5 @@ Lets you open LedgerOps on your own machine without signing in. The OIDC login, 
 Reconciliations (and other saved work) are kept in server memory unless `DATABASE_URL` points at a Postgres database.
 In memory they are labelled "Temporary local development records" in the app and are lost when the server restarts.
 To keep them, set `DATABASE_URL` in `.env` (locally) or in the Render environment, then restart the server.
+
+Settings > Demo Data > Development storage shows the live status reported by the backend (Database-backed, Temporary or Unknown). The app never displays the connection string; set it only in .env or the Render environment, for example DATABASE_URL=postgres://user:password@host:5432/ledgerops.

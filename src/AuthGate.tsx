@@ -58,7 +58,7 @@ export default function AuthGate() {
     }
   }
 
-  if (state.status === 'signed-in') return <App user={state.user} onSignOut={signOut} />
+  if (state.status === 'signed-in') return <App user={state.user} onSignOut={signOut} devBypass={state.devBypass} />
 
   return (
     <main className="login-page">

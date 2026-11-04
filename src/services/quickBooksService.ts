@@ -1,5 +1,6 @@
 import type { LedgerAccount, LedgerBill, LedgerContact, LedgerInvoice, LedgerReport, LedgerTransaction } from './bookkeepingTypes'
 import { apiFetch } from './apiClient'
+import type { ConnectionReading } from './settingsStatus'
 import type { Completeness, ReconTxn } from '../../shared/reconciliation'
 import type { ReportId } from '../../shared/accounting'
 import type { QbReportJson } from '../../shared/qbReports'
@@ -36,6 +37,17 @@ export const quickBooksService = {
     const response = await apiFetch('/api/quickbooks/status')
     if (!response.ok) throw new Error('Unable to check QuickBooks status.')
     return response.json() as Promise<QuickBooksStatus>
+  },
+  /** Read-only status check that keeps the HTTP outcome, so Settings can tell "not connected" from "sign-in needed" or "server down". */
+  readConnection: async (): Promise<ConnectionReading> => {
+    let response: Response
+    try {
+      response = await apiFetch('/api/quickbooks/status')
+    } catch {
+      return { kind: 'network' }
+    }
+    const json = await response.json().catch(() => null) as { connected?: boolean; error?: string } | null
+    return { kind: 'response', status: response.status, json }
   },
   /** Asks the server for a session-bound authorization URL, then sends the browser to Intuit. */
   connect: async () => {

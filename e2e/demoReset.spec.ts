@@ -74,6 +74,7 @@ async function closeJuly(page: Page) {
 
 async function resetDemoData(page: Page, label: string) {
   await nav(page, /Settings/).click()
+  await page.getByRole('tab', { name: 'Demo Data' }).click()
   await page.locator('.demo-reset-card select').selectOption({ label })
   await page.getByRole('button', { name: 'Review reset' }).click()
   const confirmation = page.getByRole('group', { name: 'Confirm demo data reset' })
@@ -132,6 +133,7 @@ test.describe('Reset Demo Data', () => {
     const { demoReset, unexpected } = await start(page)
 
     await nav(page, /Settings/).click()
+    await page.getByRole('tab', { name: 'Demo Data' }).click()
     await page.locator('.demo-reset-card select').selectOption({ label: 'All five demo companies' })
     await page.getByRole('button', { name: 'Review reset' }).click()
     const confirmation = page.getByRole('group', { name: 'Confirm demo data reset' })

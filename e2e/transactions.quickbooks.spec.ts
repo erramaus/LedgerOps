@@ -117,6 +117,7 @@ test.describe('QuickBooks Sandbox (mocked)', () => {
     await expect(page.getByRole('status').filter({ hasText: 'Updated in QuickBooks Sandbox' })).toBeVisible()
 
     await page.locator('nav.main-nav').getByRole('button', { name: /Settings/ }).click()
+    await page.getByRole('tab', { name: 'Activity & History' }).click()
     const log = page.locator('.audit-log-row')
     await expect(log).toHaveCount(1)
     await expect(log).toContainText('Success')

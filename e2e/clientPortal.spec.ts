@@ -13,13 +13,14 @@ test.describe('Phase 8: client portal and documents', () => {
   test('creates a request, receives a client document, matches the receipt, and clears the inbox task', async ({ page }) => {
     await openWorkspace(page)
     await nav(page, /Client Requests/).click()
-    const createRequestPanel = page.locator('.portal-panel').filter({ hasText: 'Create request' })
-
+    await page.getByRole('button', { name: 'New Request' }).click()
+    const createRequestPanel = page.getByTestId('request-composer')
+    await createRequestPanel.getByLabel('Client').selectOption({ label: 'ABC Plumbing' })
     await createRequestPanel.getByLabel('Request type').selectOption('Missing Receipt')
-    await createRequestPanel.getByLabel('Related transaction or document').fill('Home Depot')
-    await createRequestPanel.getByLabel('Amount').fill('$341.22')
-    await createRequestPanel.getByRole('textbox', { name: 'Request' }).fill('Please upload the receipt for the Home Depot purchase.')
-    await page.getByRole('button', { name: 'Send request' }).click()
+    await createRequestPanel.getByLabel('Related transaction or document (optional)').fill('Home Depot')
+    await createRequestPanel.getByLabel('Amount (optional)').fill('$341.22')
+    await createRequestPanel.getByRole('textbox', { name: /Request message/ }).fill('Please upload the receipt for the Home Depot purchase.')
+    await page.getByRole('button', { name: 'Send Request' }).click()
     await expect(page.getByRole('heading', { name: 'Home Depot' })).toBeVisible()
     await expect(page.locator('.request-question')).toContainText('Please upload the receipt for the Home Depot purchase.')
     await page.getByRole('button', { name: '← All requests' }).click()
@@ -31,7 +32,7 @@ test.describe('Phase 8: client portal and documents', () => {
 
     await nav(page, /Client Requests/).click()
     await page.getByRole('button', { name: /^Simulated Client View/ }).click()
-    await page.locator('.request-card').filter({ hasText: 'Please upload the receipt for the Home Depot purchase.' }).click()
+    await page.locator('.request-card').filter({ hasText: 'Please upload the receipt for the Home Depot purchase.' }).getByRole('button', { name: /^(View Request|Review Response)/ }).first().click()
     const requestDetail = page.locator('.request-detail-layout')
     await requestDetail.getByLabel('Note to bookkeeper').fill('Uploading the receipt from my phone.')
     await page.getByRole('button', { name: 'Upload simulated document' }).click()
@@ -41,7 +42,7 @@ test.describe('Phase 8: client portal and documents', () => {
     await page.getByRole('button', { name: '← All requests' }).click()
 
     await page.getByRole('button', { name: /^Bookkeeper View/ }).click()
-    await page.locator('.request-card').filter({ hasText: 'Please upload the receipt for the Home Depot purchase.' }).click()
+    await page.locator('.request-card').filter({ hasText: 'Please upload the receipt for the Home Depot purchase.' }).getByRole('button', { name: /^(View Request|Review Response)/ }).first().click()
     await expect(page.locator('.audit-log-row').filter({ hasText: 'receipt' })).toBeVisible()
     await page.getByRole('button', { name: /Match to Home Depot/i }).first().click()
     await expect(page.locator('.resolved-note')).toContainText('resolved')

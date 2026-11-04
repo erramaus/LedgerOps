@@ -143,6 +143,18 @@ import { demoEntryService, entryTransactions } from "./services/demoEntryService
 import { demoJournalService } from "./services/demoJournalService";
 import { billsWithPayments, bookForDocument, demoPaymentService, invoicesWithPayments, paymentTransactions } from "./services/demoPaymentService";
 import { demoResetService } from "./services/demoResetService";
+import { reconciliationService } from "./services/reconciliationService";
+import {
+  SETTINGS_SECTIONS,
+  classifyConnection,
+  describeStorage,
+  ruleFormFromRule,
+  ruleFormHasUnsavedWork,
+  type ConnectionSummary,
+  type RuleForm,
+  type SettingsSection,
+  type StorageSummary,
+} from "./services/settingsStatus";
 import { demoWorkpaperService } from "./services/demoWorkpaperService";
 import type { EntryTools } from "./MissingTransaction";
 import { DocumentPaymentActions } from "./DocumentPaymentActions";
@@ -244,7 +256,7 @@ type MonthEndCompletion = {
   completedBy: string;
 };
 
-function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
+function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut: () => void; devBypass?: boolean }) {
   const [currentDate, setCurrentDate] = useState(() => new Date());
   const [view, setView] = useState<View>("Dashboard");
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
@@ -1740,8 +1752,8 @@ function App({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) {
             selectedClientId={automationClientId}
             selectedClientName={automationClientName}
             source={automationSource}
-            rules={scopedRules}
-            rulePreviewTransactions={records.transactions}
+            devBypass={devBypass}
+            rules={scopedRules}            rulePreviewTransactions={records.transactions}
             automationEvents={scopedAutomationEvents}
             recurringPatterns={recurringPatterns}
             categoryOptions={appDataSource === "demo" ? demoCategoryOptions : quickBooksCategoryOptions}
@@ -4340,6 +4352,7 @@ function Settings({
   selectedClientId,
   selectedClientName,
   source,
+  devBypass,
   rules,
   rulePreviewTransactions,
   automationEvents,
@@ -4358,6 +4371,7 @@ function Settings({
   selectedClientId: string;
   selectedClientName: string;
   source: "demo" | "quickbooks";
+  devBypass: boolean;
   rules: AutomationRule[];
   rulePreviewTransactions: Transaction[];
   automationEvents: AutomationAuditEvent[];
@@ -4369,20 +4383,7 @@ function Settings({
   onReset: (clientIds: string[]) => void;
 }) {
   type RuleDraft = Omit<AutomationRule, "id" | "createdAt" | "updatedAt" | "source" | "clientId"> & { id?: string };
-  type RuleFormState = {
-    name: string;
-    enabled: boolean;
-    priority: number;
-    payeeContains: string;
-    descriptionContains: string;
-    minAmount: string;
-    maxAmount: string;
-    transactionKind: "Any" | "Expense" | "Deposit";
-    category: string;
-    memo: string;
-    reviewPriority: TaskPriority;
-  };
-
+  type RuleFormState = RuleForm;
   const [error, setError] = useState<string | null>(null);
   const [loadingCompany, setLoadingCompany] = useState(false);
   const [resetTarget, setResetTarget] = useState(selectedClientId ?? DEMO_RESET_CLIENTS[0].id);
@@ -4407,14 +4408,27 @@ function Settings({
   });
   const [ruleErrors, setRuleErrors] = useState<Partial<Record<"name" | "criteria" | "amount" | "category" | "priority", string>>>({});
 
+  const [section, setSection] = useState<SettingsSection>("Connections");
+  const [recheck, setRecheck] = useState(0);
+  const [connection, setConnection] = useState<ConnectionSummary>({ state: "checking", label: "Checking…", detail: "Asking the server about QuickBooks." });
+  const [storage, setStorage] = useState<StorageSummary>(describeStorage("checking"));
+
   useEffect(() => {
-    quickBooksService
-      .getStatus()
-      .then(onStatusChange)
-      .catch(() =>
-        setError("Start the backend server to check QuickBooks status."),
-      );
-  }, [onStatusChange]);
+    let active = true;
+    quickBooksService.readConnection().then((reading) => {
+      if (!active) return;
+      const summary = classifyConnection(reading, devBypass);
+      setConnection(summary);
+      onStatusChange({ connected: summary.state === "connected", environment: "sandbox" });
+    });
+    reconciliationService
+      .storage()
+      .then((result) => active && setStorage(describeStorage(result)))
+      .catch(() => active && setStorage(describeStorage("unavailable")));
+    return () => {
+      active = false;
+    };
+  }, [onStatusChange, devBypass, recheck]);
 
   const reviewReset = () => {
     setResetReview(resetTarget === "all" ? DEMO_RESET_CLIENTS.map((client) => client.id) : [resetTarget]);
@@ -4479,20 +4493,9 @@ function Settings({
   const editRule = (rule: AutomationRule) => {
     setEditingRuleId(rule.id);
     setRuleErrors({});
-    setRuleForm({
-      name: rule.name,
-      enabled: rule.enabled,
-      priority: rule.priority,
-      payeeContains: rule.payeeContains ?? "",
-      descriptionContains: rule.descriptionContains ?? "",
-      minAmount: rule.minAmountCents !== undefined ? (rule.minAmountCents / 100).toFixed(2) : "",
-      maxAmount: rule.maxAmountCents !== undefined ? (rule.maxAmountCents / 100).toFixed(2) : "",
-      transactionKind: rule.transactionKind,
-      category: rule.category,
-      memo: rule.memo ?? "",
-      reviewPriority: rule.reviewPriority,
-    });
+    setRuleForm(ruleFormFromRule(rule));
   };
+  const unsavedRuleWork = ruleFormHasUnsavedWork(ruleForm, editingRuleId !== null);
 
   const currentDraft: RuleDraft = {
     id: editingRuleId ?? undefined,
@@ -4532,161 +4535,194 @@ function Settings({
     [rules],
   );
 
+  const sectionId = (name: SettingsSection) => name.toLowerCase().replace(/[^a-z]+/g, "-");
+  const onSectionKey = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    if (!step) return;
+    event.preventDefault();
+    const next = SETTINGS_SECTIONS[(index + step + SETTINGS_SECTIONS.length) % SETTINGS_SECTIONS.length];
+    setSection(next);
+    document.getElementById(`settings-tab-${sectionId(next)}`)?.focus();
+  };
+  const sourceLabel = source === "demo" ? "Demo data" : "QuickBooks Sandbox";
+  const resetNames = DEMO_RESET_CLIENTS.map((client) => client.name).join(", ");
+  const canConnect = connection.state === "not-connected";
+
   return (
-    <div className="page-content">
+    <div className="page-content settings-page">
       <section className="welcome-row">
         <div>
           <h2>Settings</h2>
-          <p className="muted">
-            Connect LedgerOps to a QuickBooks Online sandbox.
-          </p>
+          <p className="muted">Connections, automation rules, demo data and activity history for LedgerOps.</p>
         </div>
       </section>
-      <div className="settings-grid">
-        <section className="panel settings-card">
+      <div className="settings-sections" role="tablist" aria-label="Settings sections">
+        {SETTINGS_SECTIONS.map((name, index) => (
+          <button
+            key={name}
+            id={`settings-tab-${sectionId(name)}`}
+            role="tab"
+            type="button"
+            aria-selected={section === name}
+            aria-controls={`settings-panel-${sectionId(name)}`}
+            tabIndex={section === name ? 0 : -1}
+            className={`settings-section-tab ${section === name ? "active" : ""}`}
+            onClick={() => setSection(name)}
+            onKeyDown={(event) => onSectionKey(event, index)}
+          >
+            {name}
+            {name === "Automation Rules" && unsavedRuleWork && <span className="settings-unsaved" data-testid="rule-unsaved">Unsaved edits</span>}
+          </button>
+        ))}
+      </div>
+
+      <div className="settings-panel" role="tabpanel" id="settings-panel-connections" aria-labelledby="settings-tab-connections" hidden={section !== "Connections"}>
+        <section className="panel settings-card" aria-labelledby="qb-heading">
           <div className="settings-card-heading">
             <div className="account-icon">QB</div>
             <div>
-              <h2>QuickBooks Online</h2>
-              <p className="muted">Sandbox connection</p>
+              <h2 id="qb-heading">QuickBooks Online</h2>
+              <p className="muted">Sandbox connection only. Production QuickBooks is not enabled.</p>
             </div>
           </div>
           <div className="settings-status">
             <span>Status</span>
-            <strong
-              className={
-                quickBooksStatus.connected ? "connected" : "not-connected"
-              }
-            >
-              {quickBooksStatus.connected ? "Connected" : "Not Connected"}
-            </strong>
+            <strong className={`connection-${connection.state}`} data-testid="qb-connection-state" data-state={connection.state}>{connection.label}</strong>
           </div>
-          {!quickBooksStatus.connected ? (
-            <button
-              className="primary-button"
-              onClick={() =>
-                quickBooksService.connect().catch((connectError: unknown) =>
-                  setError(
-                    connectError instanceof Error
-                      ? connectError.message
-                      : "Unable to start the QuickBooks connection.",
-                  ),
-                )
-              }
-            >
-              Connect QuickBooks <span>→</span>
-            </button>
-          ) : (
-            <button
-              className="secondary-button"
-              onClick={loadCompany}
-              disabled={loadingCompany}
-            >
-              {loadingCompany ? "Loading company info..." : "Load Company Info"}{" "}
-              <span>→</span>
-            </button>
+          <p className="settings-note" data-testid="qb-connection-detail">{connection.detail}</p>
+          {devBypass && (
+            <p className="settings-note dev-bypass-note" data-testid="dev-bypass-note">
+              Local development bypass is on. It only opens demo data on this computer. QuickBooks still requires real authentication and is never bypassed.
+            </p>
           )}
+          <div className="reset-actions settings-actions">
+            {canConnect && (
+              <button
+                className="primary-button"
+                onClick={() =>
+                  quickBooksService.connect().catch((connectError: unknown) =>
+                    setError(connectError instanceof Error ? connectError.message : "Unable to start the QuickBooks connection."),
+                  )
+                }
+              >
+                Connect QuickBooks <span>→</span>
+              </button>
+            )}
+            {connection.state === "connected" && (
+              <button className="secondary-button" onClick={loadCompany} disabled={loadingCompany}>
+                {loadingCompany ? "Loading company info..." : "Load Company Info"} <span>→</span>
+              </button>
+            )}
+            {(connection.state === "backend-unavailable" || connection.state === "error") && (
+              <button className="secondary-button" onClick={() => setRecheck((count) => count + 1)}>Check again</button>
+            )}
+          </div>
           {error && <p className="settings-error">{error}</p>}
           {company && (
             <div className="company-info">
               <h3>Company information</h3>
               <div className="detail-list">
-                <span>
-                  <small>Company Name</small>
-                  <strong>{company.CompanyName || "Not provided"}</strong>
-                </span>
-                <span>
-                  <small>Legal Name</small>
-                  <strong>{company.LegalName || "Not provided"}</strong>
-                </span>
-                <span>
-                  <small>Country</small>
-                  <strong>{company.Country || "Not provided"}</strong>
-                </span>
-                <span>
-                  <small>Fiscal Year Start Month</small>
-                  <strong>
-                    {company.FiscalYearStartMonth || "Not provided"}
-                  </strong>
-                </span>
+                <span><small>Company Name</small><strong>{company.CompanyName || "Not provided"}</strong></span>
+                <span><small>Legal Name</small><strong>{company.LegalName || "Not provided"}</strong></span>
+                <span><small>Country</small><strong>{company.Country || "Not provided"}</strong></span>
+                <span><small>Fiscal Year Start Month</small><strong>{company.FiscalYearStartMonth || "Not provided"}</strong></span>
               </div>
             </div>
           )}
         </section>
-        <section className="panel settings-card automation-rules-card">
-          <h2>Automation Rules</h2>
+      </div>
+
+      <div className="settings-panel" role="tabpanel" id="settings-panel-automation-rules" aria-labelledby="settings-tab-automation-rules" hidden={section !== "Automation Rules"}>
+        <section className="panel settings-card automation-rules-card" aria-labelledby="rules-heading">
+          <h2 id="rules-heading">{editingRuleId ? "Edit rule" : "New rule"}</h2>
           <p className="muted">Create reusable suggestions for {selectedClientName}. Rules never post accounting changes automatically.</p>
           <div className="detail-list">
             <span><small>Scope</small><strong>{selectedClientName}</strong></span>
-            <span><small>Data source</small><strong>{source === "demo" ? "Demo data" : "QuickBooks Sandbox"}</strong></span>
+            <span><small>Data source</small><strong>{sourceLabel}</strong></span>
           </div>
-          <div className="queue-filters">
-            <label>
-              Rule name
-              <input value={ruleForm.name} onChange={(event) => setRuleForm({ ...ruleForm, name: event.target.value })} placeholder="Home Depot materials" />
-            </label>
-            <label>
-              Priority
-              <input type="number" min={1} value={ruleForm.priority} onChange={(event) => setRuleForm({ ...ruleForm, priority: Number(event.target.value) || 1 })} />
-            </label>
-            <label>
-              Transaction kind
-              <select value={ruleForm.transactionKind} onChange={(event) => setRuleForm({ ...ruleForm, transactionKind: event.target.value as "Any" | "Expense" | "Deposit" })}>
-                <option value="Any">Any</option>
-                <option value="Expense">Expense</option>
-                <option value="Deposit">Deposit</option>
-              </select>
-            </label>
-            <label>
-              Review priority
-              <select value={ruleForm.reviewPriority} onChange={(event) => setRuleForm({ ...ruleForm, reviewPriority: event.target.value as TaskPriority })}>
-                {taskPriorities.map((priority, index) => <option key={`${priority}-${index}`} value={priority}>{priority}</option>)}
-              </select>
-            </label>
-          </div>
-          <div className="queue-filters">
-            <label>
-              Vendor / payee contains
-              <input value={ruleForm.payeeContains} onChange={(event) => setRuleForm({ ...ruleForm, payeeContains: event.target.value })} placeholder="Home Depot" />
-            </label>
-            <label>
-              Description or memo contains
-              <input value={ruleForm.descriptionContains} onChange={(event) => setRuleForm({ ...ruleForm, descriptionContains: event.target.value })} placeholder="materials" />
-            </label>
-            <label>
-              Minimum amount
-              <input value={ruleForm.minAmount} onChange={(event) => setRuleForm({ ...ruleForm, minAmount: event.target.value })} placeholder="0.00" />
-            </label>
-            <label>
-              Maximum amount
-              <input value={ruleForm.maxAmount} onChange={(event) => setRuleForm({ ...ruleForm, maxAmount: event.target.value })} placeholder="999.99" />
-            </label>
-          </div>
-          <div className="queue-filters">
-            <label>
-              Suggested category
-              <select value={effectiveCategory} onChange={(event) => setRuleForm({ ...ruleForm, category: event.target.value })}>
-                {categoryOptions.map((option, index) => <option key={`${option.id ?? option.name}-${index}`} value={option.name}>{option.name}</option>)}
-              </select>
-            </label>
-            <label>
-              Optional memo
-              <input value={ruleForm.memo} onChange={(event) => setRuleForm({ ...ruleForm, memo: event.target.value })} placeholder="Job materials purchase" />
-            </label>
-            <label>
-              <span>Enabled</span>
-              <input type="checkbox" checked={ruleForm.enabled} onChange={(event) => setRuleForm({ ...ruleForm, enabled: event.target.checked })} />
-            </label>
+          <div className="rule-groups">
+            <fieldset className="settings-fieldset">
+              <legend>Rule details</legend>
+              <div className="settings-fields">
+                <label>
+                  Rule name
+                  <input value={ruleForm.name} onChange={(event) => setRuleForm({ ...ruleForm, name: event.target.value })} placeholder="Home Depot materials" />
+                </label>
+                <label>
+                  Priority
+                  <input type="number" min={1} value={ruleForm.priority} onChange={(event) => setRuleForm({ ...ruleForm, priority: Number(event.target.value) || 1 })} />
+                </label>
+                <label>
+                  Review priority
+                  <select value={ruleForm.reviewPriority} onChange={(event) => setRuleForm({ ...ruleForm, reviewPriority: event.target.value as TaskPriority })}>
+                    {taskPriorities.map((priority, index) => <option key={`${priority}-${index}`} value={priority}>{priority}</option>)}
+                  </select>
+                </label>
+                <label className="checkbox-field">
+                  <input type="checkbox" checked={ruleForm.enabled} onChange={(event) => setRuleForm({ ...ruleForm, enabled: event.target.checked })} />
+                  <span>Enabled</span>
+                </label>
+              </div>
+            </fieldset>
+            <fieldset className="settings-fieldset">
+              <legend>Match conditions</legend>
+              <div className="settings-fields">
+                <label>
+                  Transaction kind
+                  <select value={ruleForm.transactionKind} onChange={(event) => setRuleForm({ ...ruleForm, transactionKind: event.target.value as "Any" | "Expense" | "Deposit" })}>
+                    <option value="Any">Any</option>
+                    <option value="Expense">Expense</option>
+                    <option value="Deposit">Deposit</option>
+                  </select>
+                </label>
+                <label>
+                  Vendor / payee contains
+                  <input value={ruleForm.payeeContains} onChange={(event) => setRuleForm({ ...ruleForm, payeeContains: event.target.value })} placeholder="Home Depot" />
+                </label>
+                <label>
+                  Description or memo contains
+                  <input value={ruleForm.descriptionContains} onChange={(event) => setRuleForm({ ...ruleForm, descriptionContains: event.target.value })} placeholder="materials" />
+                </label>
+                <label>
+                  Minimum amount
+                  <input value={ruleForm.minAmount} onChange={(event) => setRuleForm({ ...ruleForm, minAmount: event.target.value })} placeholder="0.00" />
+                </label>
+                <label>
+                  Maximum amount
+                  <input value={ruleForm.maxAmount} onChange={(event) => setRuleForm({ ...ruleForm, maxAmount: event.target.value })} placeholder="999.99" />
+                </label>
+              </div>
+            </fieldset>
+            <fieldset className="settings-fieldset">
+              <legend>Suggested action</legend>
+              <div className="settings-fields">
+                <label>
+                  Suggested category
+                  <select value={effectiveCategory} onChange={(event) => setRuleForm({ ...ruleForm, category: event.target.value })}>
+                    {!categoryOptions.some((option) => option.name === effectiveCategory) && effectiveCategory && <option value={effectiveCategory}>{effectiveCategory}</option>}
+                    {categoryOptions.map((option, index) => <option key={`${option.id ?? option.name}-${index}`} value={option.name}>{option.name}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Optional memo
+                  <input value={ruleForm.memo} onChange={(event) => setRuleForm({ ...ruleForm, memo: event.target.value })} placeholder="Job materials purchase" />
+                </label>
+              </div>
+              <p className="muted">The rule only suggests this category. A bookkeeper still reviews and approves every change.</p>
+            </fieldset>
           </div>
           {(ruleErrors.name || ruleErrors.criteria || ruleErrors.amount || ruleErrors.category || ruleErrors.priority) && <p className="settings-error" role="alert">{ruleErrors.name || ruleErrors.criteria || ruleErrors.amount || ruleErrors.category || ruleErrors.priority}</p>}
-          <div className="reset-actions">
+          <div className="reset-actions settings-actions">
             <button className="secondary-button" onClick={resetRuleForm}>{editingRuleId ? "Cancel edit" : "Clear rule"}</button>
             <button className="primary-button" onClick={submitRule}>{editingRuleId ? "Save rule" : "Create rule"}</button>
           </div>
-          <div className="panel automation-preview-panel" data-testid="rule-preview">
-            <h3>Preview matches</h3>
-            {previewMatches.length === 0 ? <p className="muted">No current transactions match this rule yet.</p> : <div className="audit-log-list">{previewMatches.slice(0, 5).map((match, index) => <div className="audit-log-row" key={`${match.transactionId}-${index}`}><strong>{match.payee}</strong><span>{match.date} · {match.amount}</span><span>{match.reasons[0]}</span></div>)}</div>}
-          </div>
+        </section>
+        <section className="panel settings-card automation-preview-panel" data-testid="rule-preview" aria-labelledby="preview-heading">
+          <h3 id="preview-heading">Preview matches</h3>
+          {previewMatches.length === 0 ? <p className="muted">No current transactions match this rule yet.</p> : <div className="audit-log-list">{previewMatches.slice(0, 5).map((match, index) => <div className="audit-log-row" key={`${match.transactionId}-${index}`}><strong>{match.payee}</strong><span>{match.date} · {match.amount}</span><span>{match.reasons[0]}</span></div>)}</div>}
+        </section>
+        <section className="panel settings-card" aria-labelledby="existing-rules-heading">
+          <h3 id="existing-rules-heading">Existing rules ({sortedRules.length})</h3>
           <div className="audit-log-list" data-testid="rules-list">
             {sortedRules.length === 0 ? <p className="muted">No rules saved for this client yet.</p> : sortedRules.map((rule, index) => {
               const matches = previewRule(rule, rulePreviewTransactions);
@@ -4694,9 +4730,26 @@ function Settings({
             })}
           </div>
         </section>
-        <section className="panel settings-card demo-reset-card">
-          <h2>Reset Demo Data</h2>
-          <p className="muted">Restore the original demo books for one company or all five.</p>
+      </div>
+
+      <div className="settings-panel" role="tabpanel" id="settings-panel-demo-data" aria-labelledby="settings-tab-demo-data" hidden={section !== "Demo Data"}>
+        <section className="panel settings-card storage-card" data-testid="storage-card" aria-labelledby="storage-heading">
+          <h2 id="storage-heading">Development storage</h2>
+          <div className="settings-status">
+            <span>Server records</span>
+            <strong className={`storage-${storage.state}`} data-testid="storage-state" data-state={storage.state}>{storage.label}</strong>
+          </div>
+          <p className="settings-note" data-testid="storage-detail">{storage.detail}</p>
+          <p className="muted">Browser-only items (automation rules and activity, and the QuickBooks update attempts shown in Activity &amp; History) are never saved to the server.</p>
+        </section>
+        <section className="panel settings-card demo-reset-card reset-zone" aria-labelledby="reset-heading">
+          <h2 id="reset-heading">Reset Demo Data</h2>
+          <p className="muted">Restore the original demo books. Choose one company, or all five.</p>
+          <ul className="reset-scope">
+            <li><strong>One company:</strong> only the selected company's demo changes are removed; the other four are untouched.</li>
+            <li><strong>All five demo companies:</strong> every demo company ({resetNames}) is restored to its original data.</li>
+            <li><strong>Never reset:</strong> QuickBooks, sign-in, sessions, or any other database records.</li>
+          </ul>
           <label className="reset-target-label">
             <span>Company</span>
             <select value={resetTarget} onChange={(event) => { setResetTarget(event.target.value); setResetReview(null); setResetSuccess(null); }}>
@@ -4718,21 +4771,29 @@ function Settings({
           {resetError && <p className="settings-error" role="alert">{resetError}</p>}
           {resetSuccess && <p className="reset-success" role="status">{resetSuccess}</p>}
         </section>
-        <section className="panel settings-card audit-log-card">
-          <h2>Audit Log</h2>
-          <p className="muted">Local test record of QuickBooks Sandbox write attempts.</p>
-          {auditLog.length === 0 ? <p className="muted">No QuickBooks updates attempted.</p> : <div className="audit-log-list">{auditLog.map((entry, index) => <div className="audit-log-row" key={`${entry.timestamp}-${index}`}><strong>{entry.result}</strong><span>{entry.transactionType} · {entry.quickBooksId}</span><span>{entry.oldCategory} → {entry.newCategory}</span><small>{new Date(entry.timestamp).toLocaleString()}</small></div>)}</div>}
-        </section>
-        <section className="panel settings-card audit-log-card">
-          <h2>Automation Activity</h2>
-          <p className="muted">Tracks rule changes and automation suggestions without marking any accounting change as posted.</p>
-          {automationEvents.length === 0 ? <p className="muted">No automation activity recorded yet.</p> : <div className="audit-log-list">{automationEvents.map((event, index) => <div className="audit-log-row" key={`${event.id}-${index}`}><strong>{event.summary}</strong><span>{event.kind}</span>{event.detail && <span>{event.detail}</span>}<small>{new Date(event.at).toLocaleString()}</small></div>)}</div>}
-        </section>
-        <section className="panel settings-card audit-log-card">
-          <h2>Recurring activity</h2>
-          <p className="muted">Expected recurring transactions are reminders only and never create entries automatically.</p>
-          {recurringPatterns.length === 0 ? <p className="muted">No recurring reminders are currently open.</p> : <div className="audit-log-list">{recurringPatterns.slice(0, 8).map((pattern, index) => <div className="audit-log-row" key={`${pattern.id}-${index}`}><strong>{pattern.vendor}</strong><span>{pattern.frequency} · typical {formatMoney(pattern.typicalAmountCents / 100)}</span><span>Expected next date {formatDueDate(pattern.expectedNextDate)} · {pattern.confidence} confidence</span></div>)}</div>}
-        </section>
+      </div>
+
+      <div className="settings-panel" role="tabpanel" id="settings-panel-activity-history" aria-labelledby="settings-tab-activity-history" hidden={section !== "Activity & History"}>
+        <div className="history-grid">
+          <section className="panel settings-card audit-log-card" data-testid="history-audit" aria-labelledby="audit-heading">
+            <h2 id="audit-heading">Audit Log <span className="history-count">{auditLog.length}</span></h2>
+            <span className="history-badge temporary">This session only</span>
+            <p className="muted">Record of QuickBooks Sandbox update attempts made in this browser tab. It is cleared when the page reloads and is not a permanent log.</p>
+            {auditLog.length === 0 ? <p className="muted">No QuickBooks updates attempted.</p> : <div className="audit-log-list">{auditLog.map((entry, index) => <div className="audit-log-row" key={`${entry.timestamp}-${index}`}><strong>{entry.result}</strong><span>{entry.transactionType} · {entry.quickBooksId}</span><span>{entry.oldCategory} → {entry.newCategory}</span><small>{new Date(entry.timestamp).toLocaleString()}</small></div>)}</div>}
+          </section>
+          <section className="panel settings-card audit-log-card" data-testid="history-automation" aria-labelledby="automation-heading">
+            <h2 id="automation-heading">Automation Activity <span className="history-count">{automationEvents.length}</span></h2>
+            <span className="history-badge browser">Saved in this browser only</span>
+            <p className="muted">Rule changes and automation suggestions, kept in this browser's storage. Not saved on the server, and nothing here marks an accounting change as posted.</p>
+            {automationEvents.length === 0 ? <p className="muted">No automation activity recorded yet.</p> : <div className="audit-log-list">{automationEvents.map((event, index) => <div className="audit-log-row" key={`${event.id}-${index}`}><strong>{event.summary}</strong><span>{event.kind}</span>{event.detail && <span>{event.detail}</span>}<small>{new Date(event.at).toLocaleString()}</small></div>)}</div>}
+          </section>
+          <section className="panel settings-card audit-log-card" data-testid="history-recurring" aria-labelledby="recurring-heading">
+            <h2 id="recurring-heading">Recurring activity <span className="history-count">{recurringPatterns.length}</span></h2>
+            <span className="history-badge derived">Calculated from current transactions</span>
+            <p className="muted">Expected recurring transactions are reminders only and never create entries automatically. This list is recalculated, not a saved history.</p>
+            {recurringPatterns.length === 0 ? <p className="muted">No recurring reminders are currently open.</p> : <div className="audit-log-list">{recurringPatterns.slice(0, 8).map((pattern, index) => <div className="audit-log-row" key={`${pattern.id}-${index}`}><strong>{pattern.vendor}</strong><span>{pattern.frequency} · typical {formatMoney(pattern.typicalAmountCents / 100)}</span><span>Expected next date {formatDueDate(pattern.expectedNextDate)} · {pattern.confidence} confidence</span></div>)}</div>}
+          </section>
+        </div>
       </div>
     </div>
   );
