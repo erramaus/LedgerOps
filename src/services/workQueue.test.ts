@@ -148,7 +148,7 @@ describe('suspected problems are not presented as confirmed errors', () => {
       transactions: [
         qbTransaction({ id: 'a', payee: 'Acme', amount: '$40.00' }),
         qbTransaction({ id: 'b', payee: 'Acme', amount: '$40.00' }),
-        qbTransaction({ id: 'c', payee: 'Big Co', amount: '$2,500.00' }),
+        qbTransaction({ id: 'c', payee: 'Big Co', amount: '$6,500.00' }),
         qbTransaction({ id: 'd', category: 'Uncategorized', payee: 'Unknown' }),
       ],
     })

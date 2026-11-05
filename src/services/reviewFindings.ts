@@ -43,7 +43,7 @@ const WHY: Partial<Record<TaskKind, string>> = {
   'rule-suggestion': 'The transaction has no category, and one of your automation rules suggests one. Nothing is applied until you confirm.',
   'missing-payee': 'A transaction without a payee cannot be matched to a vendor or checked against a receipt.',
   'needs-receipt': 'The transaction is marked as needing a receipt, so supporting documentation may be missing.',
-  'large-transaction': 'The amount is $1,000 or more. Large amounts are worth a second look, but a large amount is not automatically wrong.',
+  'large-transaction': 'This amount is well above what is typical for this client, judged from the client’s own transaction history (or against a conservative fixed limit when there is too little history). An unusual amount is not automatically wrong.',
   'negative-balance': 'A bank or credit card account shows a negative balance in the books. This can be expected, so it is a prompt to check.',
   'reconciliation-difference': 'The statement balance and the books differ, so something is missing, duplicated or mistimed.',
   'summary-reconciliation': 'The client summary shows reconciliation is not complete. Individual items are not in the demo data.',
@@ -147,17 +147,19 @@ export function buildFindingRows(input: {
   live: WorkTask[]
   dismissed: WorkTask[]
   decisions: ReviewDecision[]
-  records: SourceRecords
-  detailClientId: string
+  records: SourceRecords | ((task: WorkTask) => SourceRecords)
+  /** The client whose findings are fully loaded; null when every client's findings are (All clients). */
+  detailClientId: string | null
 }): FindingRow[] {
   const latest = latestDecisions(input.decisions)
   const rows: FindingRow[] = []
   const seen = new Set<string>()
+  const recordsFor = (task: WorkTask) => (typeof input.records === 'function' ? input.records(task) : input.records)
   for (const task of input.live) {
     const key = decisionKey(input.source, task.id)
     seen.add(key)
     const decision = latest.get(key)
-    const changed = decision?.status === 'dismissed' && decision.fingerprint !== sourceFingerprint(task, input.records)
+    const changed = decision?.status === 'dismissed' && decision.fingerprint !== sourceFingerprint(task, recordsFor(task))
     rows.push({ key, task, status: decision?.status === 'reviewing' ? 'Under review' : 'Open', decision, changedSinceDismissed: Boolean(changed) })
   }
   for (const task of input.dismissed) {
@@ -167,7 +169,7 @@ export function buildFindingRows(input: {
   }
   // A finding that was under review and no longer triggers its check has been fixed at the source.
   for (const [key, decision] of latest) {
-    if (seen.has(key) || decision.source !== input.source || decision.clientId !== input.detailClientId || decision.status !== 'reviewing') continue
+    if (seen.has(key) || decision.source !== input.source || (input.detailClientId !== null && decision.clientId !== input.detailClientId) || decision.status !== 'reviewing') continue
     rows.push({
       key,
       status: 'Resolved',

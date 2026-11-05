@@ -46,7 +46,9 @@ test.describe('a bookkeeper works through the whole month in Demo Data', () => {
       expect(await number(metric(page, 'Clients'))).toBe(5)
       expect(await number(metric(page, 'Transactions to review'))).toBeGreaterThan(0)
       const work = page.locator('.work-panel')
-      await expect(work).toContainText('ABC Plumbing')
+      // The work panel now ranks tasks from all five companies, so it is not limited to ABC Plumbing.
+      await expect(work).toContainText('Johnson Dental')
+      await expect(work).toContainText('Smith Construction')
       await expect(work).toContainText('Overdue invoice')
       for (const name of ['ABC Plumbing', 'Green Leaf Landscaping', 'Smith Construction', 'Johnson Dental', 'Acme Consulting']) {
         await expect(page.locator('.client-card').filter({ hasText: name })).toBeVisible()

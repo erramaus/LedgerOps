@@ -39,8 +39,10 @@ describe('categorization status vs. other review reasons', () => {
     expect(categorizationStatus(make('d', { status: 'Matched' }))).toBe('Matched')
   })
 
-  it('flags large transactions', () => {
-    expect(matchesReason(make('e', { amount: '$1,250.00' }), 'Large transaction')).toBe(true)
+  it('flags only amounts at or above the conservative limit when there is no client history', () => {
+    expect(matchesReason(make('e', { amount: '$1,250.00' }), 'Large transaction')).toBe(false)
+    expect(matchesReason(make('e', { amount: '$6,250.00' }), 'Large transaction')).toBe(true)
+    expect(matchesReason(make('e', { amount: '$1,250.00' }), 'Large transaction', new Set(['e']))).toBe(true)
   })
 })
 

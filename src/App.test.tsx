@@ -2,7 +2,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import App from './App'
 import { demoDataService } from './services/demoDataService'
-import { companyRequests } from './services/demoCompanyData'
+import { companyBills, companyInvoices, companyMonthEndItems, companyReconciliationAccounts, companyRequests, companyTransactions } from './services/demoCompanyData'
+import type { MonthEndItem } from './data/demoData'
 import { buildWorkTasks, summarizeTasks, type ClientRecords } from './services/workQueue'
 import { localIsoDate } from './services/inboxView'
 import { buildAutomationTasks } from './services/automationReminders'
@@ -24,7 +25,7 @@ const html = renderToStaticMarkup(<App user={{ sub: 'u1', email: 'pat@example.co
 const records: ClientRecords = {
   client: { id: demoClient.id, name: demoClient.name },
   transactions, invoices, bills, accounts: [], reconciliations: reconciliationAccounts,
-  requests: allDemoRequests,
+  requests: allDemoRequests.filter((request) => request.clientId === demoClient.id),
   monthEnd: monthEndItems,
   today: localIsoDate(new Date()),
 }
@@ -35,7 +36,17 @@ const recurringHistory = [
   ...visibleRecurringHistory,
 ]
 const recurringPatterns = recurringFromHistory(recurringHistory, '2026-10-15')
-const baseTasks = buildWorkTasks(records, clients.filter((client) => client.id !== demoClient.id))
+const otherCompanyTasks = ADDITIONAL_DEMO_CLIENT_IDS.flatMap((clientId) => {
+  const company = getAdditionalDemoCompany(clientId)
+  if (!company) return []
+  return buildWorkTasks({
+    client: { id: clientId, name: company.clientName },
+    transactions: companyTransactions(company), invoices: companyInvoices(company), bills: companyBills(company), accounts: [],
+    reconciliations: companyReconciliationAccounts(company), requests: companyRequests(company),
+    monthEnd: companyMonthEndItems(company, { year: 2026, month: 8 }) as MonthEndItem[], today: records.today,
+  })
+})
+const baseTasks = [...buildWorkTasks(records), ...otherCompanyTasks]
 const summary = summarizeTasks([...baseTasks, ...buildAutomationTasks(records.client, new Map(), recurringPatterns)])
 const metric = (label: string) => new RegExp(`${label}</span><strong>([^<]+)</strong>`).exec(html)?.[1]
 

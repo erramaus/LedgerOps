@@ -12,6 +12,7 @@ import { openRequest, requestTaskPriority, requestTaskStatus, summarizeRequest }
 import { isDueSoon, needsReview } from './payablesView'
 import { isOverdue, paymentStatus } from './receivablesView'
 import { getLines, needsCategory, uncategorizedLineCount } from './transactionReview'
+import { unusualAmounts } from './unusualAmounts'
 
 export type DataSource = 'demo' | 'quickbooks'
 export type TaskPriority = 'High' | 'Medium' | 'Low'
@@ -117,25 +118,31 @@ function taskFactory(client: ClientRef, into: WorkTask[]) {
 export function buildReviewTasks(records: ClientRecords): WorkTask[] {
   const tasks: WorkTask[] = []
   const add = taskFactory(records.client, tasks)
+  // Unusual amounts are judged against this client's own transactions only.
+  const unusualById = unusualAmounts(records.transactions)
 
   records.transactions.forEach((transaction, index) => {
     const amount = parseAmount(transaction.amount)
     const payee = transaction.payee?.trim()
     const knownPayee = Boolean(payee) && payee !== 'Unknown'
     const label = knownPayee ? payee : 'A transaction'
+    const unusual = unusualById.get(transaction.id)
+    // An unusual amount on a transaction that already needs categorizing, a payee or a receipt is shown on that task rather than as a second one.
+    const folded = unusual && (needsCategory(transaction) || !knownPayee || transaction.status === 'Needs Receipt')
+    const note = folded ? ` Also unusual: ${unusual.explanation}` : ''
     if (needsCategory(transaction)) {
       const missing = uncategorizedLineCount(transaction)
       const total = getLines(transaction).length
-      add({ id: `${transaction.id}-category`, type: 'Transactions', kind: 'uncategorized', issue: 'Uncategorized transaction', description: total > 1 ? `${label} has ${missing} of ${total} lines with no category.` : `${label} has no category or account.`, amount, priority: 'High', destination: 'Transactions', action: 'Categorize transaction' })
+      add({ id: `${transaction.id}-category`, type: 'Transactions', kind: 'uncategorized', issue: 'Uncategorized transaction', description: `${total > 1 ? `${label} has ${missing} of ${total} lines with no category.` : `${label} has no category or account.`}${note}`, amount, priority: 'High', destination: 'Transactions', action: 'Categorize transaction' })
     }
     if (!knownPayee) {
-      add({ id: `${transaction.id}-payee`, type: 'Transactions', kind: 'missing-payee', issue: 'Missing payee', description: 'This transaction needs a payee before it can be reviewed.', amount, priority: 'High', destination: 'Transactions', action: 'Add the payee' })
+      add({ id: `${transaction.id}-payee`, type: 'Transactions', kind: 'missing-payee', issue: 'Missing payee', description: `This transaction needs a payee before it can be reviewed.${needsCategory(transaction) ? '' : note}`, amount, priority: 'High', destination: 'Transactions', action: 'Add the payee' })
     }
-    if (amount >= 1000) {
-      add({ id: `${transaction.id}-large`, type: 'Transactions', kind: 'large-transaction', issue: 'Large transaction', description: `${label} is a large amount and may be worth a second look.`, amount, priority: 'Medium', suspected: true, destination: 'Transactions', action: 'Review transaction' })
+    if (unusual && !folded) {
+      add({ id: `${transaction.id}-large`, type: 'Transactions', kind: 'large-transaction', issue: 'Unusually large amount', description: unusual.explanation, amount, priority: unusual.basis === 'fallback' ? 'Low' : 'Medium', suspected: true, destination: 'Transactions', action: 'Review transaction' })
     }
     if (transaction.status === 'Needs Receipt') {
-      add({ id: `${transaction.id}-receipt`, type: 'Transactions', kind: 'needs-receipt', issue: 'May need receipt', description: `${label} may need supporting documentation.`, amount, priority: 'Medium', suspected: true, destination: 'Transactions', action: 'Request receipt' })
+      add({ id: `${transaction.id}-receipt`, type: 'Transactions', kind: 'needs-receipt', issue: 'May need receipt', description: `${label} may need supporting documentation.${needsCategory(transaction) || !knownPayee ? '' : note}`, amount, priority: 'Medium', suspected: true, destination: 'Transactions', action: 'Request receipt' })
     }
     const repeated = knownPayee && records.transactions.some((other, otherIndex) => otherIndex < index && other.payee === transaction.payee && other.amount === transaction.amount)
     if (repeated) {

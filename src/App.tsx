@@ -26,7 +26,7 @@ import {
   QUICKBOOKS_CLIENT_ID,
   buildReviewTasks,
   buildWorkTasks,
-  buildClientRequestTasks,
+  buildSummaryTasks,
   countByClient,
   filterTasks,
   isReviewTask,
@@ -38,6 +38,7 @@ import {
   taskStatuses,
   taskTypes,
   type ClientRecords,
+  monthEndPercent,
   type TaskPriority,
   type TaskStatus,
   type TaskType,
@@ -158,11 +159,14 @@ import {
 import { demoWorkpaperService } from "./services/demoWorkpaperService";
 import type { EntryTools } from "./MissingTransaction";
 import { DocumentPaymentActions } from "./DocumentPaymentActions";
-import { companyBills, companyClient, companyInvoices, companyLedgerRegister, companyReconciliationAccounts, companyReconSources, companyRequests, companyTransactions } from "./services/demoCompanyData";
+import { companyBills, companyClient, companyInvoices, companyLedgerRegister, companyMonthEndItems, companyReconciliationAccounts, companyReconSources, companyRequests, companyTransactions } from "./services/demoCompanyData";
+import type { MonthEndItem } from "./data/demoData";
+import { unusualAmountsByClient } from "./services/unusualAmounts";
 import { MonthEnd } from "./MonthEnd";
 import { PeriodPicker } from "./PeriodPicker";
 import { Reports } from "./Reports";
 import { useMonthEnd } from "./useMonthEnd";
+import { loadedDemoClientIds, useClientsMonthEnd, type ClientMonthEndContext } from "./useClientsMonthEnd";
 import { toMonthEndItems } from "./services/monthEndData";
 import { summarizeOpenItems } from "./services/openItems";
 import { agingFilters, emptyReceivableFilters, filterCounts, filterRows, formatLongDate, hasActiveFilters, invoiceDue, isOverdue, paymentFilters, paymentStatus, type AgingFilter, type ReceivableFilters, type ReceivableRow } from "./services/receivablesView";
@@ -423,36 +427,34 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
   };
   useEffect(() => {
     const generation = ++entryLoadGeneration.current;
-    const clientId = selectedClient?.id ?? demoClient.id;
     entriesRef.current = [];
     setDemoEntries([]);
-    demoEntryService.list(clientId).then((records) => { if (generation === entryLoadGeneration.current) { entriesRef.current = records; setDemoEntries(records); setEntriesError(null); } }, (error: unknown) => { if (generation === entryLoadGeneration.current) setEntriesError(error instanceof Error ? error.message : "Unknown error."); });
-  }, [selectedClient?.id, demoResetRevision]);
+    Promise.all(loadedDemoClientIds(selectedClient?.id, appDataSource).map((id) => demoEntryService.list(id))).then((lists) => { const records = lists.flat(); if (generation === entryLoadGeneration.current) { entriesRef.current = records; setDemoEntries(records); setEntriesError(null); } }, (error: unknown) => { if (generation === entryLoadGeneration.current) setEntriesError(error instanceof Error ? error.message : "Unknown error."); });
+  }, [selectedClient?.id, appDataSource, demoResetRevision]);
   const [journalRecords, setJournalRecords] = useState<DemoJournalRecord[]>([]);
   const journalsRef = useRef<DemoJournalRecord[]>([]);
   const journalLoadGeneration = useRef(0);
   useEffect(() => {
     const generation = ++journalLoadGeneration.current;
-    const clientId = selectedClient?.id ?? demoClient.id;
     journalsRef.current = [];
     setJournalRecords([]);
-    demoJournalService.list(clientId).then((records) => {
+    Promise.all(loadedDemoClientIds(selectedClient?.id, appDataSource).map((id) => demoJournalService.list(id))).then((lists) => {
+      const records = lists.flat();
       if (generation === journalLoadGeneration.current) {
         journalsRef.current = records;
         setJournalRecords(records);
       }
     }, () => undefined);
-  }, [selectedClient?.id, demoResetRevision]);
+  }, [selectedClient?.id, appDataSource, demoResetRevision]);
   const [paymentBooks, setPaymentBooks] = useState<DemoPaymentBook[]>([]);
   const paymentBooksRef = useRef<DemoPaymentBook[]>([]);
   const paymentLoadGeneration = useRef(0);
   useEffect(() => {
     const generation = ++paymentLoadGeneration.current;
-    const clientId = selectedClient?.id ?? demoClient.id;
     paymentBooksRef.current = [];
     setPaymentBooks([]);
-    demoPaymentService.list(clientId).then((books) => { if (generation === paymentLoadGeneration.current) { paymentBooksRef.current = books; setPaymentBooks(books); } }, () => undefined);
-  }, [selectedClient?.id, demoResetRevision]);
+    Promise.all(loadedDemoClientIds(selectedClient?.id, appDataSource).map((id) => demoPaymentService.list(id))).then((lists) => { const books = lists.flat(); if (generation === paymentLoadGeneration.current) { paymentBooksRef.current = books; setPaymentBooks(books); } }, () => undefined);
+  }, [selectedClient?.id, appDataSource, demoResetRevision]);
   const [workpapers, setWorkpapers] = useState<DemoWorkpaperRecord[]>([]);
   const workpapersRef = useRef<DemoWorkpaperRecord[]>([]);
   const workpaperLoadGeneration = useRef(0);
@@ -526,22 +528,25 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
     });
   }, [baseClients, demoEntries, journalRecords, paymentBooks]);
   // The books-versus-statement figures behind the work queue include manual entries, so a fixed difference stops being a task.
+  const companyReconciliationsNow = (company: NonNullable<typeof activeDemoCompany>) => companyReconciliationAccounts(company).map((account) => {
+    const ledgerId = company.reconciliationAccounts.find((item) => item.id === account.id)?.ledgerId;
+    const rows = ledgerId ? [...additionRegister(demoEntries, ledgerId, company.clientId), ...(ledgerId === "checking" ? paymentRegister(paymentBooks, "checking", company.clientId) : [])] : [];
+    const delta = rows.reduce((total, row) => total + (row.direction === "increase" ? row.amountCents : -row.amountCents), 0);
+    if (!delta) return account;
+    const quickBooksBalance = Math.round(account.quickBooksBalance * 100 + delta) / 100;
+    return { ...account, quickBooksBalance, status: Math.round(quickBooksBalance * 100) === Math.round(account.statementBalance * 100) ? "Ready to complete" : "Difference to resolve" };
+  });
+  const abcReconciliationsNow = () => reconciliationAccounts.map((account) => {
+    const ledgerId = DEMO_RECONCILIATION_ACCOUNTS.find((item) => item.id === account.id)?.ledgerId as "checking" | "card" | undefined;
+    const rows = ledgerId ? [...additionRegister(demoEntries, ledgerId), ...(ledgerId === "checking" ? paymentRegister(paymentBooks, "checking") : [])] : [];
+    const delta = rows.reduce((total, row) => total + (row.direction === "increase" ? row.amountCents : -row.amountCents), 0);
+    if (delta === 0) return account;
+    const quickBooksBalance = Math.round(account.quickBooksBalance * 100 + delta) / 100;
+    return { ...account, quickBooksBalance, status: Math.round(quickBooksBalance * 100) === Math.round(account.statementBalance * 100) ? "Ready to complete" : "Difference to resolve" };
+  });
   const reconciliationAccountsNow = useMemo(
-    () => activeDemoCompany ? companyReconciliationAccounts(activeDemoCompany).map((account) => {
-      const ledgerId = activeDemoCompany.reconciliationAccounts.find((item) => item.id === account.id)?.ledgerId;
-      const rows = ledgerId ? [...additionRegister(demoEntries, ledgerId, activeDemoClientId), ...(ledgerId === "checking" ? paymentRegister(paymentBooks, "checking", activeDemoClientId) : [])] : [];
-      const delta = rows.reduce((total, row) => total + (row.direction === "increase" ? row.amountCents : -row.amountCents), 0);
-      if (!delta) return account;
-      const quickBooksBalance = Math.round(account.quickBooksBalance * 100 + delta) / 100;
-      return { ...account, quickBooksBalance, status: Math.round(quickBooksBalance * 100) === Math.round(account.statementBalance * 100) ? "Ready to complete" : "Difference to resolve" };
-    }) : reconciliationAccounts.map((account) => {
-      const ledgerId = DEMO_RECONCILIATION_ACCOUNTS.find((item) => item.id === account.id)?.ledgerId as "checking" | "card" | undefined;
-      const rows = ledgerId ? [...additionRegister(demoEntries, ledgerId), ...(ledgerId === "checking" ? paymentRegister(paymentBooks, "checking") : [])] : [];
-      const delta = rows.reduce((total, row) => total + (row.direction === "increase" ? row.amountCents : -row.amountCents), 0);
-      if (delta === 0) return account;
-      const quickBooksBalance = Math.round(account.quickBooksBalance * 100 + delta) / 100;
-      return { ...account, quickBooksBalance, status: Math.round(quickBooksBalance * 100) === Math.round(account.statementBalance * 100) ? "Ready to complete" : "Difference to resolve" };
-    }),
+    () => activeDemoCompany ? companyReconciliationsNow(activeDemoCompany) : abcReconciliationsNow(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [activeDemoCompany, activeDemoClientId, demoEntries, paymentBooks],
   );
 
@@ -1322,10 +1327,46 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
     [recurringHistory, scopedRecurringDecisions, todayIso],
   );
   const ruleSuggestionMap = useMemo(() => new Map(records.transactions.map((transaction) => [transaction.id, bestRuleMatch(scopedRules, transaction)]).filter((entry): entry is [string, NonNullable<ReturnType<typeof bestRuleMatch>>] => Boolean(entry[1]))), [records.transactions, scopedRules]);
-  const otherClientRequestTasks = source === "demo" && !selectedClient
-    ? clients.filter((client) => client.id !== records.client.id).flatMap((client) => buildClientRequestTasks({ id: client.id, name: client.name }, allDemoRequests.filter((request) => request.clientId === client.id)))
-    : [];
-  const baseTasks = queueAvailable ? [...buildWorkTasks(records, source === "demo" ? clients.filter((client) => client.id !== records.client.id) : []), ...otherClientRequestTasks].map((task) => {
+  // Under All clients every demo company contributes its own item-level tasks, built from the same records its tabs show.
+  const otherClientBase = useMemo<ClientRecords[]>(() => {
+    if (source !== "demo") return [];
+    return [demoClient.id, ...ADDITIONAL_DEMO_CLIENT_IDS].filter((id) => id !== dataClient.id).flatMap((id) => {
+      const company = getAdditionalDemoCompany(id);
+      const name = company?.clientName ?? demoClient.name;
+      const clientRequests = allDemoRequests.filter((request) => request.clientId === id);
+      const clientTransactions = allClientTransactions.filter((transaction) => transaction.clientId === id).map((transaction) => relevantTransactionStatus(transaction, clientRequests));
+      return [{
+        client: { id, name },
+        transactions: clientTransactions,
+        invoices: company ? companyInvoices(company, paymentBooks) : invoicesWithPayments(demoInvoices, paymentBooks),
+        bills: company ? companyBills(company, paymentBooks) : billsWithPayments(demoBills, paymentBooks),
+        accounts: [],
+        reconciliations: company ? companyReconciliationsNow(company) : abcReconciliationsNow(),
+        requests: clientRequests,
+        monthEnd: company ? companyMonthEndItems(company, { year: 2026, month: 8 }) as MonthEndItem[] : [],
+        today: todayIso,
+      }];
+    });
+  }, // eslint-disable-next-line react-hooks/exhaustive-deps
+  [source, dataClient.id, allDemoRequests, allClientTransactions, paymentBooks, demoEntries, todayIso]);
+  // Each other company's month-end checks come from its own stored reconciliations and sign-offs. Until they load (or if they cannot be read) the static, never-complete list stands in.
+  const otherClientContexts = useMemo<ClientMonthEndContext[]>(() => otherClientBase.map((item) => {
+    const company = getAdditionalDemoCompany(item.client.id);
+    return { id: item.client.id, name: item.client.name, ledger: mergeDemoPayments(paymentBooks, mergeDemoJournals(journalRecords, mergedLedger(demoEntries, company?.ledger, item.client.id), item.client.id), item.client.id), transactions: item.transactions, requests: item.requests };
+  }), [otherClientBase, paymentBooks, journalRecords, demoEntries]);
+  const otherClientMonthEnd = useClientsMonthEnd({ enabled: source === "demo" && !selectedClient && ["Dashboard", "Clients", "Inbox", "Bookkeeping Review"].includes(view), contexts: otherClientContexts, period, today: todayIso, refreshToken: `${view}:${demoResetRevision}` });
+  const otherClientRecords = useMemo<ClientRecords[]>(() => otherClientBase.map((item) => {
+    const stored = otherClientMonthEnd[item.client.id];
+    return stored ? { ...item, monthEnd: stored } : item;
+  }), [otherClientBase, otherClientMonthEnd]);
+  const otherClientTasks = otherClientRecords.flatMap((client) => {
+    const detailed = buildWorkTasks(client);
+    // Until ABC Plumbing's stored month-end state is read, its summary figure stands in rather than implying it is finished.
+    if (client.client.id !== demoClient.id || otherClientMonthEnd[client.client.id]) return detailed;
+    const summary = clients.find((item) => item.id === client.client.id);
+    return [...detailed, ...(summary ? buildSummaryTasks([summary]).filter((task) => task.kind === "summary-month-end") : [])];
+  });
+  const baseTasks = queueAvailable ? [...buildWorkTasks(records), ...otherClientTasks].map((task) => {
     if (task.kind !== "uncategorized" || !task.recordId) return task;
     const match = ruleSuggestionMap.get(task.recordId);
     return match ? { ...task, priority: match.rule.reviewPriority, issue: "Uncategorized transaction with rule suggestion", description: `${task.description} Rule "${match.rule.name}" suggests ${match.rule.category}.`, automationId: match.rule.id, status: "Ready to review" as const } : task;
@@ -1335,8 +1376,13 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
   // A dismissed finding leaves every screen's queue until its source record changes.
   const latestReviewDecisions = latestDecisions(reviewDecisions);
   const sourceRecords = { transactions: records.transactions, invoices: records.invoices, bills: records.bills };
+  // Each finding is fingerprinted against its own client's records, never another company's.
+  const sourceRecordsFor = (task: WorkTask) => {
+    const owner = task.clientId === records.client.id ? records : otherClientRecords.find((item) => item.client.id === task.clientId) ?? records;
+    return owner === records ? sourceRecords : { transactions: owner.transactions, invoices: owner.invoices, bills: owner.bills };
+  };
   const isDismissedFinding = (task: WorkTask) =>
-    isAccountingFinding(task) && isDismissalCurrent(latestReviewDecisions.get(decisionKey(source, task.id)), sourceFingerprint(task, sourceRecords));
+    isAccountingFinding(task) && isDismissalCurrent(latestReviewDecisions.get(decisionKey(source, task.id)), sourceFingerprint(task, sourceRecordsFor(task)));
   const allTasks = allTasksUnfiltered.filter((task) => !isDismissedFinding(task));
   const dismissedFindings = filterTasks(allTasksUnfiltered.filter(isDismissedFinding), { clientId: source === "demo" && selectedClient ? selectedClient.id : null });
   const recordReviewDecision = (task: WorkTask, status: ReviewDecision["status"], reason?: string) => {
@@ -1354,7 +1400,7 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
       reason,
       actor: "Bookkeeper",
       at: new Date().toISOString(),
-      fingerprint: sourceFingerprint(task, sourceRecords),
+      fingerprint: sourceFingerprint(task, sourceRecordsFor(task)),
     };
     setReviewDecisions((current) => [decision, ...current]);
   };
@@ -1367,7 +1413,12 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
   const hasDetail = !activeClient || activeClient.id === demoClient.id || ADDITIONAL_DEMO_CLIENT_IDS.includes(activeClient.id);
   const showNoDetail = Boolean(activeClient) && !hasDetail && detailViews.includes(view);
   const scopeName = source === "demo" ? activeClient?.name ?? demoClient.name : sandboxName;
-  const clientMonthEnd = (client: Client) => (client.id === demoClient.id || ADDITIONAL_DEMO_CLIENT_IDS.includes(client.id) ? (selectedClient?.id === client.id && monthEndView.checklist ? completionPercent(monthEndView.checklist) : client.monthEnd) : null);
+  const clientMonthEnd = (client: Client) => {
+    if (client.id !== demoClient.id && !ADDITIONAL_DEMO_CLIENT_IDS.includes(client.id)) return null;
+    if (selectedClient?.id === client.id && monthEndView.checklist) return completionPercent(monthEndView.checklist);
+    const stored = otherClientMonthEnd[client.id];
+    return stored ? monthEndPercent(stored) : client.monthEnd;
+  };
   const openedMonthEnd = source === "demo" ? (selectedClient ? clientMonthEnd(selectedClient) : null) : monthEndView.checklist ? completionPercent(monthEndView.checklist) : null;
 
   const entryTools: EntryTools | undefined = source === "demo"
@@ -1410,9 +1461,11 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
     }
     // A task about one record opens that record, so the user does not have to find it again.
     if (task.recordId) {
-      const transaction = (source === "demo" ? transactions : reviewData?.transactions ?? []).find((item) => item.id === task.recordId);
-      const invoice = (source === "demo" ? invoices : reviewData?.invoices ?? []).find((item) => item.id === task.recordId);
-      const bill = (source === "demo" ? bills : reviewData?.bills ?? []).find((item) => item.id === task.recordId);
+      // The owner's records are read directly: the client selection above has not rendered yet.
+      const owner = source === "demo" ? (task.clientId === records.client.id ? records : otherClientRecords.find((item) => item.client.id === task.clientId) ?? records) : null;
+      const transaction = (owner ? owner.transactions : reviewData?.transactions ?? []).find((item) => item.id === task.recordId);
+      const invoice = (owner ? owner.invoices : reviewData?.invoices ?? []).find((item) => item.id === task.recordId);
+      const bill = (owner ? owner.bills : reviewData?.bills ?? []).find((item) => item.id === task.recordId);
       if (task.destination === "Transactions" && transaction) { setSelectedTransaction(transaction); setView("Transactions"); return; }
       if (task.destination === "Receivables" && invoice) { setSelectedInvoice(invoice); setView("Receivables"); return; }
       if (task.destination === "Payables" && bill) { setSelectedBill(bill); setView("Payables"); return; }
@@ -1578,13 +1631,13 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
             period={period}
             today={todayIso}
             monthEndFor={clientMonthEnd}
-            monthEndLive={(client) => selectedClient?.id === client.id && Boolean(monthEndView.checklist)}
+            monthEndLive={(client) => (selectedClient?.id === client.id && Boolean(monthEndView.checklist)) || Boolean(otherClientMonthEnd[client.id])}
             onOpen={openClient}
             onOpenReconcile={(client) => { selectClient(client); setView("Reconcile"); }}
             onOpenCompany={openCompany}
           />
         ) : view === "Bookkeeping Review" ? (
-          <BookkeepingReview source={source} rows={buildFindingRows({ source, live: visibleTasks.filter(isAccountingFinding), dismissed: dismissedFindings.filter(isAccountingFinding), decisions: reviewDecisions, records: sourceRecords, detailClientId: records.client.id })} history={reviewDecisions.filter((decision) => decision.source === source && (!activeClient || decision.clientId === activeClient.id))} decisionsSaved={reviewDecisionsSaved} available={queueAvailable} loading={reviewLoading} error={reviewError} today={localIsoDate(currentDate)} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onReview={reviewFinding} onDismiss={(task, reason) => recordReviewDecision(task, "dismissed", reason)} onReopen={(task) => recordReviewDecision(task, "reopened")} />
+          <BookkeepingReview source={source} rows={buildFindingRows({ source, live: visibleTasks.filter(isAccountingFinding), dismissed: dismissedFindings.filter(isAccountingFinding), decisions: reviewDecisions, records: sourceRecordsFor, detailClientId: source === "demo" && !activeClient ? null : records.client.id })} history={reviewDecisions.filter((decision) => decision.source === source && (!activeClient || decision.clientId === activeClient.id))} decisionsSaved={reviewDecisionsSaved} available={queueAvailable} loading={reviewLoading} error={reviewError} today={localIsoDate(currentDate)} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onReview={reviewFinding} onDismiss={(task, reason) => recordReviewDecision(task, "dismissed", reason)} onReopen={(task) => recordReviewDecision(task, "reopened")} />
         ) : view === "Inbox" ? (
           <Inbox tasks={visibleTasks} source={source} available={queueAvailable} loading={reviewLoading} error={reviewError} scopeLabel={activeClient?.name ?? (source === "demo" ? "All clients" : sandboxName)} today={localIsoDate(currentDate)} onOpenTask={openTask} />
         ) : view === "Transactions" ? (
@@ -3862,9 +3915,11 @@ function Transactions({
   const rangeInvalid = Boolean(range.from && range.to && range.from > range.to);
 
   const everything = source === "demo" ? transactions : quickBooksTransactions;
+  // "Unusually large" is judged per client against that client's own history, never against the whole list.
+  const unusualIds = useMemo(() => new Set(unusualAmountsByClient(everything).keys()), [everything]);
   // Client, date, search and category scope every count; status and reason then narrow the list.
   const scoped = filterTransactions(everything, { clientId, category, search, range: rangeInvalid ? {} : range });
-  const reasonScoped = scoped.filter((transaction) => matchesReason(transaction, reason));
+  const reasonScoped = scoped.filter((transaction) => matchesReason(transaction, reason, unusualIds));
   const reviewQueue = reasonScoped.filter(needsAttention);
   const filteredTransactions = reasonScoped.filter((transaction) => filter === "All" || categorizationStatus(transaction) === filter);
   const filtersActive = filter !== "All" || reason !== "Any" || search.trim() !== "" || category !== "All" || dateMode !== "all";
@@ -3986,7 +4041,7 @@ function Transactions({
           {reasonFilters.map((option) => (
             <button className={`filter-button ${reason === option ? "active" : ""}`} key={option} aria-pressed={reason === option} onClick={() => setReason(option)}>
               {option === "Any" ? "Any reason" : option}
-              <span>{scoped.filter((transaction) => matchesReason(transaction, option)).length}</span>
+              <span>{scoped.filter((transaction) => matchesReason(transaction, option, unusualIds)).length}</span>
             </button>
           ))}
         </div>
@@ -4014,7 +4069,7 @@ function Transactions({
         )}
         {filteredTransactions.map((transaction) => {
           const actionable = needsAttention(transaction);
-          const extra = reviewReasons(transaction);
+          const extra = reviewReasons(transaction, unusualIds);
           return (
             <button
               className="transaction-row"

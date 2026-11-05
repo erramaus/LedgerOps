@@ -1,4 +1,5 @@
 import type { LedgerAccount, LedgerTransaction, Transaction, TransactionLine, TransactionStatus } from './bookkeepingTypes'
+import { FALLBACK_LIMIT } from './unusualAmounts'
 
 export const SPLIT_CATEGORY = 'Split'
 export type LineChange = { lineId: string; category: string; categoryId?: string }
@@ -94,7 +95,7 @@ export function matchesReviewFilter(transaction: Transaction, filter: ReviewFilt
   if (filter === 'Missing Category') return needsCategory(transaction)
   if (filter === 'Missing Payee') return !transaction.payee || transaction.payee === 'Unknown'
   if (filter === 'Needs Receipt') return transaction.status === 'Needs Receipt'
-  return parseAmount(transaction.amount) >= 1000
+  return parseAmount(transaction.amount) >= FALLBACK_LIMIT
 }
 
 /** Categorization state only; a missing receipt is a separate requirement (see needsReceipt). */
@@ -112,17 +113,18 @@ export const needsAttention = (transaction: Transaction) => categorizationStatus
 export type ReasonFilter = 'Any' | 'Missing category' | 'Missing payee' | 'Missing receipt' | 'Large transaction'
 export const reasonFilters: ReasonFilter[] = ['Any', 'Missing category', 'Missing payee', 'Missing receipt', 'Large transaction']
 
-export function matchesReason(transaction: Transaction, reason: ReasonFilter) {
+export function matchesReason(transaction: Transaction, reason: ReasonFilter, unusual?: ReadonlySet<string>) {
   if (reason === 'Any') return true
   if (reason === 'Missing category') return needsCategory(transaction)
   if (reason === 'Missing payee') return !transaction.payee || transaction.payee === 'Unknown'
   if (reason === 'Missing receipt') return needsReceipt(transaction)
-  return parseAmount(transaction.amount) >= 1000
+  // With the client's history the unusual-amount check is client-aware; on its own only the conservative fixed limit applies.
+  return unusual ? unusual.has(transaction.id) : parseAmount(transaction.amount) >= FALLBACK_LIMIT
 }
 
 /** Plain-language reasons a transaction needs a bookkeeper's attention, independent of its status label. */
-export function reviewReasons(transaction: Transaction): string[] {
-  return reasonFilters.filter((reason) => reason !== 'Any' && matchesReason(transaction, reason))
+export function reviewReasons(transaction: Transaction, unusual?: ReadonlySet<string>): string[] {
+  return reasonFilters.filter((reason) => reason !== 'Any' && matchesReason(transaction, reason, unusual))
 }
 
 const MONTH_NAMES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
@@ -171,6 +173,7 @@ export type TransactionFilters = {
   status?: TransactionStatus | 'All'
   categorization?: StatusFilter
   reason?: ReasonFilter
+  unusual?: ReadonlySet<string>
   range?: DateRange
   category?: string
   search?: string
@@ -182,7 +185,7 @@ export function filterTransactions<T extends Transaction>(transactions: T[], fil
     if (filters.clientId && transaction.clientId && transaction.clientId !== filters.clientId) return false
     if (filters.status && filters.status !== 'All' && transaction.status !== filters.status) return false
     if (filters.categorization && filters.categorization !== 'All' && categorizationStatus(transaction) !== filters.categorization) return false
-    if (filters.reason && !matchesReason(transaction, filters.reason)) return false
+    if (filters.reason && !matchesReason(transaction, filters.reason, filters.unusual)) return false
     if (!inDateRange(transaction, filters.range)) return false
     if (filters.category && filters.category !== 'All' && !getLines(transaction).some((line) => line.category === filters.category)) return false
     if (search) {
