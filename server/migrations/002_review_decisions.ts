@@ -20,6 +20,33 @@ const EXPECTED_COLUMNS = [
   ['version', 'int4', 'NO'],
 ] as const
 
+type TriggerMetadata = {
+  trigger_type: number
+  enabled: string
+  function_schema: string
+  function_name: string
+  unconditional: boolean
+  all_columns: boolean
+  argument_count: number
+  internal: boolean
+}
+
+export function isExpectedReviewDecisionTrigger(
+  trigger: TriggerMetadata | undefined,
+  schema: string,
+  expectedType: number,
+) {
+  return Boolean(trigger
+    && trigger.trigger_type === expectedType
+    && trigger.enabled === 'O'
+    && trigger.function_schema === schema
+    && trigger.function_name === 'ledgerops_reject_review_decision_mutation'
+    && trigger.unconditional
+    && trigger.all_columns
+    && trigger.argument_count === 0
+    && !trigger.internal)
+}
+
 async function validateReviewDecisionSchema(client: PoolClient) {
   const schema = (await client.query<{ schema_name: string }>('SELECT current_schema() AS schema_name')).rows[0]?.schema_name
   if (!schema) throw new Error('Review decision migration has no current schema.')
@@ -104,41 +131,42 @@ async function validateReviewDecisionSchema(client: PoolClient) {
       throw new Error(`Existing review_decisions table is missing expected constraint "${name}"; migration 002 made no changes.`)
     }
   }
-  const functions = await client.query<{ definition: string }>(
-    `SELECT pg_get_functiondef(function_data.oid) AS definition
+  const functions = await client.query<{ body: string; language: string }>(
+    `SELECT function_data.prosrc AS body, language_data.lanname AS language
      FROM pg_catalog.pg_proc function_data
      JOIN pg_catalog.pg_namespace namespace_data ON namespace_data.oid = function_data.pronamespace
+     JOIN pg_catalog.pg_language language_data ON language_data.oid = function_data.prolang
      WHERE namespace_data.nspname = $1 AND function_data.proname = 'ledgerops_reject_review_decision_mutation'
+       AND function_data.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype
        AND pg_catalog.pg_get_function_identity_arguments(function_data.oid) = ''`,
     [schema],
   )
-  const trigger = await client.query<{ definition: string; enabled: string }>(
-    `SELECT pg_get_triggerdef(trigger_data.oid) AS definition, trigger_data.tgenabled AS enabled
+  const triggers = await client.query<TriggerMetadata & { trigger_name: string }>(
+    `SELECT trigger_data.tgname AS trigger_name, trigger_data.tgtype AS trigger_type,
+            trigger_data.tgenabled AS enabled, function_namespace.nspname AS function_schema,
+            function_data.proname AS function_name, trigger_data.tgqual IS NULL AS unconditional,
+            trigger_data.tgattr = ''::pg_catalog.int2vector AS all_columns,
+            trigger_data.tgnargs AS argument_count, trigger_data.tgisinternal AS internal
      FROM pg_catalog.pg_trigger trigger_data
      JOIN pg_catalog.pg_class table_data ON table_data.oid = trigger_data.tgrelid
      JOIN pg_catalog.pg_namespace namespace_data ON namespace_data.oid = table_data.relnamespace
-     WHERE namespace_data.nspname = $1 AND table_data.relname = $2 AND trigger_data.tgname = 'review_decisions_append_only'`,
+     JOIN pg_catalog.pg_proc function_data ON function_data.oid = trigger_data.tgfoid
+     JOIN pg_catalog.pg_namespace function_namespace ON function_namespace.oid = function_data.pronamespace
+     WHERE namespace_data.nspname = $1 AND table_data.relname = $2
+       AND trigger_data.tgname IN ('review_decisions_append_only', 'review_decisions_truncate_guard')`,
     [schema, TABLE],
   )
-  const truncateTrigger = await client.query<{ definition: string; enabled: string }>(
-    `SELECT pg_get_triggerdef(trigger_data.oid) AS definition, trigger_data.tgenabled AS enabled
-     FROM pg_catalog.pg_trigger trigger_data
-     JOIN pg_catalog.pg_class table_data ON table_data.oid = trigger_data.tgrelid
-     JOIN pg_catalog.pg_namespace namespace_data ON namespace_data.oid = table_data.relnamespace
-     WHERE namespace_data.nspname = $1 AND table_data.relname = $2 AND trigger_data.tgname = 'review_decisions_truncate_guard'`,
-    [schema, TABLE],
-  )
-  if (!functions.rows[0]?.definition.includes('RAISE EXCEPTION') || !functions.rows[0].definition.includes('RETURN OLD')) {
+  if (functions.rows[0]?.language !== 'plpgsql'
+    || !/^\s*BEGIN\s+RAISE\s+EXCEPTION\s+'review_decisions is append-only'\s*;\s*RETURN\s+OLD\s*;\s*END\s*;\s*$/i.test(functions.rows[0].body)) {
     throw new Error('Review decision append-only trigger function is missing or incompatible; migration 002 made no changes.')
   }
-  if (!trigger.rows[0]?.definition.includes('BEFORE UPDATE OR DELETE')
-    || !trigger.rows[0].definition.includes('ledgerops_reject_review_decision_mutation')
-    || trigger.rows[0].enabled !== 'O') {
+  // PostgreSQL tgtype bits: row=1, before=2, delete=8, update=16, truncate=32.
+  const appendOnly = triggers.rows.find((trigger) => trigger.trigger_name === 'review_decisions_append_only')
+  if (!isExpectedReviewDecisionTrigger(appendOnly, schema, 1 | 2 | 8 | 16)) {
     throw new Error('Review decision append-only trigger is missing or incompatible; migration 002 made no changes.')
   }
-  if (!truncateTrigger.rows[0]?.definition.includes('BEFORE TRUNCATE')
-    || !truncateTrigger.rows[0].definition.includes('ledgerops_reject_review_decision_mutation')
-    || truncateTrigger.rows[0].enabled !== 'O') {
+  const truncateGuard = triggers.rows.find((trigger) => trigger.trigger_name === 'review_decisions_truncate_guard')
+  if (!isExpectedReviewDecisionTrigger(truncateGuard, schema, 2 | 32)) {
     throw new Error('Review decision truncate guard is missing or incompatible; migration 002 made no changes.')
   }
 }

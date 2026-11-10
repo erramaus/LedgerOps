@@ -1,7 +1,8 @@
 import pg from 'pg'
 import { afterEach, describe, expect, it } from 'vitest'
 import { initialStoreSchemaMigration } from './migrations/001_initial_store_schema.js'
-import { assertMigrationsCurrent, assertMigrationExecutionPolicy, migrations, runMigrations } from './migrations.js'
+import { isExpectedReviewDecisionTrigger, reviewDecisionsMigration } from './migrations/002_review_decisions.js'
+import { assertMigrationsCurrent, assertMigrationExecutionPolicy, migrationChecksum, migrations, runMigrations } from './migrations.js'
 import { createIsolatedSchema, decideFromEnvironment, type IsolatedSchema } from './testDatabase.js'
 
 const decision = decideFromEnvironment()
@@ -56,6 +57,60 @@ describe.skipIf(!decision.ok)('PostgreSQL versioned migrations', () => {
       'reconciliation_records',
       'review_decisions',
     ])
+  })
+
+  it('accepts PostgreSQL trigger catalog metadata and its canonical DELETE OR UPDATE definition', async () => {
+    const database = await openIsolatedDatabase()
+    const pool = database.connect()
+    await pool.query(reviewDecisionsMigration.up)
+    const result = await pool.query<{ definition: string; trigger_type: number }>(
+      `SELECT pg_get_triggerdef(t.oid) AS definition, t.tgtype AS trigger_type
+       FROM pg_catalog.pg_trigger t
+       JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = current_schema() AND c.relname = 'review_decisions'
+         AND t.tgname = 'review_decisions_append_only'`,
+    )
+    expect(result.rows).toHaveLength(1)
+    expect(result.rows[0].definition).toContain('BEFORE DELETE OR UPDATE')
+    expect(result.rows[0].trigger_type).toBe(27)
+    expect(await runMigrations(pool)).toEqual([1, 2])
+  })
+
+  it.each([
+    ['missing DELETE', `DROP TRIGGER review_decisions_append_only ON review_decisions;
+      CREATE TRIGGER review_decisions_append_only BEFORE UPDATE ON review_decisions
+      FOR EACH ROW EXECUTE FUNCTION ledgerops_reject_review_decision_mutation()`],
+    ['AFTER timing', `DROP TRIGGER review_decisions_append_only ON review_decisions;
+      CREATE TRIGGER review_decisions_append_only AFTER UPDATE OR DELETE ON review_decisions
+      FOR EACH ROW EXECUTE FUNCTION ledgerops_reject_review_decision_mutation()`],
+    ['statement level', `DROP TRIGGER review_decisions_append_only ON review_decisions;
+      CREATE TRIGGER review_decisions_append_only BEFORE UPDATE OR DELETE ON review_decisions
+      FOR EACH STATEMENT EXECUTE FUNCTION ledgerops_reject_review_decision_mutation()`],
+    ['conditional trigger', `DROP TRIGGER review_decisions_append_only ON review_decisions;
+      CREATE TRIGGER review_decisions_append_only BEFORE UPDATE OR DELETE ON review_decisions
+      FOR EACH ROW WHEN (false) EXECUTE FUNCTION ledgerops_reject_review_decision_mutation()`],
+    ['column-specific UPDATE', `DROP TRIGGER review_decisions_append_only ON review_decisions;
+      CREATE TRIGGER review_decisions_append_only BEFORE UPDATE OF status OR DELETE ON review_decisions
+      FOR EACH ROW EXECUTE FUNCTION ledgerops_reject_review_decision_mutation()`],
+    ['wrong function', `CREATE FUNCTION other_review_guard() RETURNS trigger LANGUAGE plpgsql
+      AS $$ BEGIN RETURN OLD; END; $$;
+      DROP TRIGGER review_decisions_append_only ON review_decisions;
+      CREATE TRIGGER review_decisions_append_only BEFORE UPDATE OR DELETE ON review_decisions
+      FOR EACH ROW EXECUTE FUNCTION other_review_guard()`],
+    ['disabled trigger', 'ALTER TABLE review_decisions DISABLE TRIGGER review_decisions_append_only'],
+    ['missing truncate guard', 'DROP TRIGGER review_decisions_truncate_guard ON review_decisions'],
+    ['disabled truncate guard', 'ALTER TABLE review_decisions DISABLE TRIGGER review_decisions_truncate_guard'],
+    ['modified guard function', `CREATE OR REPLACE FUNCTION ledgerops_reject_review_decision_mutation()
+      RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF false THEN RAISE EXCEPTION 'review_decisions is append-only'; END IF; RETURN OLD; END; $$`],
+  ])('rejects a pre-existing review decision schema with %s', async (_label, mutation) => {
+    const database = await openIsolatedDatabase()
+    const pool = database.connect()
+    await pool.query(reviewDecisionsMigration.up)
+    await pool.query(mutation)
+
+    await expect(runMigrations(pool)).rejects.toThrow(/Review decision (append-only trigger|truncate guard)/)
+    expect(await database.schema.ownTables()).toEqual(['review_decisions'])
   })
 
   it('diagnoses a SQL failure with its migration and SQLSTATE, then rolls back', async () => {
@@ -188,6 +243,44 @@ describe.skipIf(!decision.ok)('PostgreSQL versioned migrations', () => {
     expect(columns.rows.map((row) => row.column_name)).toEqual(['id'])
     const tracking = await pool.query(`SELECT to_regclass(format('%I.%I', current_schema()::text, 'ledgerops_schema_migrations'::text))::text AS relation_name`)
     expect(tracking.rows[0]?.relation_name).toBeNull()
+  })
+})
+
+describe('review decision trigger validation', () => {
+  const valid = {
+    trigger_type: 27,
+    enabled: 'O',
+    function_schema: 'test_schema',
+    function_name: 'ledgerops_reject_review_decision_mutation',
+    unconditional: true,
+    all_columns: true,
+    argument_count: 0,
+    internal: false,
+  }
+
+  it('accepts PostgreSQL catalog flags for both append-only and truncate guards', () => {
+    expect(isExpectedReviewDecisionTrigger(valid, 'test_schema', 27)).toBe(true)
+    expect(isExpectedReviewDecisionTrigger({ ...valid, trigger_type: 34 }, 'test_schema', 34)).toBe(true)
+  })
+
+  it.each([
+    ['missing trigger', undefined],
+    ['missing DELETE', { ...valid, trigger_type: 19 }],
+    ['AFTER trigger', { ...valid, trigger_type: 25 }],
+    ['statement trigger', { ...valid, trigger_type: 26 }],
+    ['disabled trigger', { ...valid, enabled: 'D' }],
+    ['other function schema', { ...valid, function_schema: 'other' }],
+    ['other function', { ...valid, function_name: 'other' }],
+    ['conditional trigger', { ...valid, unconditional: false }],
+    ['column-specific trigger', { ...valid, all_columns: false }],
+    ['trigger arguments', { ...valid, argument_count: 1 }],
+    ['internal trigger', { ...valid, internal: true }],
+  ])('rejects %s', (_label, trigger) => {
+    expect(isExpectedReviewDecisionTrigger(trigger, 'test_schema', 27)).toBe(false)
+  })
+
+  it('preserves the released migration 002 checksum', () => {
+    expect(migrationChecksum(reviewDecisionsMigration)).toBe('7904dc33481e7c6ee2adb00c507c233a68fd30844d69166a5d54abd87d1c5e26')
   })
 })
 
