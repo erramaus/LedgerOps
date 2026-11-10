@@ -47,7 +47,6 @@ jobs:
     env:
       LEDGEROPS_TEST_DATABASE_URL: postgresql://postgres:ledgerops_test_only@127.0.0.1:5432/ledgerops_test
       LEDGEROPS_REQUIRE_POSTGRES: "true"
-      POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -65,11 +64,17 @@ jobs:
         run: node --import tsx server/postgresRequired.check.ts
 
       - name: Run required PostgreSQL storage tests
+        env:
+          POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
         run: npx vitest run server/storageContract.test.ts server/migrations.test.ts server/migrationDiagnostic.test.ts server/reviewDecisionStore.test.ts server/reviewDecisions.test.ts --reporter=json --outputFile "$POSTGRES_TEST_REPORT"
 
       - name: Reject skipped or missing PostgreSQL coverage
+        env:
+          POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
         run: node scripts/assert-postgres-vitest-report.mjs "$POSTGRES_TEST_REPORT"
 
       - name: Remove temporary test report
+        env:
+          POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
         if: always()
         run: rm -f "$POSTGRES_TEST_REPORT"
