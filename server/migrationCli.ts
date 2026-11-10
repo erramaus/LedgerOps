@@ -1,18 +1,29 @@
 import 'dotenv/config'
 import pg from 'pg'
 import { loadConfig } from './config.js'
-import { assertMigrationExecutionPolicy, MigrationError, runMigrations } from './migrations.js'
+import {
+  assertMigrationExecutionPolicy,
+  getMigrationDiagnosticFailure,
+  MigrationError,
+  migrations,
+  runMigrations,
+} from './migrations.js'
 
 async function main() {
   const config = loadConfig(process.env)
   const databaseUrl = process.env.DATABASE_URL?.trim()
   if (!databaseUrl) throw new MigrationError('DATABASE_URL is required to run migrations.')
 
+  const diagnostic = process.argv.includes('--diagnose')
   assertMigrationExecutionPolicy(config.app.production, process.argv, process.env)
 
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 })
   try {
-    const applied = await runMigrations(pool)
+    const applied = await runMigrations(pool, migrations, { diagnostic })
+    if (diagnostic) {
+      console.log('Migration diagnostic succeeded; pending migrations were rolled back and no schema changes were committed.')
+      return
+    }
     if (applied.length === 0) {
       console.log('Database schema is already current.')
     } else {
@@ -24,7 +35,22 @@ async function main() {
 }
 
 main().catch((error: unknown) => {
-  if (error instanceof MigrationError) console.error(error.message)
+  if (process.argv.includes('--diagnose')) {
+    const diagnostic = getMigrationDiagnosticFailure(error)
+    if (diagnostic && !diagnostic.rollbackConfirmed) {
+      console.error('ROLLBACK NOT CONFIRMED. Migration diagnostic details and connection information are suppressed.')
+    } else if (diagnostic) {
+      console.error(JSON.stringify({
+        migrationNumber: diagnostic.migrationNumber,
+        failingStep: diagnostic.step,
+        postgresErrorCode: diagnostic.postgresCode,
+      }))
+    } else if (error instanceof MigrationError) {
+      console.error(error.message)
+    } else {
+      console.error('Migration diagnostic failed; details and connection information are suppressed.')
+    }
+  } else if (error instanceof MigrationError) console.error(error.message)
   else console.error('Migration failed. Database error details and connection information are suppressed.')
   process.exitCode = 1
 })

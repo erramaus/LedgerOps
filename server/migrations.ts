@@ -21,6 +21,39 @@ export class MigrationError extends Error {
   }
 }
 
+export class MigrationDiagnosticError extends Error {
+  constructor(
+    readonly migrationNumber: number | null,
+    readonly step: string,
+    readonly postgresCode: string | null,
+  ) {
+    super('Migration diagnostic failed.')
+    this.name = 'MigrationDiagnosticError'
+  }
+}
+
+export type MigrationDiagnosticFailure =
+  | { rollbackConfirmed: true; migrationNumber: number | null; step: string; postgresCode: string | null }
+  | { rollbackConfirmed: false }
+
+export function getMigrationDiagnosticFailure(error: unknown): MigrationDiagnosticFailure | undefined {
+  if (error instanceof AggregateError) return { rollbackConfirmed: false }
+  if (error instanceof MigrationDiagnosticError) {
+    return {
+      rollbackConfirmed: true,
+      migrationNumber: error.migrationNumber,
+      step: error.step,
+      postgresCode: error.postgresCode,
+    }
+  }
+  return undefined
+}
+
+type MigrationRunOptions = {
+  /** Executes pending DDL in a transaction and rolls it back instead of committing. */
+  diagnostic?: boolean
+}
+
 export function assertMigrationExecutionPolicy(
   production: boolean,
   args: string[],
@@ -130,24 +163,39 @@ function validateAppliedMigrations(
   }
 }
 
-export async function runMigrations(pool: Pool, items: readonly Migration[] = migrations): Promise<number[]> {
+export async function runMigrations(
+  pool: Pool,
+  items: readonly Migration[] = migrations,
+  options: MigrationRunOptions = {},
+): Promise<number[]> {
   validateMigrationSequence(items)
   const client = await pool.connect()
+  let migrationNumber: number | null = null
+  let step = 'begin_transaction'
   try {
     await client.query('BEGIN')
+    step = 'acquire_migration_lock'
     await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [MIGRATION_LOCK_KEY])
+    step = 'prepare_tracking_table'
     await ensureTrackingTable(client)
 
+    step = 'read_migration_history'
     const applied = await readAppliedMigrations(client)
+    step = 'validate_migration_history'
     validateAppliedMigrations(applied, items)
     const appliedVersions = new Set(applied.map((row) => row.version))
     const newlyApplied: number[] = []
 
     for (const migration of items) {
       if (appliedVersions.has(migration.version)) continue
+      migrationNumber = migration.version
+      step = 'pre_migration_validation'
       if (migration.validate) await migration.validate(client)
+      step = 'execute_migration_sql'
       await client.query(migration.up)
+      step = 'post_migration_validation'
       if (migration.validate) await migration.validate(client)
+      step = 'record_migration_history'
       await client.query(
         `INSERT INTO ${TRACKING_TABLE} (version, name, checksum) VALUES ($1, $2, $3)`,
         [migration.version, migration.name, migrationChecksum(migration)],
@@ -155,18 +203,34 @@ export async function runMigrations(pool: Pool, items: readonly Migration[] = mi
       newlyApplied.push(migration.version)
     }
 
+    if (options.diagnostic) {
+      step = 'rollback_diagnostic_transaction'
+      await client.query('ROLLBACK')
+      return []
+    }
+
+    step = 'commit_transaction'
     await client.query('COMMIT')
     return newlyApplied
   } catch (error) {
+    const diagnosticError = options.diagnostic
+      ? new MigrationDiagnosticError(migrationNumber, step, postgresErrorCode(error))
+      : error
     try {
       await client.query('ROLLBACK')
     } catch (rollbackError) {
-      throw new AggregateError([error, rollbackError], 'Migration failed and PostgreSQL did not confirm rollback.')
+      throw new AggregateError([diagnosticError, rollbackError], 'Migration failed and PostgreSQL did not confirm rollback.')
     }
-    throw error
+    throw diagnosticError
   } finally {
     client.release()
   }
+}
+
+function postgresErrorCode(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return null
+  const code = error.code
+  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null
 }
 
 export async function assertMigrationsCurrent(pool: Pool, items: readonly Migration[] = migrations) {

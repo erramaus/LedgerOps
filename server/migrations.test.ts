@@ -58,6 +58,27 @@ describe.skipIf(!decision.ok)('PostgreSQL versioned migrations', () => {
     ])
   })
 
+  it('diagnoses a SQL failure with its migration and SQLSTATE, then rolls back', async () => {
+    const database = await openIsolatedDatabase()
+    const pool = database.connect()
+    const brokenMigration = [{ version: 1, name: 'broken_sql', up: 'SELECT FROM' }]
+
+    await expect(runMigrations(pool, brokenMigration, { diagnostic: true })).rejects.toMatchObject({
+      migrationNumber: 1,
+      step: 'execute_migration_sql',
+      postgresCode: '42601',
+    })
+    expect(await database.schema.ownTables()).toEqual([])
+  })
+
+  it('rolls back successful diagnostic migration execution without creating tables', async () => {
+    const database = await openIsolatedDatabase()
+    const pool = database.connect()
+
+    await expect(runMigrations(pool, migrations, { diagnostic: true })).resolves.toEqual([])
+    expect(await database.schema.ownTables()).toEqual([])
+  })
+
   it('detects an altered checksum for an already-applied migration without changing the schema', async () => {
     const database = await openIsolatedDatabase()
     const pool = database.connect()
