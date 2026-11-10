@@ -65,7 +65,7 @@ jobs:
         run: node --import tsx server/postgresRequired.check.ts
 
       - name: Run required PostgreSQL storage tests
-        run: npx vitest run server/storageContract.test.ts server/migrations.test.ts server/reviewDecisionStore.test.ts server/reviewDecisions.test.ts --reporter=json --outputFile "$POSTGRES_TEST_REPORT"
+        run: npx vitest run server/storageContract.test.ts server/migrations.test.ts server/migrationDiagnostic.test.ts server/reviewDecisionStore.test.ts server/reviewDecisions.test.ts --reporter=json --outputFile "$POSTGRES_TEST_REPORT"
 
       - name: Reject skipped or missing PostgreSQL coverage
         run: node scripts/assert-postgres-vitest-report.mjs "$POSTGRES_TEST_REPORT"

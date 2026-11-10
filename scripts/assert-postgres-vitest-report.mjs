@@ -77,6 +77,8 @@ for (const title of reviewStoreTests) {
 const migrationTests = [
   'keeps production readiness checks read-only when migration history is absent',
   'creates the baseline schema on an empty schema and is idempotent',
+  'diagnoses a SQL failure with its migration and SQLSTATE, then rolls back',
+  'rolls back successful diagnostic migration execution without creating tables',
   'detects an altered checksum for an already-applied migration without changing the schema',
   'detects an altered checksum for migration 002 without changing its schema',
   'serializes concurrent migration processes using the database advisory lock',
