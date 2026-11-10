@@ -8,10 +8,9 @@ import {
   explainFinding,
   isAccountingFinding,
   isDismissalCurrent,
-  readReviewDecisions,
+  readLegacyReviewDecisionExport,
   sourceFingerprint,
   summarizeFindings,
-  writeReviewDecisions,
   type FindingFilters,
   type ReviewDecision,
 } from './reviewFindings'
@@ -30,6 +29,7 @@ const filters: FindingFilters = { client: 'All', type: 'All', priority: 'All', s
 const decide = (task: WorkTask, status: ReviewDecision['status'], over: Partial<ReviewDecision> = {}): ReviewDecision => ({
   id: `${status}-${task.id}`, source: 'demo', clientId: task.clientId, clientName: task.client, findingId: task.id, findingType: findingTypeOf(task),
   issue: task.issue, description: task.description, priority: task.priority, status, at: '2026-11-02T10:00:00Z', fingerprint: sourceFingerprint(task, source), ...over,
+  version: 1,
 })
 
 describe('classification', () => {
@@ -121,7 +121,8 @@ describe('decisions', () => {
   })
 
   it('keeps Demo and QuickBooks decisions separate', () => {
-    expect(decisionKey('demo', 'x')).not.toBe(decisionKey('quickbooks', 'x'))
+    expect(decisionKey('demo', demoClient.id, 'x')).not.toBe(decisionKey('quickbooks', demoClient.id, 'x'))
+    expect(decisionKey('demo', demoClient.id, 'x')).not.toBe(decisionKey('demo', 'another-client', 'x'))
     const rows = buildFindingRows({ source: 'quickbooks', live: [first], dismissed: [], decisions: [decide(first, 'dismissed', { reason: 'ok' })], records: source, detailClientId: 'quickbooks-sandbox' })
     expect(rows[0].status).toBe('Open')
   })
@@ -146,13 +147,10 @@ describe('filters', () => {
 })
 
 describe('decision storage', () => {
-  it('round-trips and reports when the browser refuses the write', () => {
-    const store = new Map<string, string>()
-    const storage = { getItem: (key: string) => store.get(key) ?? null, setItem: (key: string, value: string) => void store.set(key, value) }
-    const decision = decide(findings[0], 'dismissed', { reason: 'Checked' })
-    expect(writeReviewDecisions([decision], storage)).toBe(true)
-    expect(readReviewDecisions(storage)).toEqual([decision])
-    expect(writeReviewDecisions([decision], { getItem: () => null, setItem: () => { throw new Error('full') } })).toBe(false)
-    expect(readReviewDecisions({ getItem: () => 'not json', setItem: () => undefined })).toEqual([])
+  it('preserves the legacy browser record for explicit export without changing it', () => {
+    let value = JSON.stringify([decide(findings[0], 'dismissed', { reason: 'Checked' })])
+    const storage = { getItem: () => value, setItem: (_key: string, next: string) => { value = next } }
+    expect(readLegacyReviewDecisionExport(storage)).toBe(value)
+    expect(value).toContain('Checked')
   })
 })

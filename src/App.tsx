@@ -67,9 +67,10 @@ import {
 import { cleanDescription, dueLabel, filterByReadiness, isWaiting, localIsoDate, searchTasks, type Readiness } from "./services/inboxView";
 import {
   buildFindingRows, decisionKey, explainFinding, filterFindingRows, findingTypeLabel, findingTypeOf, findingTypes, isAccountingFinding, isDismissalCurrent,
-  latestDecisions, readReviewDecisions, reviewStatuses, rowType, sourceFingerprint, summarizeFindings, writeReviewDecisions,
+  latestDecisions, reviewStatuses, rowType, sourceFingerprint, summarizeFindings,
   type FindingFilters, type FindingRow, type ReviewDecision,
 } from "./services/reviewFindings";
+import { downloadLegacyReviewDecisionExport, reviewDecisionService, type ReviewDecisionStatus } from "./services/reviewDecisionService";
 import { attentionStatus, monthEndStatus, nextTaskFor, periodNotice } from "./services/clientStatus";
 import {
   DEMO_CATEGORIES,
@@ -346,8 +347,11 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
   const [automationEvents, setAutomationEvents] = useState<AutomationAuditEvent[]>(() => readEvents());
   const [recurringDecisions, setRecurringDecisions] = useState<RecurringDecision[]>(() => readRecurringDecisions());
   const [selectedRecurring, setSelectedRecurring] = useState<RecurringPattern | null>(null);
-  const [reviewDecisions, setReviewDecisions] = useState<ReviewDecision[]>(() => readReviewDecisions());
-  const [reviewDecisionsSaved, setReviewDecisionsSaved] = useState(true);
+  const [reviewDecisions, setReviewDecisions] = useState<ReviewDecision[]>([]);
+  const [reviewDecisionStatus, setReviewDecisionStatus] = useState<ReviewDecisionStatus>("loading");
+  const [reviewDecisionDurable, setReviewDecisionDurable] = useState<boolean | null>(null);
+  const [reviewDecisionError, setReviewDecisionError] = useState<string | null>(null);
+  const reviewDecisionLoadGeneration = useRef(0);
   const [demoResetRevision, setDemoResetRevision] = useState(0);
   const resetDemoState = (clientIds: string[]) => {
     const targets = new Set(clientIds);
@@ -369,7 +373,6 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
       }),
     ]);
     setPortalAudit((current) => current.filter((event) => !targets.has(event.clientId)));
-    setReviewDecisions((current) => current.filter((decision) => !(decision.source === "demo" && targets.has(decision.clientId))));
     setSelectedTransaction(null);
     setSelectedInvoice(null);
     setSelectedBill(null);
@@ -411,9 +414,27 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
     writeRecurringDecisions(recurringDecisions);
   }, [recurringDecisions]);
 
+  const loadReviewDecisions = useCallback(async (decisionSource: ReviewSource) => {
+    const generation = ++reviewDecisionLoadGeneration.current;
+    setReviewDecisionStatus("loading");
+    setReviewDecisionError(null);
+    try {
+      const loaded = await reviewDecisionService.list(decisionSource);
+      if (generation !== reviewDecisionLoadGeneration.current) return;
+      setReviewDecisions(loaded.decisions);
+      setReviewDecisionDurable(loaded.durable);
+      setReviewDecisionStatus("ready");
+    } catch (error) {
+      if (generation !== reviewDecisionLoadGeneration.current) return;
+      setReviewDecisionError(error instanceof Error ? error.message : "Review decisions could not be loaded.")
+      setReviewDecisionStatus("error");
+    }
+  }, []);
+
   useEffect(() => {
-    setReviewDecisionsSaved(writeReviewDecisions(reviewDecisions));
-  }, [reviewDecisions]);
+    void loadReviewDecisions(reviewSource);
+    return () => { reviewDecisionLoadGeneration.current += 1; };
+  }, [loadReviewDecisions, reviewSource]);
 
   // Transactions entered by hand in Demo Mode. The ref always holds the latest list so a reload right after a save sees it.
   const [demoEntries, setDemoEntries] = useState<DemoEntryRecord[]>([]);
@@ -1375,6 +1396,9 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
   const allTasksUnfiltered = sortTasks([...baseTasks, ...automationTasks]);
   // A dismissed finding leaves every screen's queue until its source record changes.
   const latestReviewDecisions = latestDecisions(reviewDecisions);
+  const decisionsForReview = reviewDecisions.map((decision) =>
+    decision.source === "quickbooks" ? { ...decision, clientName: sandboxName } : decision,
+  );
   const sourceRecords = { transactions: records.transactions, invoices: records.invoices, bills: records.bills };
   // Each finding is fingerprinted against its own client's records, never another company's.
   const sourceRecordsFor = (task: WorkTask) => {
@@ -1382,30 +1406,54 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
     return owner === records ? sourceRecords : { transactions: owner.transactions, invoices: owner.invoices, bills: owner.bills };
   };
   const isDismissedFinding = (task: WorkTask) =>
-    isAccountingFinding(task) && isDismissalCurrent(latestReviewDecisions.get(decisionKey(source, task.id)), sourceFingerprint(task, sourceRecordsFor(task)));
+    isAccountingFinding(task) && isDismissalCurrent(latestReviewDecisions.get(decisionKey(source, task.clientId, task.id)), sourceFingerprint(task, sourceRecordsFor(task)));
   const allTasks = allTasksUnfiltered.filter((task) => !isDismissedFinding(task));
   const dismissedFindings = filterTasks(allTasksUnfiltered.filter(isDismissedFinding), { clientId: source === "demo" && selectedClient ? selectedClient.id : null });
-  const recordReviewDecision = (task: WorkTask, status: ReviewDecision["status"], reason?: string) => {
-    const decision: ReviewDecision = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      source,
-      clientId: task.clientId,
-      clientName: task.client,
-      findingId: task.id,
-      findingType: findingTypeOf(task),
-      issue: task.issue,
-      description: task.description,
-      priority: task.priority,
-      status,
-      reason,
-      actor: "Bookkeeper",
-      at: new Date().toISOString(),
-      fingerprint: sourceFingerprint(task, sourceRecordsFor(task)),
-    };
-    setReviewDecisions((current) => [decision, ...current]);
+  const recordReviewDecision = async (task: WorkTask, status: ReviewDecision["status"], reason?: string): Promise<boolean> => {
+    if (reviewDecisionStatus !== "ready") return false;
+    const previous = latestReviewDecisions.get(decisionKey(source, task.clientId, task.id));
+    setReviewDecisionStatus("saving");
+    setReviewDecisionError(null);
+    try {
+      const saved = await reviewDecisionService.append(source, {
+        clientId: task.clientId,
+        findingId: task.id,
+        findingType: findingTypeOf(task),
+        issue: task.issue,
+        description: task.description,
+        priority: task.priority,
+        status,
+        reason,
+        fingerprint: sourceFingerprint(task, sourceRecordsFor(task)),
+        expectedVersion: previous?.version ?? 0,
+      });
+      setReviewDecisions((current) => [saved.decision, ...current.filter((decision) => decision.id !== saved.decision.id)]);
+      setReviewDecisionDurable(saved.durable);
+      setReviewDecisionStatus("ready");
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The review decision could not be saved.";
+      if (error instanceof Error && "status" in error && error.status === 409) {
+        setReviewDecisionStatus("loading");
+        try {
+          const loaded = await reviewDecisionService.list(source);
+          setReviewDecisions(loaded.decisions);
+          setReviewDecisionDurable(loaded.durable);
+          setReviewDecisionStatus("ready");
+          setReviewDecisionError(`${message} Saved decisions have been refreshed; retry the action.`);
+        } catch (refreshError) {
+          setReviewDecisionError(refreshError instanceof Error ? refreshError.message : message);
+          setReviewDecisionStatus("error");
+        }
+      } else {
+        setReviewDecisionError(message);
+        setReviewDecisionStatus("error");
+      }
+      return false;
+    }
   };
   const reviewFinding = (task: WorkTask) => {
-    if (latestReviewDecisions.get(decisionKey(source, task.id))?.status !== "reviewing" || isDismissedFinding(task)) recordReviewDecision(task, "reviewing");
+    if (latestReviewDecisions.get(decisionKey(source, task.clientId, task.id))?.status !== "reviewing" || isDismissedFinding(task)) void recordReviewDecision(task, "reviewing");
     openTask(task);
   };
   const activeClient = source === "demo" && selectedClient ? clients.find((client) => client.id === selectedClient.id) ?? selectedClient : null;
@@ -1637,7 +1685,7 @@ function App({ user, onSignOut, devBypass = false }: { user: AuthUser; onSignOut
             onOpenCompany={openCompany}
           />
         ) : view === "Bookkeeping Review" ? (
-          <BookkeepingReview source={source} rows={buildFindingRows({ source, live: visibleTasks.filter(isAccountingFinding), dismissed: dismissedFindings.filter(isAccountingFinding), decisions: reviewDecisions, records: sourceRecordsFor, detailClientId: source === "demo" && !activeClient ? null : records.client.id })} history={reviewDecisions.filter((decision) => decision.source === source && (!activeClient || decision.clientId === activeClient.id))} decisionsSaved={reviewDecisionsSaved} available={queueAvailable} loading={reviewLoading} error={reviewError} today={localIsoDate(currentDate)} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onReview={reviewFinding} onDismiss={(task, reason) => recordReviewDecision(task, "dismissed", reason)} onReopen={(task) => recordReviewDecision(task, "reopened")} />
+          <BookkeepingReview source={source} rows={buildFindingRows({ source, live: visibleTasks.filter(isAccountingFinding), dismissed: dismissedFindings.filter(isAccountingFinding), decisions: decisionsForReview, records: sourceRecordsFor, detailClientId: source === "demo" && !activeClient ? null : records.client.id })} history={decisionsForReview.filter((decision) => decision.source === source && (!activeClient || decision.clientId === activeClient.id))} decisionStatus={reviewDecisionStatus} decisionDurable={reviewDecisionDurable} decisionError={reviewDecisionError} onRetryDecisions={() => void loadReviewDecisions(reviewSource)} available={queueAvailable} loading={reviewLoading} error={reviewError} today={localIsoDate(currentDate)} selectedRecurring={selectedRecurring} onBackRecurring={() => setSelectedRecurring(null)} onResolveRecurring={resolveRecurringReminder} onSourceChange={changeAppDataSource} onReview={reviewFinding} onDismiss={(task, reason) => recordReviewDecision(task, "dismissed", reason)} onReopen={(task) => recordReviewDecision(task, "reopened")} />
         ) : view === "Inbox" ? (
           <Inbox tasks={visibleTasks} source={source} available={queueAvailable} loading={reviewLoading} error={reviewError} scopeLabel={activeClient?.name ?? (source === "demo" ? "All clients" : sandboxName)} today={localIsoDate(currentDate)} onOpenTask={openTask} />
         ) : view === "Transactions" ? (
@@ -2252,7 +2300,10 @@ function BookkeepingReview({
   source,
   rows,
   history,
-  decisionsSaved,
+  decisionStatus,
+  decisionDurable,
+  decisionError,
+  onRetryDecisions,
   available,
   loading,
   error,
@@ -2268,7 +2319,10 @@ function BookkeepingReview({
   source: ReviewSource;
   rows: FindingRow[];
   history: ReviewDecision[];
-  decisionsSaved: boolean;
+  decisionStatus: ReviewDecisionStatus;
+  decisionDurable: boolean | null;
+  decisionError: string | null;
+  onRetryDecisions: () => void;
   available: boolean;
   loading: boolean;
   error: string | null;
@@ -2278,13 +2332,14 @@ function BookkeepingReview({
   onResolveRecurring: (pattern: RecurringPattern, status: "confirmed" | "dismissed") => void;
   onSourceChange: (source: ReviewSource) => void;
   onReview: (task: WorkTask) => void;
-  onDismiss: (task: WorkTask, reason: string) => void;
-  onReopen: (task: WorkTask) => void;
+  onDismiss: (task: WorkTask, reason: string) => Promise<boolean>;
+  onReopen: (task: WorkTask) => Promise<boolean>;
 }) {
   const [filters, setFilters] = useState<FindingFilters>({ client: "All", type: "All", priority: "All", status: "Active", query: "" });
   const [dismissing, setDismissing] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [showHistory, setShowHistory] = useState(false);
+  const [legacyExportMessage, setLegacyExportMessage] = useState<string | null>(null);
   const setFilter = (patch: Partial<FindingFilters>) => setFilters((current) => ({ ...current, ...patch }));
   if (selectedRecurring) {
     return (
@@ -2326,11 +2381,22 @@ function BookkeepingReview({
   const clientOptions = [...new Map(rows.map((row) => [row.task.clientId, row.task.client])).entries()];
   const figure = (value: number) => (available ? `${value}` : NOT_AVAILABLE);
   const filtersActive = filters.client !== "All" || filters.type !== "All" || filters.priority !== "All" || filters.status !== "Active" || filters.query.trim() !== "";
-  const submitDismiss = (task: WorkTask) => {
+  const submitDismiss = async (task: WorkTask) => {
     if (!reason.trim()) return;
-    onDismiss(task, reason.trim());
-    setDismissing(null);
-    setReason("");
+    if (await onDismiss(task, reason.trim())) {
+      setDismissing(null);
+      setReason("");
+    }
+  };
+  const exportLegacyDecisions = async () => {
+    try {
+      const exported = await downloadLegacyReviewDecisionExport();
+      setLegacyExportMessage(exported
+        ? "Legacy browser decisions were exported only; they were not imported or trusted."
+        : "No legacy browser decisions were found in this browser.")
+    } catch {
+      setLegacyExportMessage("The legacy browser decisions could not be exported.")
+    }
   };
   return (
     <div className="page-content">
@@ -2345,6 +2411,10 @@ function BookkeepingReview({
       {loading && <div className="data-state-message">Loading QuickBooks Sandbox review data...</div>}
       {error && <div className="data-state-message error">{error}</div>}
       {!available && !loading && !error && <div className="data-state-message">{NOT_AVAILABLE}: QuickBooks Sandbox data has not been loaded.</div>}
+      {decisionStatus === "loading" && <div className="data-state-message" role="status">Loading saved review decisions from the server...</div>}
+      {decisionStatus === "saving" && <div className="data-state-message" role="status">Saving review decision...</div>}
+      {decisionError && <div className="data-state-message error" role="alert">{decisionError}</div>}
+      {decisionStatus === "error" && <button className="secondary-button" onClick={onRetryDecisions}>Retry loading review decisions</button>}
       <div className="review-summary-grid">
         <SummaryCard value={figure(summary.total)} label="Total review findings" tone="red" />
         <SummaryCard value={figure(summary.duplicates)} label="Possible duplicates" tone="amber" />
@@ -2392,9 +2462,18 @@ function BookkeepingReview({
         </button>
       </div>
       <p className="muted decision-note">
-        {decisionsSaved ? "Review decisions are temporary development records, stored only in this browser." : "Review decisions could not be saved and will be lost when this page closes."}
+        {decisionStatus === "ready" && decisionDurable === true && "Review decisions are saved on the server and persist in PostgreSQL."}
+        {decisionStatus === "ready" && decisionDurable === false && "Review decisions are on the server, but this development server uses memory storage and they will be lost on restart."}
+        {decisionStatus === "loading" && "Saved review history is loading; browser-only decisions are not used automatically."}
+        {decisionStatus === "saving" && "The decision is not recorded until the server confirms the save."}
+        {decisionStatus === "error" && "Saved review history is unavailable. No browser fallback was used."}
         {filtersActive && available ? ` Showing ${visibleRows.length} of ${rows.length} findings.` : ""}
       </p>
+      <div className="decision-note">
+        <button className="secondary-button" onClick={() => void exportLegacyDecisions()}>Export legacy browser decisions</button>
+        <span className="muted">Existing browser records are not imported automatically. Review and validate their client attribution before re-entering any decision.</span>
+        {legacyExportMessage && <span role="status">{legacyExportMessage}</span>}
+      </div>
       {showHistory && (
         <div className="panel decision-history" aria-label="Review decisions">
           <h3>Previous review decisions</h3>
@@ -2447,20 +2526,20 @@ function BookkeepingReview({
                 {!resolved && (
                   <div className="finding-actions">
                     {row.status === "Dismissed" ? (
-                      <button className="secondary-button" onClick={() => onReopen(task)}>Reopen finding</button>
+                      <button className="secondary-button" disabled={decisionStatus !== "ready"} onClick={() => void onReopen(task)}>Reopen finding</button>
                     ) : dismissing === row.key ? (
                       <form className="dismiss-form" onSubmit={(event) => { event.preventDefault(); submitDismiss(task); }}>
                         <label>
                           Reason for dismissing
                           <input autoFocus required value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Why is this not a problem?" />
                         </label>
-                        <button className="primary-button" type="submit" disabled={!reason.trim()}>Confirm dismiss</button>
+                        <button className="primary-button" type="submit" disabled={!reason.trim() || decisionStatus !== "ready"}>Confirm dismiss</button>
                         <button className="secondary-button" type="button" onClick={() => { setDismissing(null); setReason(""); }}>Cancel</button>
                       </form>
                     ) : (
                       <>
-                        <button className="primary-button" onClick={() => onReview(task)}>Review finding</button>
-                        <button className="secondary-button" onClick={() => { setDismissing(row.key); setReason(""); }}>Dismiss finding</button>
+                        <button className="primary-button" disabled={decisionStatus !== "ready"} onClick={() => onReview(task)}>Review finding</button>
+                        <button className="secondary-button" disabled={decisionStatus !== "ready"} onClick={() => { setDismissing(row.key); setReason(""); }}>Dismiss finding</button>
                       </>
                     )}
                   </div>

@@ -97,7 +97,7 @@ describe('loading every company under All clients', () => {
 describe('Bookkeeping Review under All clients', () => {
   const decision = (clientId: string, findingId: string, status: ReviewDecision['status']): ReviewDecision => ({
     id: `${clientId}-${findingId}-${status}`, source: 'demo', clientId, clientName: clientId, findingId, findingType: 'Possible duplicate' as ReviewDecision['findingType'],
-    issue: 'Possible duplicate', description: 'x', priority: 'High', status, actor: 'Bookkeeper', at: '2026-10-01T00:00:00Z', fingerprint: 'f',
+    issue: 'Possible duplicate', description: 'x', priority: 'High', status, actor: 'Bookkeeper', at: '2026-10-01T00:00:00Z', fingerprint: 'f', version: 1,
   })
   const empty = { transactions: [], invoices: [], bills: [] }
 

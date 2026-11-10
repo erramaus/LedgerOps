@@ -38,51 +38,33 @@ export class MemoryDemoPaymentStore implements DemoPaymentStore {
 export class PostgresDemoPaymentStore implements DemoPaymentStore {
   readonly durable = true
   private pool: pg.Pool
-  private ready?: Promise<unknown>
 
   constructor(databaseUrl: string) {
     this.pool = new pg.Pool({ connectionString: databaseUrl })
     this.pool.on('error', (error) => console.error('[demo payment store] idle connection error:', error.message))
   }
 
-  private ensureTable() {
-    this.ready ??= this.pool
-      .query(`CREATE TABLE IF NOT EXISTS demo_payment_books (
-        id text PRIMARY KEY, client_id text NOT NULL, version integer NOT NULL,
-        data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
-      .then(() => this.pool.query('CREATE INDEX IF NOT EXISTS demo_payment_books_client ON demo_payment_books (client_id, id)'))
-      .catch((error) => {
-        this.ready = undefined
-        throw error
-      })
-    return this.ready
-  }
-
   async list(clientId: string) {
-    await this.ensureTable()
     const result = await this.pool.query('SELECT data FROM demo_payment_books WHERE client_id = $1 ORDER BY id', [clientId])
     return result.rows.map((row) => row.data as DemoPaymentBook)
   }
 
   async get(id: string) {
-    await this.ensureTable()
     const result = await this.pool.query('SELECT data FROM demo_payment_books WHERE id = $1', [id])
     return (result.rows[0]?.data as DemoPaymentBook | undefined) ?? null
   }
 
   async put(book: DemoPaymentBook, expectedVersion: number) {
-    await this.ensureTable()
     const values = [book.id, book.clientId, book.version, JSON.stringify(book), expectedVersion]
     if (expectedVersion === 0) {
       const inserted = await this.pool.query('INSERT INTO demo_payment_books (id, client_id, version, data) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING', values.slice(0, 4))
       return inserted.rowCount === 1
     }
-    const updated = await this.pool.query('UPDATE demo_payment_books SET version = $3, data = $4, updated_at = now() WHERE id = $1 AND version = $5', values)
+    const updated = await this.pool.query('UPDATE demo_payment_books SET version = $2, data = $3, updated_at = now() WHERE id = $1 AND version = $4', [values[0], values[2], values[3], expectedVersion])
     return updated.rowCount === 1
   }
 
   async deleteClients(clientIds: string[]) {
-    await this.ensureTable()
     await this.pool.query('DELETE FROM demo_payment_books WHERE client_id = ANY($1::text[])', [clientIds])
   }
 }

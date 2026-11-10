@@ -11,6 +11,8 @@
     "build:pages": "vite build",
     "build:render": "vite build --mode render --outDir dist-render",
     "build:server": "tsc --project tsconfig.server.json",
+    "db:migrate": "node dist-server/server/migrationCli.js",
+    "db:migrate:source": "tsx server/migrationCli.ts",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "preview": "vite preview",

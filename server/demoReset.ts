@@ -86,25 +86,6 @@ export class PostgresDemoResetRepository implements DemoResetRepository {
     const client = await this.pool.connect()
     try {
       await client.query('BEGIN')
-      await client.query(`CREATE TABLE IF NOT EXISTS demo_entries (
-        id text PRIMARY KEY, client_id text NOT NULL, status text NOT NULL, version integer NOT NULL,
-        created_at timestamptz NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
-      await client.query(`CREATE TABLE IF NOT EXISTS demo_journals (
-        id text PRIMARY KEY, client_id text NOT NULL, status text NOT NULL, version integer NOT NULL,
-        created_at timestamptz NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
-      await client.query(`CREATE TABLE IF NOT EXISTS demo_payment_books (
-        id text PRIMARY KEY, client_id text NOT NULL, version integer NOT NULL,
-        data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
-      await client.query(`CREATE TABLE IF NOT EXISTS demo_workpapers (
-        id text PRIMARY KEY, client_id text NOT NULL, period text NOT NULL, version integer NOT NULL,
-        created_at timestamptz NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
-      await client.query(`CREATE TABLE IF NOT EXISTS reconciliation_records (
-        id text PRIMARY KEY, source text NOT NULL, client_id text NOT NULL, account_id text NOT NULL,
-        period_end date NOT NULL, status text NOT NULL, version integer NOT NULL, data jsonb NOT NULL,
-        updated_at timestamptz NOT NULL DEFAULT now())`)
-      await client.query(`CREATE TABLE IF NOT EXISTS month_end_records (
-        id text PRIMARY KEY, source text NOT NULL, client_id text NOT NULL, period text NOT NULL,
-        status text NOT NULL, version integer NOT NULL, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
       await client.query('DELETE FROM demo_entries WHERE client_id = ANY($1::text[])', [clientIds])
       await client.query('DELETE FROM demo_journals WHERE client_id = ANY($1::text[])', [clientIds])
       await client.query('DELETE FROM demo_payment_books WHERE client_id = ANY($1::text[])', [clientIds])

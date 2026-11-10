@@ -230,6 +230,7 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; de
   const demoPayments = options.demoPayments ?? new FakeDemoPayments(reconciliations, monthEnd)
   const demoWorkpapers = options.demoWorkpapers ?? new FakeDemoWorkpapers()
   const demoReset = options.demoReset ?? new FakeDemoReset({ demoEntries, demoJournals, demoPayments, demoWorkpapers, reconciliations, monthEnd }, options.beforeDemoResetSeed)
+  const reviewDecisions = new FakeReviewDecisions()
   const unexpected: string[] = []
   const json = (route: Route, body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   await page.clock.setFixedTime(new Date(`${TODAY}T12:00:00Z`))
@@ -242,6 +243,15 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; de
   await page.route('**/api/auth/session', (route) =>
     json(route, options.authenticated === false ? { configured: true, authenticated: false } : { configured: true, authenticated: true, user, csrfToken: CSRF_TOKEN, ...(options.devBypass ? { devBypass: true } : {}) }),
   )
+  await page.route('**/api/review-decisions/demo', async (route) => {
+    const result = reviewDecisions.handle(route.request().method(), 'demo', route.request().method() === 'GET' ? undefined : route.request().postDataJSON(), route.request().headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
+  await page.route('**/api/review-decisions/quickbooks', async (route) => {
+    if (options.devBypass) return json(route, { error: 'Authentication required.' }, 401)
+    const result = reviewDecisions.handle(route.request().method(), 'quickbooks', route.request().method() === 'GET' ? undefined : route.request().postDataJSON(), route.request().headers()['x-csrf-token'])
+    return json(route, result.json, result.status)
+  })
   await page.route('**/api/quickbooks/status', (route) => options.devBypass ? json(route, { error: 'Authentication required.' }, 401) : json(route, { connected: true, environment: 'sandbox' }))
   await page.route('**/api/quickbooks/transactions', (route) => {
     quickBooks.transactionLoads += 1
@@ -306,7 +316,50 @@ export async function mockApp(page: Page, options: { authenticated?: boolean; de
     const result = await demoReset.handle(incoming.method(), incoming.method() === 'GET' ? undefined : incoming.postDataJSON(), incoming.headers()['x-csrf-token'])
     return json(route, result.json, result.status)
   })
-  return { quickBooks, reconciliations, monthEnd, demoEntries, demoJournals, demoPayments, demoWorkpapers, demoReset, unexpected }
+  return { quickBooks, reconciliations, monthEnd, demoEntries, demoJournals, demoPayments, demoWorkpapers, demoReset, reviewDecisions, unexpected }
+}
+
+export class FakeReviewDecisions {
+  records: Array<Record<string, unknown> & { source: string; clientId: string; findingId: string; version: number; at: string; id: string }> = []
+  failNextAppend = false
+  failNextList = 0
+
+  handle(method: string, source: 'demo' | 'quickbooks', body: unknown, csrf?: string): { status: number; json: unknown } {
+    if (method !== 'GET' && csrf !== CSRF_TOKEN) return { status: 403, json: { error: 'Invalid CSRF token.' } }
+    if (method === 'GET') {
+      if (this.failNextList > 0) {
+        this.failNextList -= 1
+        return { status: 503, json: { error: 'Review decisions could not be loaded or saved.' } }
+      }
+      return { status: 200, json: { durable: false, decisions: this.records.filter((record) => record.source === source) } }
+    }
+    if (this.failNextAppend) {
+      this.failNextAppend = false
+      return { status: 503, json: { error: 'Review decisions could not be loaded or saved.' } }
+    }
+    const input = (body ?? {}) as Record<string, unknown>
+    const clientId = typeof input.clientId === 'string' ? input.clientId : ''
+    const findingId = typeof input.findingId === 'string' ? input.findingId : ''
+    const version = Number(input.expectedVersion)
+    const previous = this.records.filter((record) => record.source === source && record.clientId === clientId && record.findingId === findingId).sort((a, b) => b.version - a.version)[0]
+    if ((previous?.version ?? 0) !== version) return { status: 409, json: { error: 'This review finding changed elsewhere. Reload review decisions and try again.' } }
+    const decision = {
+      ...input,
+      source,
+      id: `e2e-review-${this.records.length + 1}`,
+      clientName: clientId === 'abc-plumbing' ? 'ABC Plumbing' : clientId === 'quickbooks-sandbox' ? 'QuickBooks Sandbox' : 'Acme Consulting',
+      actor: 'e2e@example.com',
+      at: new Date().toISOString(),
+      version: version + 1,
+    }
+    this.records.unshift(decision)
+    return { status: 201, json: { durable: false, decision } }
+  }
+
+  replaceLatestFingerprint(clientId: string, findingId: string, fingerprint: string) {
+    const latest = this.records.find((record) => record.clientId === clientId && record.findingId === findingId)
+    if (latest) latest.fingerprint = fingerprint
+  }
 }
 
 /** The real demo-entries router, run in-process on memory stores, so browser tests exercise the actual validation and period rules. */

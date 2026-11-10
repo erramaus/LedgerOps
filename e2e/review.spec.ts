@@ -13,12 +13,14 @@ const inboxTotal = async (page: Page) => {
 async function start(page: Page) {
   const reconciliations = new FakeReconciliations()
   const monthEnd = new FakeMonthEnd(reconciliations)
-  await mockApp(page, { reconciliations, monthEnd })
+  const mocks = await mockApp(page, { reconciliations, monthEnd })
   reconciliations.seedDemo()
   await monthEnd.seedDemo()
   await page.goto('./')
   await nav(page, /Bookkeeping Review/).click()
   await expect(page.locator('.finding-card').first()).toBeVisible()
+  await expect(page.getByText(/Review decisions are on the server/)).toBeVisible()
+  return mocks
 }
 
 const amazon = (page: Page) => page.locator('.finding-card').filter({ hasText: 'Amazon has no category or account.' })
@@ -89,7 +91,7 @@ test.describe('Bookkeeping Review usability', () => {
     await page.getByRole('button', { name: 'View review decisions' }).click()
     await expect(page.locator('.decision-history')).toContainText('Dismissed')
     await expect(page.locator('.decision-history')).toContainText('Receipt on file')
-    await expect(page.getByText(/temporary development records/)).toBeVisible()
+    await expect(page.getByText(/Review decisions are on the server/)).toBeVisible()
 
     await amazon(page).getByRole('button', { name: 'Reopen finding' }).click()
     await page.getByLabel('Review status').selectOption('Active')
@@ -98,19 +100,84 @@ test.describe('Bookkeeping Review usability', () => {
   })
 
   test('a dismissed finding returns when its source record has changed', async ({ page }) => {
-    await start(page)
+    const mocks = await start(page)
     await amazon(page).getByRole('button', { name: 'Dismiss finding' }).click()
     await amazon(page).getByLabel('Reason for dismissing').fill('Checked')
     await amazon(page).getByRole('button', { name: 'Confirm dismiss' }).click()
     await expect(amazon(page)).toHaveCount(0)
-    await page.evaluate(() => {
-      const key = 'ledgerops-review-decisions-v1'
-      const decisions = JSON.parse(localStorage.getItem(key) ?? '[]') as { fingerprint: string }[]
-      localStorage.setItem(key, JSON.stringify(decisions.map((decision) => ({ ...decision, fingerprint: 'older-version' }))))
-    })
+    const saved = mocks.reviewDecisions.records[0]
+    mocks.reviewDecisions.replaceLatestFingerprint(saved.clientId, saved.findingId, 'older-version')
     await page.reload()
     await nav(page, /Bookkeeping Review/).click()
     await expect(amazon(page)).toContainText('source record changed')
+  })
+
+  test('a failed server save keeps the finding open and does not report it as saved', async ({ page }) => {
+    const mocks = await start(page)
+    mocks.reviewDecisions.failNextAppend = true
+    await amazon(page).getByRole('button', { name: 'Dismiss finding' }).click()
+    await amazon(page).getByLabel('Reason for dismissing').fill('Checked with the source record')
+    await amazon(page).getByRole('button', { name: 'Confirm dismiss' }).click()
+    await expect(page.getByRole('alert')).toContainText('could not be loaded or saved')
+    await expect(amazon(page)).toBeVisible()
+    await expect(page.getByText('Saved review history is unavailable. No browser fallback was used.')).toBeVisible()
+
+    await page.getByRole('button', { name: 'Retry loading review decisions' }).click()
+    await amazon(page).getByLabel('Reason for dismissing').fill('Checked with the source record')
+    await amazon(page).getByRole('button', { name: 'Confirm dismiss' }).click()
+    await expect(amazon(page)).toHaveCount(0)
+  })
+
+  test('legacy browser decisions are not loaded automatically and can be explicitly exported', async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('ledgerops-review-decisions-v1', JSON.stringify([{
+        id: 'legacy-id',
+        source: 'demo',
+        clientId: 'abc-plumbing',
+        clientName: 'ABC Plumbing',
+        findingId: 'txn-001-category',
+        findingType: 'categorization',
+        issue: 'Uncategorized transaction',
+        description: 'Amazon has no category or account.',
+        priority: 'High',
+        status: 'reviewing',
+        at: '2026-01-01T00:00:00.000Z',
+        fingerprint: 'legacy-fingerprint',
+      }]))
+    })
+    await start(page)
+    await expect(amazon(page)).toBeVisible()
+    await expect(amazon(page).locator('.finding-status')).toHaveText('Open')
+    const download = page.waitForEvent('download')
+    await page.getByRole('button', { name: 'Export legacy browser decisions' }).click()
+    const file = await download
+    expect(file.suggestedFilename()).toBe('ledgerops-legacy-review-decisions.json')
+    await expect(page.getByRole('status').filter({ hasText: 'not imported or trusted' })).toBeVisible()
+    await expect(page.locator('.decision-history')).toHaveCount(0)
+    expect(await page.evaluate(() => localStorage.getItem('ledgerops-review-decisions-v1'))).toContain('legacy-id')
+  })
+
+  test('a server load error is visible and decisions can be retried without browser fallback', async ({ page }) => {
+    const mocks = await mockApp(page)
+    mocks.reviewDecisions.failNextList = 2
+    await page.goto('./')
+    await nav(page, /Bookkeeping Review/).click()
+    await expect(page.getByRole('alert')).toContainText('could not be loaded or saved')
+    await expect(page.getByText('Saved review history is unavailable. No browser fallback was used.')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Retry loading review decisions' })).toBeVisible()
+    mocks.reviewDecisions.records.push({
+      source: 'demo',
+      clientId: 'abc-plumbing',
+      findingId: 'untrusted-legacy',
+      version: 1,
+      at: new Date().toISOString(),
+      id: 'legacy',
+      status: 'dismissed',
+      fingerprint: 'any',
+    })
+    await page.getByRole('button', { name: 'Retry loading review decisions' }).click()
+    await expect(page.getByText(/Review decisions are on the server/)).toBeVisible()
+    await expect(page.locator('.finding-card').filter({ hasText: 'untrusted-legacy' })).toHaveCount(0)
   })
 
   test('Review finding opens the exact record and marks the finding under review', async ({ page }) => {

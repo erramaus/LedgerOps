@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import pg from 'pg'
 import session from 'express-session'
 import { createApp } from './app.js'
 import type { AuthProvider } from './authProvider.js'
@@ -13,11 +14,27 @@ import { MemoryDemoJournalStore, PostgresDemoJournalStore } from './demoJournalS
 import { MemoryDemoPaymentStore, PostgresDemoPaymentStore } from './demoPaymentStore.js'
 import { MemoryDemoWorkpaperStore, PostgresDemoWorkpaperStore } from './demoWorkpaperStore.js'
 import { MemoryDemoResetRepository, PostgresDemoResetRepository } from './demoReset.js'
+import { MemoryReviewDecisionStore, PostgresReviewDecisionStore } from './reviewDecisionStore.js'
 import { seedDemoRecords } from './demoSeed.js'
+import { assertMigrationsCurrent, runMigrations } from './migrations.js'
 
 const port = Number(process.env.PORT || 3001)
 const loaded = loadConfig(process.env)
 quickbooks.validateConfigurationAtStartup()
+
+if (loaded.databaseUrl) {
+  const migrationPool = new pg.Pool({ connectionString: loaded.databaseUrl, max: 1 })
+  try {
+    if (loaded.app.production) {
+      await assertMigrationsCurrent(migrationPool)
+    } else {
+      const applied = await runMigrations(migrationPool)
+      if (applied.length > 0) console.info(`Applied local PostgreSQL migration versions: ${applied.join(', ')}.`)
+    }
+  } finally {
+    await migrationPool.end()
+  }
+}
 
 let authProvider: AuthProvider | undefined
 let sessionStore: session.Store | undefined
@@ -53,7 +70,9 @@ if (!demoWorkpaperStore.durable) console.warn('DATABASE_URL is not set: demo wor
 const demoResetRepository = loaded.databaseUrl
   ? new PostgresDemoResetRepository(loaded.databaseUrl)
   : new MemoryDemoResetRepository({ entries: demoEntryStore, journals: demoJournalStore, payments: demoPaymentStore, workpapers: demoWorkpaperStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
-const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore, demoEntryStore, demoJournalStore, demoPaymentStore, demoWorkpaperStore, demoResetRepository })
+const reviewDecisionStore = loaded.databaseUrl ? new PostgresReviewDecisionStore(loaded.databaseUrl) : new MemoryReviewDecisionStore()
+if (!reviewDecisionStore.durable) console.warn('DATABASE_URL is not set: review decisions are temporary server-memory records and will be lost on restart.')
+const app = createApp({ config: loaded.app, quickbooks, authProvider, sessionStore, reconciliationStore, monthEndStore, demoEntryStore, demoJournalStore, demoPaymentStore, demoWorkpaperStore, demoResetRepository, reviewDecisionStore })
 
 if (loaded.devBypassRefusal) console.error(`LEDGEROPS_DEV_BYPASS_AUTH was REFUSED and sign-in stays required: ${loaded.devBypassRefusal}.`)
 if (loaded.app.devBypassAuth) console.warn('*** LOCAL DEVELOPMENT AUTH BYPASS IS ACTIVE: demo routes need no sign-in; QuickBooks routes still require real sign-in. Listening on 127.0.0.1 only. ***')

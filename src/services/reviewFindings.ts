@@ -77,18 +77,21 @@ export type ReviewDecision = {
   status: DecisionStatus
   reason?: string
   actor?: string
+  actorId?: string
   at: string
   /** Fingerprint of the source record when the decision was made. A different one means the record changed. */
   fingerprint: string
+  /** Per-finding append-only sequence number assigned by the server. */
+  version: number
 }
 
-export const decisionKey = (source: ReviewSource, findingId: string) => `${source}:${findingId}`
+export const decisionKey = (source: ReviewSource, clientId: string, findingId: string) => `${source}:${clientId}:${findingId}`
 
 /** The most recent decision per finding. `decisions` are newest first. */
 export function latestDecisions(decisions: ReviewDecision[]): Map<string, ReviewDecision> {
   const latest = new Map<string, ReviewDecision>()
   for (const decision of decisions) {
-    const key = decisionKey(decision.source, decision.findingId)
+    const key = decisionKey(decision.source, decision.clientId, decision.findingId)
     if (!latest.has(key)) latest.set(key, decision)
   }
   return latest
@@ -156,14 +159,14 @@ export function buildFindingRows(input: {
   const seen = new Set<string>()
   const recordsFor = (task: WorkTask) => (typeof input.records === 'function' ? input.records(task) : input.records)
   for (const task of input.live) {
-    const key = decisionKey(input.source, task.id)
+    const key = decisionKey(input.source, task.clientId, task.id)
     seen.add(key)
     const decision = latest.get(key)
     const changed = decision?.status === 'dismissed' && decision.fingerprint !== sourceFingerprint(task, recordsFor(task))
     rows.push({ key, task, status: decision?.status === 'reviewing' ? 'Under review' : 'Open', decision, changedSinceDismissed: Boolean(changed) })
   }
   for (const task of input.dismissed) {
-    const key = decisionKey(input.source, task.id)
+    const key = decisionKey(input.source, task.clientId, task.id)
     seen.add(key)
     rows.push({ key, task, status: 'Dismissed', decision: latest.get(key), changedSinceDismissed: false })
   }
@@ -224,22 +227,7 @@ const KEY = 'ledgerops-review-decisions-v1'
 type StorageLike = Pick<Storage, 'getItem' | 'setItem'>
 const local = (): StorageLike | null => (typeof window === 'undefined' ? null : window.localStorage)
 
-export function readReviewDecisions(storage: StorageLike | null = local()): ReviewDecision[] {
-  try {
-    const parsed = JSON.parse(storage?.getItem(KEY) ?? '[]') as unknown
-    return Array.isArray(parsed) ? (parsed as ReviewDecision[]) : []
-  } catch {
-    return []
-  }
-}
-
-/** Returns false when the browser refused the write, so the screen can say the decisions are not being kept. */
-export function writeReviewDecisions(decisions: ReviewDecision[], storage: StorageLike | null = local()): boolean {
-  if (!storage) return false
-  try {
-    storage.setItem(KEY, JSON.stringify(decisions.slice(0, 500)))
-    return true
-  } catch {
-    return false
-  }
+/** Reads the old browser-only value only when a user explicitly requests an export. */
+export function readLegacyReviewDecisionExport(storage: StorageLike | null = local()): string | null {
+  return storage?.getItem(KEY) ?? null
 }

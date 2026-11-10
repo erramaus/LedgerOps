@@ -27,6 +27,8 @@ import { MemoryDemoPaymentStore, type DemoPaymentStore } from './demoPaymentStor
 import { createDemoWorkpaperRouter } from './demoWorkpapers.js'
 import { MemoryDemoWorkpaperStore, type DemoWorkpaperStore } from './demoWorkpaperStore.js'
 import { createDemoResetRouter, MemoryDemoResetRepository, type DemoResetRepository } from './demoReset.js'
+import { createReviewDecisionRouter } from './reviewDecisions.js'
+import { MemoryReviewDecisionStore, type ReviewDecisionStore } from './reviewDecisionStore.js'
 import type { QuickBooksReportKey } from './quickbooks.js'
 import { isValidIsoDate } from '../shared/period.js'
 
@@ -57,6 +59,7 @@ export type AppDependencies = {
   demoPaymentStore?: DemoPaymentStore
   demoWorkpaperStore?: DemoWorkpaperStore
   demoResetRepository?: DemoResetRepository
+  reviewDecisionStore?: ReviewDecisionStore
   now?: () => number
 }
 
@@ -140,6 +143,7 @@ export function createApp(dependencies: AppDependencies) {
   const requireDemoAuth: RequestHandler = (request, response, next) => {
     if (bypassActive(request)) {
       request.session.csrfToken ??= crypto.randomBytes(32).toString('hex')
+      response.locals.devBypass = true
       return next()
     }
     requireAuth(request, response, next)
@@ -277,6 +281,9 @@ export function createApp(dependencies: AppDependencies) {
   app.use('/api/demo-workpapers', requireDemoAuth, requireCsrf, createDemoWorkpaperRouter({ store: demoWorkpaperStore, now }))
   const demoResetRepository = dependencies.demoResetRepository ?? new MemoryDemoResetRepository({ entries: demoEntryStore, journals: demoJournalStore, payments: demoPaymentStore, workpapers: demoWorkpaperStore, reconciliations: reconciliationStore, monthEnd: monthEndStore })
   app.use('/api/demo-reset', requireDemoAuth, requireCsrf, createDemoResetRouter(demoResetRepository))
+  const reviewDecisionStore = dependencies.reviewDecisionStore ?? new MemoryReviewDecisionStore()
+  app.use('/api/review-decisions/demo', requireDemoAuth, requireCsrf, createReviewDecisionRouter({ source: 'demo', store: reviewDecisionStore, now }))
+  app.use('/api/review-decisions/quickbooks', requireAuth, requireCsrf, createReviewDecisionRouter({ source: 'quickbooks', store: reviewDecisionStore, now }))
 
   const fail = (response: Response, error: unknown, fallback: string) =>
     response.status(400).json({ error: error instanceof Error ? error.message : fallback })

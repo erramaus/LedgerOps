@@ -1,0 +1,75 @@
+name: PostgreSQL storage tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/postgres-storage-tests.yml"
+      - "server/**"
+      - "shared/**"
+      - "scripts/**"
+      - "docs/PHASE12_STORAGE_AUDIT.md"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig*.json"
+  push:
+    branches:
+      - "**"
+    paths:
+      - ".github/workflows/postgres-storage-tests.yml"
+      - "server/**"
+      - "shared/**"
+      - "scripts/**"
+      - "docs/PHASE12_STORAGE_AUDIT.md"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-storage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ledgerops_test_only
+          POSTGRES_DB: ledgerops_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ledgerops_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      LEDGEROPS_TEST_DATABASE_URL: postgresql://postgres:ledgerops_test_only@127.0.0.1:5432/ledgerops_test
+      LEDGEROPS_REQUIRE_POSTGRES: "true"
+      POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify the disposable database configuration
+        run: node --import tsx server/postgresRequired.check.ts
+
+      - name: Run required PostgreSQL storage tests
+        run: npx vitest run server/storageContract.test.ts server/migrations.test.ts server/reviewDecisionStore.test.ts server/reviewDecisions.test.ts --reporter=json --outputFile "$POSTGRES_TEST_REPORT"
+
+      - name: Reject skipped or missing PostgreSQL coverage
+        run: node scripts/assert-postgres-vitest-report.mjs "$POSTGRES_TEST_REPORT"
+
+      - name: Remove temporary test report
+        if: always()
+        run: rm -f "$POSTGRES_TEST_REPORT"

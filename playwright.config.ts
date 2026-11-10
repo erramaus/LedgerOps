@@ -8,14 +8,14 @@ export default defineConfig({
   retries: 0,
   reporter: 'list',
   use: {
-    baseURL: 'http://localhost:5199/LedgerOps/',
+    baseURL: 'http://127.0.0.1:5199/LedgerOps/',
     channel: process.env.PW_CHANNEL || 'msedge',
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'npx vite --port 5199 --strictPort',
-    url: 'http://localhost:5199/LedgerOps/',
-    reuseExistingServer: !process.env.CI,
+    command: 'npx vite --mode e2e --host 127.0.0.1 --port 5199 --strictPort',
+    url: 'http://127.0.0.1:5199/LedgerOps/',
+    reuseExistingServer: false,
     timeout: 60_000,
   },
 })
