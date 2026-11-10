@@ -64,17 +64,37 @@ jobs:
         run: node --import tsx server/postgresRequired.check.ts
 
       - name: Run required PostgreSQL storage tests
+        id: postgres_tests
         env:
           POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
-        run: npx vitest run server/storageContract.test.ts server/migrations.test.ts server/migrationDiagnostic.test.ts server/reviewDecisionStore.test.ts server/reviewDecisions.test.ts --reporter=json --outputFile "$POSTGRES_TEST_REPORT"
+        run: npx vitest run server/storageContract.test.ts server/migrations.test.ts server/migrationDiagnostic.test.ts server/postgresReportSanitizer.test.ts server/reviewDecisionStore.test.ts server/reviewDecisions.test.ts --reporter=default --reporter=json --outputFile.json "$POSTGRES_TEST_REPORT"
 
       - name: Reject skipped or missing PostgreSQL coverage
+        if: ${{ !cancelled() && steps.postgres_tests.outcome != 'skipped' }}
         env:
           POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
         run: node scripts/assert-postgres-vitest-report.mjs "$POSTGRES_TEST_REPORT"
 
+      - name: Prepare safe failure report
+        id: safe_report
+        if: ${{ failure() && steps.postgres_tests.outcome != 'skipped' }}
+        env:
+          POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
+          SAFE_POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage-safe.json
+        run: node scripts/sanitize-postgres-vitest-report.mjs "$POSTGRES_TEST_REPORT" "$SAFE_POSTGRES_TEST_REPORT"
+
+      - name: Upload safe failure report
+        if: ${{ failure() && steps.safe_report.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-test-failure-report
+          path: ${{ runner.temp }}/ledgerops-postgres-storage-safe.json
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Remove temporary test report
         env:
           POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage.json
+          SAFE_POSTGRES_TEST_REPORT: ${{ runner.temp }}/ledgerops-postgres-storage-safe.json
         if: always()
-        run: rm -f "$POSTGRES_TEST_REPORT"
+        run: rm -f "$POSTGRES_TEST_REPORT" "$SAFE_POSTGRES_TEST_REPORT"
